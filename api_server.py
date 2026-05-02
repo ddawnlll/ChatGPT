@@ -57,6 +57,8 @@ class SessionMaterialRequest(BaseModel):
     allow_anon_fallback: bool = False
     endpoint_overrides: dict[str, str] | None = None
     extra_headers: dict[str, str] | None = None
+    websocket_url: str | None = None
+    websocket_verify_token: str | None = None
 
 
 class ConversationRequest(SessionMaterialRequest):
@@ -269,6 +271,8 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
         "allow_anon_fallback": bool(request.allow_anon_fallback),
         "endpoint_overrides": dict(request.endpoint_overrides or {}),
         "extra_headers": dict(request.extra_headers or {}),
+        "websocket_url": request.websocket_url,
+        "websocket_verify_token": request.websocket_verify_token,
     }
 
     if not request.session_id:
@@ -298,6 +302,8 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
     merged_session["allow_anon_fallback"] = incoming_session["allow_anon_fallback"] or stored_session.get("allow_anon_fallback", False)
     merged_session["endpoint_overrides"] = incoming_session["endpoint_overrides"] or stored_session.get("endpoint_overrides", {})
     merged_session["extra_headers"] = incoming_session["extra_headers"] or stored_session.get("extra_headers", {})
+    merged_session["websocket_url"] = incoming_session["websocket_url"] or stored_session.get("websocket_url")
+    merged_session["websocket_verify_token"] = incoming_session["websocket_verify_token"] or stored_session.get("websocket_verify_token")
 
     if not merged_session.get("cookies") and not merged_session.get("authorization") and request.session_id not in SESSION_STORE:
         raise HTTPException(status_code=400, detail="Session material is missing for the provided session_id")
@@ -318,6 +324,8 @@ def build_client(session_material: dict[str, Any]) -> ChatGPT:
         allow_anon_fallback=session_material.get("allow_anon_fallback", False),
         endpoint_overrides=session_material.get("endpoint_overrides"),
         extra_headers=session_material.get("extra_headers"),
+        websocket_url=session_material.get("websocket_url"),
+        websocket_verify_token=session_material.get("websocket_verify_token"),
     )
 
 

@@ -1,6 +1,12 @@
 {
+  "scripts": {
+    "discover:ws": "node tools/discover_authenticated_ws.mjs"
+  },
   "dependencies": {
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.54.2"
   }
 }

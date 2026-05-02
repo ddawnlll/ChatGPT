@@ -281,6 +281,66 @@ def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(m
     assert client.get_debug_summary()["last_request_summary"]["history_and_training_disabled_sent"] is False
 
 
+def test_authenticated_send_uses_websocket_handoff_when_http_response_has_no_text(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+    monkeypatch.setattr(chatgpt_mod.Challenges, "generate_token", staticmethod(lambda config: "vm-token"))
+
+    class FakeWS:
+        def __init__(self):
+            self.messages = iter([
+                '[{"id":1,"type":"reply","reply":{"type":"connect"}}]',
+                '[{"type":"message","topic_id":"conversation-turn-auth","payload":{"type":"conversation-turn-stream","payload":{"type":"stream-item","encoded_item":"event: delta\\ndata: {\\"o\\":\\"patch\\",\\"v\\":[{\\"p\\":\\"/message/content/parts/0\\",\\"o\\":\\"append\\",\\"v\\":\\"Hello from \\\"},{\\"p\\":\\"/message/content/parts/0\\",\\"o\\":\\"append\\",\\"v\\":\\"websocket\\"}]}\\n\\n"}}}]',
+                '[{"type":"message","topic_id":"conversation-turn-auth","payload":{"type":"conversation-turn-stream","payload":{"type":"stream-item","encoded_item":"data: {\\"type\\":\\"message_stream_complete\\",\\"conversation_id\\":\\"conv-auth\\"}\\n\\n"}}}]',
+            ])
+            self.sent = []
+        def send_str(self, payload):
+            self.sent.append(payload)
+        def recv(self):
+            return next(self.messages)
+        def close(self):
+            pass
+
+    fake_ws = FakeWS()
+
+    def fake_ws_connect(url, **kwargs):
+        assert url == "wss://ws.chatgpt.com/test"
+        return fake_ws
+
+    def fake_post(url, json=None, timeout=None, stream=False):
+        if url.endswith("/f/conversation/prepare"):
+            return DummyResponse('{"status":"ok","conduit_token":"conduit-auth"}', json_data={"status": "ok", "conduit_token": "conduit-auth"})
+        if url.endswith("/sentinel/chat-requirements/prepare"):
+            return DummyResponse(
+                '{"prepare_token":"prep-auth","proofofwork":{"seed":"seed","difficulty":"abc"},"turnstile":{"dx":"dx"}}',
+                json_data={"prepare_token": "prep-auth", "proofofwork": {"seed": "seed", "difficulty": "abc"}, "turnstile": {"dx": "dx"}},
+            )
+        if url.endswith("/sentinel/chat-requirements/finalize"):
+            return DummyResponse('{"token":"requirements-auth"}', json_data={"token": "requirements-auth"})
+        return DummyResponse(
+            'event: delta_encoding\n'
+            'data: "v1"\n\n'
+            'data: {"type":"resume_conversation_token","token":"resume-token","conversation_id":"conv-auth"}\n\n'
+            'data: {"type":"stream_handoff","conversation_id":"conv-auth","turn_exchange_id":"turn-auth","options":[{"type":"subscribe_ws_topic","topic_id":"conversation-turn-auth"}]}\n\n'
+            'data: [DONE]\n'
+        )
+
+    client = chatgpt_mod.ChatGPT(
+        transport_mode="authenticated",
+        cookies={"session": "token"},
+        authorization="Bearer abc",
+        websocket_url="wss://ws.chatgpt.com/test",
+    )
+    client.session.post = fake_post
+    client.session.ws_connect = fake_ws_connect
+
+    response = client.ask_question("hello")
+    assert response == "Hello from websocket"
+    diagnostics = client.get_debug_summary()["request_diagnostics"]
+    assert diagnostics["websocket_connected"] is True
+    assert diagnostics["websocket_stream_complete"] is True
+    assert diagnostics["handoff_topic_id"] == "conversation-turn-auth"
+
+
 def test_authenticated_stream_handoff_updates_state_without_text_chunks(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
 

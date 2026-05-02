@@ -6,6 +6,10 @@
   "thinking_mode": "extended",
   "model_name": "generic-model-id",
   "authorization": null,
+  "websocket_url": null,
+  "websocket_verify_token": null,
+  "websocket_discovery_path": "session.discovered.json",
+  "websocket_har_path": "chatgpt.com3.har",
   "cookies": [
     {
       "name": "session_cookie",

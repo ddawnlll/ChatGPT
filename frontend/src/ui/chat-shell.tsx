@@ -37,6 +37,8 @@ const defaultSessionConfig: SessionFormState = {
   model_name: 'auto',
   transport_mode: 'authenticated',
   allow_anon_fallback: false,
+  websocket_url: '',
+  websocket_verify_token: '',
 }
 
 function loadSessionConfig(): SessionFormState {
@@ -44,6 +46,24 @@ function loadSessionConfig(): SessionFormState {
   if (!raw) return defaultSessionConfig
   try { return { ...defaultSessionConfig, ...JSON.parse(raw) } }
   catch { return defaultSessionConfig }
+}
+
+function parseCookiesTxt(content: string): string {
+  const cookies = new Map<string, string>()
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const parts = trimmed.split('\t')
+    if (parts.length < 7) continue
+    const domain = parts[0]
+    const name = parts[5]
+    const value = parts.slice(6).join('\t')
+    if (!name || !value) continue
+    if (domain.includes('chatgpt.com') || domain.includes('openai.com')) {
+      cookies.set(name, value)
+    }
+  }
+  return Array.from(cookies.entries()).map(([name, value]) => `${name}=${value}`).join('; ')
 }
 
 /* ─── auto-scroll ─── */
@@ -346,6 +366,120 @@ function VerificationPanel({
   )
 }
 
+function SettingsDialog({
+  open,
+  onClose,
+  sessionConfig,
+  setSessionConfig,
+  onSave,
+}: {
+  open: boolean
+  onClose: () => void
+  sessionConfig: SessionFormState
+  setSessionConfig: Dispatch<SetStateAction<SessionFormState>>
+  onSave: () => void
+}) {
+  const [tab, setTab] = useState<'configuration' | 'cookies'>('configuration')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  if (!open) return null
+
+  const importCookiesFile = async (file: File) => {
+    const text = await file.text()
+    const parsed = parseCookiesTxt(text)
+    if (parsed) {
+      setSessionConfig((s) => ({ ...s, cookies: parsed }))
+      setTab('cookies')
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <div className="modal-title">Settings</div>
+            <div className="modal-sub">Configure transport, auth, and import ChatGPT cookies.</div>
+          </div>
+          <button className="icon-btn" onClick={onClose} title="Close">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <div className="modal-tabs">
+          <button className={clsx('modal-tab', tab === 'configuration' && 'modal-tab-active')} onClick={() => setTab('configuration')}>Configuration</button>
+          <button className={clsx('modal-tab', tab === 'cookies' && 'modal-tab-active')} onClick={() => setTab('cookies')}>Cookies</button>
+        </div>
+
+        <div className="modal-body">
+          {tab === 'configuration' ? (
+            <div className="settings-grid">
+              <Field label="Session ID">
+                <input className="s-input" value={sessionConfig.session_id ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, session_id: e.target.value }))} />
+              </Field>
+              <Field label="Model">
+                <input className="s-input" value={sessionConfig.model_name} onChange={(e) => setSessionConfig((s) => ({ ...s, model_name: e.target.value }))} />
+              </Field>
+              <Field label="Thinking mode">
+                <select className="s-input" value={sessionConfig.thinking_mode} onChange={(e) => setSessionConfig((s) => ({ ...s, thinking_mode: e.target.value as SessionFormState['thinking_mode'] }))}>
+                  <option value="instant">instant</option>
+                  <option value="extended">extended</option>
+                  <option value="pro">pro</option>
+                </select>
+              </Field>
+              <Field label="Transport mode">
+                <select className="s-input" value={sessionConfig.transport_mode ?? 'authenticated'} onChange={(e) => setSessionConfig((s) => ({ ...s, transport_mode: e.target.value as SessionFormState['transport_mode'] }))}>
+                  <option value="authenticated">authenticated</option>
+                  <option value="anon">anon</option>
+                </select>
+              </Field>
+              <Field label="Allow anon fallback">
+                <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /> <span>Enable explicit anon fallback</span></label>
+              </Field>
+              <Field label="Authorization">
+                <textarea className="s-input s-textarea" value={sessionConfig.authorization ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, authorization: e.target.value }))} />
+              </Field>
+              <Field label="WebSocket URL">
+                <input className="s-input" value={sessionConfig.websocket_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_url: e.target.value }))} placeholder="wss://ws.chatgpt.com/..." />
+              </Field>
+              <Field label="WebSocket verify token">
+                <input className="s-input" value={sessionConfig.websocket_verify_token ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_verify_token: e.target.value }))} placeholder="timestamp-signature" />
+              </Field>
+            </div>
+          ) : (
+            <div>
+              <div className="cookies-actions">
+                <button className="verify-btn verify-btn-subtle" onClick={() => fileInputRef.current?.click()}>Upload cookies.txt</button>
+                <button className="verify-btn verify-btn-subtle" onClick={() => setSessionConfig((s) => ({ ...s, cookies: '' }))}>Clear</button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".txt"
+                  className="hidden-input"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0]
+                    if (file) await importCookiesFile(file)
+                    e.currentTarget.value = ''
+                  }}
+                />
+              </div>
+              <p className="modal-sub" style={{ marginBottom: 10 }}>Paste a Cookie header directly, or upload a Netscape-format cookies.txt file.</p>
+              <Field label="Cookies">
+                <textarea className="s-input s-textarea cookies-area" placeholder="name=value; name2=value2" value={sessionConfig.cookies ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, cookies: e.target.value }))} />
+              </Field>
+            </div>
+          )}
+        </div>
+
+        <div className="modal-foot">
+          <button className="verify-btn verify-btn-subtle" onClick={onClose}>Close</button>
+          <button className="verify-btn" onClick={() => { onSave(); onClose() }}>Save settings</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ════════════════════════════════════════════════
    MAIN COMPONENT
 ═══════════════════════════════════════════════════ */
@@ -520,6 +654,13 @@ export function ChatShell() {
   return (
     <>
       <style>{CSS}</style>
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        sessionConfig={sessionConfig}
+        setSessionConfig={setSessionConfig}
+        onSave={saveSession}
+      />
       <div className="shell">
         <div className="orb-field" aria-hidden>
           <div className="orb orb-1" /><div className="orb orb-2" /><div className="orb orb-3" />
@@ -562,50 +703,12 @@ export function ChatShell() {
           </div>
 
           <div className="settings-section">
-            <button className="settings-toggle" onClick={() => setSettingsOpen((s) => !s)}>
+            <button className="settings-toggle" onClick={() => setSettingsOpen(true)}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                 <circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/>
               </svg>
-              Session settings
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
-                style={{ marginLeft: 'auto', transform: settingsOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
-                <polyline points="6 9 12 15 18 9"/>
-              </svg>
+              Open settings
             </button>
-
-            {settingsOpen && (
-              <div className="settings-body settings-anim">
-                <Field label="Session ID">
-                  <input className="s-input" value={sessionConfig.session_id ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, session_id: e.target.value }))} />
-                </Field>
-                <Field label="Model">
-                  <input className="s-input" value={sessionConfig.model_name} onChange={(e) => setSessionConfig((s) => ({ ...s, model_name: e.target.value }))} />
-                </Field>
-                <Field label="Thinking mode">
-                  <select className="s-input" value={sessionConfig.thinking_mode} onChange={(e) => setSessionConfig((s) => ({ ...s, thinking_mode: e.target.value as SessionFormState['thinking_mode'] }))}>
-                    <option value="instant">instant</option>
-                    <option value="extended">extended</option>
-                    <option value="pro">pro</option>
-                  </select>
-                </Field>
-                <Field label="Transport mode">
-                  <select className="s-input" value={sessionConfig.transport_mode ?? 'authenticated'} onChange={(e) => setSessionConfig((s) => ({ ...s, transport_mode: e.target.value as SessionFormState['transport_mode'] }))}>
-                    <option value="authenticated">authenticated</option>
-                    <option value="anon">anon</option>
-                  </select>
-                </Field>
-                <Field label="Allow anon fallback">
-                  <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /> <span>Enable explicit anon fallback</span></label>
-                </Field>
-                <Field label="Authorization">
-                  <textarea className="s-input s-textarea" value={sessionConfig.authorization ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, authorization: e.target.value }))} />
-                </Field>
-                <Field label="Cookies">
-                  <textarea className="s-input s-textarea" placeholder="a=val; b=val" value={sessionConfig.cookies ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, cookies: e.target.value }))} />
-                </Field>
-                <button className="save-btn" onClick={saveSession}>Save settings</button>
-              </div>
-            )}
           </div>
         </aside>
 
@@ -863,6 +966,20 @@ input:focus, textarea:focus, select:focus { outline:none; }
 }
 .check-row { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--txt); }
 .check-row input { accent-color: var(--accent); }
+.hidden-input { display:none; }
+.modal-backdrop { position:fixed; inset:0; background:rgba(5,7,12,.72); backdrop-filter:blur(10px); z-index:80; display:flex; align-items:center; justify-content:center; padding:20px; }
+.modal-card { width:min(760px, 100%); max-height:90svh; overflow:auto; border:1px solid var(--border-hi); background:rgba(18,20,29,.96); border-radius:20px; box-shadow:0 30px 90px rgba(0,0,0,.45); }
+.modal-head, .modal-foot { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 18px; border-bottom:1px solid var(--border); }
+.modal-foot { border-bottom:none; border-top:1px solid var(--border); }
+.modal-title { color:var(--heading); font-size:18px; font-weight:700; }
+.modal-sub { color:var(--muted); font-size:12px; }
+.modal-tabs { display:flex; gap:8px; padding:14px 18px 0; }
+.modal-tab { padding:9px 12px; border-radius:10px; background:rgba(255,255,255,.04); color:var(--txt-dim); font-size:12px; font-weight:600; }
+.modal-tab-active { background:rgba(232,160,48,.14); color:var(--accent-hi); border:1px solid rgba(232,160,48,.18); }
+.modal-body { padding:18px; }
+.settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+.cookies-actions { display:flex; gap:8px; justify-content:flex-end; margin-bottom:10px; }
+.cookies-area { min-height:220px; }
 .verify-wrap { padding: 0 18px 10px; }
 .verify-toggle { margin: 6px auto 0; max-width: 1100px; border:1px solid var(--border); background:rgba(255,255,255,.03); }
 .verify-status-badge { margin-left: 8px; padding:2px 7px; border-radius:999px; background:rgba(232,160,48,.14); color:var(--accent-hi); font-size:10px; letter-spacing:0; text-transform:none; }

@@ -4,7 +4,7 @@ from zoneinfo     import ZoneInfo
 from curl_cffi    import requests
 from datetime     import datetime
 from uuid         import uuid4
-from json         import loads
+from json         import loads, dumps
 from time         import time
 from typing       import Any
 from base64       import b64decode
@@ -99,7 +99,7 @@ class ChatGPT:
         'title_sync': None,
     }
 
-    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant", model_name: str = "auto", transport_mode: str = "authenticated", allow_anon_fallback: bool = False, endpoint_overrides: dict[str, str] | None = None, extra_headers: dict[str, str] | None = None) -> Any:
+    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant", model_name: str = "auto", transport_mode: str = "authenticated", allow_anon_fallback: bool = False, endpoint_overrides: dict[str, str] | None = None, extra_headers: dict[str, str] | None = None, websocket_url: str | None = None, websocket_verify_token: str | None = None) -> Any:
         self.session: requests.session.Session = requests.Session(impersonate="chrome133a")
         self.session.headers = Headers.DEFAULT
         self.data: dict = {}
@@ -110,6 +110,8 @@ class ChatGPT:
         self.allow_anon_fallback: bool = bool(allow_anon_fallback)
         self.endpoint_overrides: dict[str, str] = dict(endpoint_overrides or {})
         self.extra_headers: dict[str, str] = dict(extra_headers or {})
+        self.websocket_url: str | None = websocket_url
+        self.websocket_verify_token: str | None = websocket_verify_token
         if self.authorization:
             self.session.headers.update({
                 'Authorization': self.authorization
@@ -496,6 +498,8 @@ class ChatGPT:
             'allow_anon_fallback': self.allow_anon_fallback,
             'endpoint_override_keys': sorted(self.endpoint_overrides.keys()),
             'extra_header_keys': sorted(self.extra_headers.keys()),
+            'websocket_url_supplied': bool(self.websocket_url),
+            'websocket_verify_token_supplied': bool(self.websocket_verify_token),
             'device_id_present': device_id_present,
             'client_version_present': bool(self.data.get('prod')),
             'session_material_loaded': session_material_loaded,
@@ -536,6 +540,8 @@ class ChatGPT:
             'diagnostics': dict(self.request_diagnostics),
             'endpoint_overrides': dict(self.endpoint_overrides),
             'extra_headers': sorted(self.extra_headers.keys()),
+            'websocket_url_supplied': bool(self.websocket_url),
+            'websocket_verify_token_supplied': bool(self.websocket_verify_token),
         }
 
     def _endpoint_for(self, endpoint_name: str) -> str:
@@ -552,6 +558,36 @@ class ChatGPT:
             f"Authenticated endpoint discovery is incomplete for '{endpoint_name}'. "
             "Capture logged-in browser traffic before enabling this path."
         )
+
+    def _decode_authorization_claims(self) -> dict[str, Any]:
+        token = (self.authorization or '').strip()
+        if token.startswith('Bearer '):
+            token = token[7:].strip()
+        parts = token.split('.')
+        if len(parts) < 2:
+            return {}
+        try:
+            payload = parts[1]
+            padding = '=' * (-len(payload) % 4)
+            decoded = b64decode(payload.replace('-', '+').replace('_', '/') + padding).decode('utf-8')
+            return loads(decoded)
+        except Exception:
+            return {}
+
+    def _authenticated_websocket_url(self) -> str:
+        if self.websocket_url:
+            return self.websocket_url
+        if not self.websocket_verify_token:
+            raise RuntimeError(
+                'Authenticated websocket handoff requires websocket_url or websocket_verify_token. '
+                'Capture a logged-in browser websocket URL from DevTools/HAR and provide it for now.'
+            )
+        claims = self._decode_authorization_claims()
+        auth_claims = claims.get('https://api.openai.com/auth', {}) if isinstance(claims, dict) else {}
+        user_path = auth_claims.get('chatgpt_account_user_id') or auth_claims.get('chatgpt_user_id')
+        if not user_path:
+            raise RuntimeError('Could not derive authenticated websocket user path from authorization token claims.')
+        return f'wss://ws.chatgpt.com/p13/ws/user/{user_path}?verify={self.websocket_verify_token}'
 
     def _missing_authenticated_requirements(self) -> list[str]:
         missing: list[str] = []
@@ -771,6 +807,7 @@ class ChatGPT:
             'stream_handoff_found': False,
             'resume_token_found': False,
             'turn_exchange_id': None,
+            'handoff_topic_id': None,
         }
         for line in text.splitlines():
             if not line.startswith('data:'):
@@ -789,6 +826,10 @@ class ChatGPT:
                 metadata['turn_exchange_id'] = data.get('turn_exchange_id')
                 if data.get('turn_exchange_id'):
                     self.data['turn_exchange_id'] = data.get('turn_exchange_id')
+                for option in data.get('options', []) or []:
+                    if isinstance(option, dict) and option.get('type') == 'subscribe_ws_topic' and option.get('topic_id'):
+                        metadata['handoff_topic_id'] = option.get('topic_id')
+                        self.data['handoff_topic_id'] = option.get('topic_id')
             if data.get('type') == 'resume_conversation_token':
                 metadata['resume_token_found'] = bool(data.get('token'))
                 if data.get('token'):
@@ -806,6 +847,134 @@ class ChatGPT:
             remote_parent_message_id=self.data.get('parent_message_id'),
         )
         return conversation_id, parent_message_id
+
+    def _extract_handoff_topic_id(self, text: str) -> str | None:
+        fallback_topic_id: str | None = None
+        for line in text.splitlines():
+            if not line.startswith('data:'):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == '[DONE]':
+                continue
+            try:
+                data = loads(data_str)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get('type') != 'stream_handoff':
+                continue
+            for option in data.get('options', []) or []:
+                if not isinstance(option, dict) or not option.get('topic_id'):
+                    continue
+                if option.get('type') == 'resume_sse_endpoint' and not fallback_topic_id:
+                    fallback_topic_id = option['topic_id']
+                if option.get('type') == 'subscribe_ws_topic':
+                    self.data['handoff_topic_id'] = option['topic_id']
+                    self._update_request_diagnostics(handoff_topic_id=option['topic_id'])
+                    return option['topic_id']
+        if fallback_topic_id:
+            self.data['handoff_topic_id'] = fallback_topic_id
+            self._update_request_diagnostics(handoff_topic_id=fallback_topic_id)
+            return fallback_topic_id
+        return self.data.get('handoff_topic_id')
+
+    def _read_authenticated_initial_response(self, conversation_request: Any) -> str:
+        raw_lines: list[str] = []
+        saw_handoff = False
+        saw_done = False
+
+        for line in conversation_request.iter_lines():
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='ignore')
+            if line is None:
+                continue
+            raw_lines.append(line)
+            if self._extract_stream_chunks(line):
+                continue
+            if line.startswith('data:'):
+                data_str = line[5:].strip()
+                if data_str == '[DONE]':
+                    saw_done = True
+                    break
+                try:
+                    data = loads(data_str)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and data.get('type') == 'stream_handoff':
+                    saw_handoff = True
+                    break
+
+        try:
+            self.session.cookies.update(conversation_request.cookies)
+        except Exception:
+            pass
+        try:
+            conversation_request.close()
+        except Exception:
+            pass
+
+        text = '\n'.join(raw_lines)
+        self._update_request_diagnostics(initial_handoff_streaming_read=True, initial_handoff_seen=saw_handoff, initial_handoff_done_seen=saw_done)
+        return text
+
+    def _iter_authenticated_websocket_handoff(self, topic_id: str):
+        websocket_url = self._authenticated_websocket_url()
+        self._update_request_diagnostics(websocket_handoff_topic_id=topic_id, websocket_url=websocket_url, websocket_connected=False)
+        ws = self.session.ws_connect(websocket_url)
+        self._update_request_diagnostics(websocket_connected=True)
+        command_id = 1
+        ws.send_str(dumps([
+            {'id': command_id, 'command': {'type': 'connect', 'presence': {'type': 'presence', 'state': 'background'}}},
+            {'id': command_id + 1, 'command': {'type': 'subscribe', 'topic_id': 'conversations'}},
+            {'id': command_id + 2, 'command': {'type': 'subscribe', 'topic_id': 'app_notifications'}},
+        ]))
+        command_id += 3
+        ws.send_str(dumps([
+            {'id': command_id, 'command': {'type': 'subscribe', 'topic_id': topic_id, 'offset': '0'}},
+        ]))
+        self._update_request_diagnostics(websocket_topic_subscribed=topic_id)
+        try:
+            while True:
+                raw_message = ws.recv()
+                if isinstance(raw_message, bytes):
+                    raw_message = raw_message.decode('utf-8', errors='ignore')
+                try:
+                    messages = loads(raw_message)
+                except Exception:
+                    continue
+                if not isinstance(messages, list):
+                    continue
+                for entry in messages:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get('type') != 'message' or entry.get('topic_id') != topic_id:
+                        continue
+                    payload = entry.get('payload') or {}
+                    if payload.get('type') != 'conversation-turn-stream':
+                        continue
+                    stream_payload = payload.get('payload') or {}
+                    encoded_item = stream_payload.get('encoded_item')
+                    if not encoded_item:
+                        continue
+                    self._apply_conversation_state_from_text(encoded_item)
+                    stream_metadata = {k: v for k, v in self._extract_authenticated_stream_metadata(encoded_item).items() if v is not None and v is not False}
+                    if stream_metadata:
+                        self._update_request_diagnostics(**stream_metadata)
+                    chunk = self._parse_event_stream(encoded_item)
+                    if chunk:
+                        yield chunk
+                    if 'message_stream_complete' in encoded_item:
+                        self._update_request_diagnostics(websocket_stream_complete=True)
+                        return
+        finally:
+            try:
+                command_id += 1
+                ws.send_str(dumps([{'id': command_id, 'command': {'type': 'unsubscribe', 'topic_id': topic_id}}]))
+            except Exception:
+                pass
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _record_conversation_request(self, url: str, model: str, message: str, has_image: bool, stream: bool = False) -> None:
         self._update_request_diagnostics(endpoint_family='authenticated-web')
@@ -891,9 +1060,11 @@ class ChatGPT:
             'x-conduit-token': conduit_token,
         }, authenticated=True)
         self._record_conversation_request(url, model, message, has_image)
-        conversation_request = self.session.post(url, json=payload, timeout=(30, 300))
-        self.session.cookies.update(conversation_request.cookies)
-        text = conversation_request.text
+        try:
+            conversation_request = self.session.post(url, json=payload, timeout=(30, 300), stream=True)
+        except TypeError:
+            conversation_request = self.session.post(url, json=payload, timeout=(30, 300))
+        text = self._read_authenticated_initial_response(conversation_request)
         conversation_id, parent_message_id = self._apply_conversation_state_from_text(text)
         stream_metadata = self._extract_authenticated_stream_metadata(text)
         self._update_request_diagnostics(**stream_metadata)
@@ -910,6 +1081,10 @@ class ChatGPT:
             Log.Error('Your IP got flagged by chatgpt, retry with a new IP')
             exit(conversation_request.status_code)
         self.response = self._parse_event_stream(text)
+        handoff_topic_id = self._extract_handoff_topic_id(text)
+        if not self.response and handoff_topic_id:
+            websocket_parts = list(self._iter_authenticated_websocket_handoff(handoff_topic_id))
+            self.response = ''.join(websocket_parts)
         if not self.response and not conversation_id:
             raise RuntimeError(f"Authenticated conversation response did not contain a usable answer or conversation id. Preview: {text[:300]}")
         return self.response
@@ -931,7 +1106,15 @@ class ChatGPT:
         }, authenticated=True)
         self._record_conversation_request(url, model, message, has_image, stream=True)
         conversation_request = self.session.post(url, json=payload, timeout=(30, 300), stream=True)
-        yield from self._consume_stream_response(conversation_request)
+        yielded = False
+        for chunk in self._consume_stream_response(conversation_request):
+            yielded = True
+            yield chunk
+        if not yielded:
+            handoff_topic_id = self.data.get('handoff_topic_id')
+            if handoff_topic_id:
+                for chunk in self._iter_authenticated_websocket_handoff(handoff_topic_id):
+                    yield chunk
 
     def _authenticated_stream_followup(self, message: str, model: str | None = None):
         yield from self._authenticated_stream_initial(message, model=model)

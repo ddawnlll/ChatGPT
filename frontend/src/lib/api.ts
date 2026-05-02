@@ -6,6 +6,8 @@ export type SessionConfig = {
   model_name: string
   transport_mode?: 'authenticated' | 'anon'
   allow_anon_fallback?: boolean
+  websocket_url?: string
+  websocket_verify_token?: string
 }
 
 export type ChatSummary = {
