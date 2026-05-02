@@ -4,6 +4,8 @@ export type SessionConfig = {
   authorization?: string
   thinking_mode: 'instant' | 'extended' | 'pro'
   model_name: string
+  transport_mode?: 'authenticated' | 'anon'
+  allow_anon_fallback?: boolean
 }
 
 export type ChatSummary = {
@@ -22,11 +24,51 @@ export type ChatMessage = {
   image?: boolean
 }
 
+export type VerificationState = {
+  history_verification?: 'not_checked' | 'passed' | 'failed'
+  title_verification?: 'not_checked' | 'passed' | 'failed'
+  sidebar_visible?: boolean | null
+  missing_browser_stage?: string | null
+  notes?: string | null
+  remote_conversation_exists?: boolean
+}
+
+export type TransportDiagnostics = {
+  selected_transport_mode?: string
+  effective_transport_mode?: string
+  endpoint_family?: string | null
+  remote_conversation_id?: string | null
+  remote_parent_message_id?: string | null
+  fallback_occurred?: boolean
+  history_verification?: string
+  [key: string]: unknown
+}
+
 export type ChatDetail = ChatSummary & {
   messages: ChatMessage[]
   session_id?: string | null
   thinking_mode: string
   model_name: string
+  transport_mode: string
+  allow_anon_fallback?: boolean
+  verification: VerificationState
+  last_transport_diagnostics: TransportDiagnostics
+}
+
+export type DebugTransportPayload = {
+  chat_id: string
+  transport_mode: string
+  allow_anon_fallback: boolean
+  verification: VerificationState
+  last_transport_diagnostics: TransportDiagnostics
+  session_status: Record<string, unknown>
+  debug_summary: {
+    session_status: Record<string, unknown>
+    last_request_summary: Record<string, unknown>
+    last_response_summary: Record<string, unknown>
+    request_diagnostics: TransportDiagnostics
+  }
+  transport_audit: Record<string, unknown>
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:6969'
@@ -80,6 +122,26 @@ export function renameChat(chatId: string, title: string) {
 export function deleteChat(chatId: string) {
   return request<{ status: string }>(`/chats/${chatId}`, {
     method: 'DELETE',
+  })
+}
+
+export function getDebugTransport(chatId: string) {
+  return request<DebugTransportPayload>(`/debug/transports/${chatId}`)
+}
+
+export function updateChatVerification(
+  chatId: string,
+  payload: {
+    history_verification?: 'not_checked' | 'passed' | 'failed'
+    sidebar_visible?: boolean | null
+    title_verification?: 'not_checked' | 'passed' | 'failed'
+    missing_browser_stage?: string | null
+    notes?: string | null
+  },
+) {
+  return request<ChatDetail>(`/chats/${chatId}/verification`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
   })
 }
 

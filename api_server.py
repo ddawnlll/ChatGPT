@@ -32,6 +32,7 @@ CHAT_STORE: dict[str, dict[str, Any]] = {}
 CHAT_CLIENTS: dict[str, ChatGPT] = {}
 ALLOWED_THINKING_MODES = {"instant", "extended", "pro"}
 ALLOWED_TRANSPORT_MODES = {"authenticated", "anon"}
+ALLOWED_VERIFICATION_STATES = {"not_checked", "passed", "failed"}
 
 
 class CookieItem(BaseModel):
@@ -76,6 +77,14 @@ class RenameChatRequest(BaseModel):
     title: str
 
 
+class VerificationUpdateRequest(BaseModel):
+    history_verification: str | None = None
+    sidebar_visible: bool | None = None
+    title_verification: str | None = None
+    missing_browser_stage: str | None = None
+    notes: str | None = None
+
+
 class ChatSummary(BaseModel):
     id: str
     title: str
@@ -91,6 +100,8 @@ class ChatDetail(ChatSummary):
     model_name: str
     transport_mode: str
     allow_anon_fallback: bool = False
+    verification: dict[str, Any] = {}
+    last_transport_diagnostics: dict[str, Any] = {}
 
 
 class MessageRecord(BaseModel):
@@ -132,7 +143,9 @@ def init_db() -> None:
                 session_material_json TEXT NOT NULL,
                 remote_conversation_started INTEGER NOT NULL DEFAULT 0,
                 remote_conversation_id TEXT,
-                remote_parent_message_id TEXT
+                remote_parent_message_id TEXT,
+                verification_json TEXT NOT NULL DEFAULT '{}',
+                last_transport_diagnostics_json TEXT NOT NULL DEFAULT '{}'
             )
             """
         )
@@ -154,6 +167,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE chats ADD COLUMN transport_mode TEXT NOT NULL DEFAULT 'authenticated'")
         if "allow_anon_fallback" not in existing_columns:
             conn.execute("ALTER TABLE chats ADD COLUMN allow_anon_fallback INTEGER NOT NULL DEFAULT 0")
+        if "verification_json" not in existing_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN verification_json TEXT NOT NULL DEFAULT '{}' ")
+        if "last_transport_diagnostics_json" not in existing_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN last_transport_diagnostics_json TEXT NOT NULL DEFAULT '{}' ")
         conn.commit()
 
 
@@ -183,6 +200,15 @@ def normalize_transport_mode(transport_mode: str | None) -> str:
     normalized = (transport_mode or "authenticated").strip().lower()
     if normalized not in ALLOWED_TRANSPORT_MODES:
         raise HTTPException(status_code=400, detail=f"Invalid transport mode: {transport_mode}")
+    return normalized
+
+
+def normalize_verification_state(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in ALLOWED_VERIFICATION_STATES:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {value}")
     return normalized
 
 
@@ -307,14 +333,43 @@ def chat_summary(chat: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def chat_detail_payload(chat: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **chat_summary(chat),
+        "messages": chat["messages"],
+        "session_id": chat["session_id"],
+        "thinking_mode": chat["thinking_mode"],
+        "model_name": chat["model_name"],
+        "transport_mode": chat["transport_mode"],
+        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
+        "verification": dict(chat.get("verification", {})),
+        "last_transport_diagnostics": dict(chat.get("last_transport_diagnostics", {})),
+    }
+
+
+
+def update_chat_transport_diagnostics(chat: dict[str, Any], client: ChatGPT) -> None:
+    diagnostics = client.get_debug_summary().get("request_diagnostics", {})
+    chat["last_transport_diagnostics"] = dict(diagnostics)
+    verification = chat.setdefault("verification", {})
+    verification.setdefault("history_verification", "not_checked")
+    verification.setdefault("title_verification", "not_checked")
+    verification.setdefault("sidebar_visible", None)
+    verification.setdefault("missing_browser_stage", None)
+    verification.setdefault("notes", None)
+    verification["remote_conversation_exists"] = bool(diagnostics.get("remote_conversation_id") or chat.get("remote_conversation_id"))
+
+
+
 def persist_chat(chat: dict[str, Any]) -> None:
     with db_connection() as conn:
         conn.execute(
             """
             INSERT INTO chats (
                 id, title, created_at, updated_at, session_id, thinking_mode, model_name,
-                transport_mode, allow_anon_fallback, session_material_json, remote_conversation_started, remote_conversation_id, remote_parent_message_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transport_mode, allow_anon_fallback, session_material_json, remote_conversation_started, remote_conversation_id, remote_parent_message_id,
+                verification_json, last_transport_diagnostics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
                 created_at=excluded.created_at,
@@ -327,7 +382,9 @@ def persist_chat(chat: dict[str, Any]) -> None:
                 session_material_json=excluded.session_material_json,
                 remote_conversation_started=excluded.remote_conversation_started,
                 remote_conversation_id=excluded.remote_conversation_id,
-                remote_parent_message_id=excluded.remote_parent_message_id
+                remote_parent_message_id=excluded.remote_parent_message_id,
+                verification_json=excluded.verification_json,
+                last_transport_diagnostics_json=excluded.last_transport_diagnostics_json
             """,
             (
                 chat["id"],
@@ -343,6 +400,8 @@ def persist_chat(chat: dict[str, Any]) -> None:
                 1 if chat.get("remote_conversation_started", False) else 0,
                 chat.get("remote_conversation_id"),
                 chat.get("remote_parent_message_id"),
+                json.dumps(chat.get("verification", {})),
+                json.dumps(chat.get("last_transport_diagnostics", {})),
             ),
         )
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat["id"],))
@@ -397,6 +456,8 @@ def load_chats_from_db() -> None:
                 "remote_conversation_started": bool(row["remote_conversation_started"]),
                 "remote_conversation_id": row["remote_conversation_id"],
                 "remote_parent_message_id": row["remote_parent_message_id"],
+                "verification": json.loads(row["verification_json"]) if "verification_json" in row.keys() and row["verification_json"] else {},
+                "last_transport_diagnostics": json.loads(row["last_transport_diagnostics_json"]) if "last_transport_diagnostics_json" in row.keys() and row["last_transport_diagnostics_json"] else {},
             }
             CHAT_STORE[chat["id"]] = chat
             session_id = chat.get("session_id")
@@ -460,6 +521,8 @@ async def debug_chat_transport(chat_id: str) -> dict[str, Any]:
         "chat_id": chat_id,
         "transport_mode": chat.get("transport_mode"),
         "allow_anon_fallback": chat.get("allow_anon_fallback", False),
+        "verification": chat.get("verification", {}),
+        "last_transport_diagnostics": chat.get("last_transport_diagnostics", {}),
         "session_status": client.get_session_status(),
         "debug_summary": client.get_debug_summary(),
         "transport_audit": client.get_transport_audit(),
@@ -516,32 +579,25 @@ async def create_chat(request: CreateChatRequest) -> dict[str, Any]:
         "remote_conversation_started": False,
         "remote_conversation_id": None,
         "remote_parent_message_id": None,
+        "verification": {
+            "history_verification": "not_checked",
+            "title_verification": "not_checked",
+            "sidebar_visible": None,
+            "missing_browser_stage": None,
+            "notes": None,
+            "remote_conversation_exists": False,
+        },
+        "last_transport_diagnostics": {},
     }
     CHAT_STORE[chat_id] = chat
     persist_chat(chat)
-    return {
-        **chat_summary(chat),
-        "messages": chat["messages"],
-        "session_id": chat["session_id"],
-        "thinking_mode": chat["thinking_mode"],
-        "model_name": chat["model_name"],
-        "transport_mode": chat["transport_mode"],
-        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
-    }
+    return chat_detail_payload(chat)
 
 
 @app.get("/chats/{chat_id}", response_model=ChatDetail)
 async def get_chat(chat_id: str) -> dict[str, Any]:
     chat = ensure_chat(chat_id)
-    return {
-        **chat_summary(chat),
-        "messages": chat["messages"],
-        "session_id": chat["session_id"],
-        "thinking_mode": chat["thinking_mode"],
-        "model_name": chat["model_name"],
-        "transport_mode": chat["transport_mode"],
-        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
-    }
+    return chat_detail_payload(chat)
 
 
 @app.patch("/chats/{chat_id}", response_model=ChatDetail)
@@ -553,15 +609,32 @@ async def rename_chat(chat_id: str, request: RenameChatRequest) -> dict[str, Any
     chat["title"] = title
     chat["updated_at"] = utc_now_iso()
     persist_chat(chat)
-    return {
-        **chat_summary(chat),
-        "messages": chat["messages"],
-        "session_id": chat["session_id"],
-        "thinking_mode": chat["thinking_mode"],
-        "model_name": chat["model_name"],
-        "transport_mode": chat["transport_mode"],
-        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
-    }
+    return chat_detail_payload(chat)
+
+
+@app.patch("/chats/{chat_id}/verification", response_model=ChatDetail)
+async def update_chat_verification(chat_id: str, request: VerificationUpdateRequest) -> dict[str, Any]:
+    chat = ensure_chat(chat_id)
+    verification = dict(chat.get("verification", {}))
+
+    history_verification = normalize_verification_state(request.history_verification, "history_verification")
+    title_verification = normalize_verification_state(request.title_verification, "title_verification")
+
+    if history_verification is not None:
+        verification["history_verification"] = history_verification
+    if title_verification is not None:
+        verification["title_verification"] = title_verification
+    if request.sidebar_visible is not None:
+        verification["sidebar_visible"] = request.sidebar_visible
+    if request.missing_browser_stage is not None:
+        verification["missing_browser_stage"] = request.missing_browser_stage.strip() or None
+    if request.notes is not None:
+        verification["notes"] = request.notes.strip() or None
+
+    chat["verification"] = verification
+    chat["updated_at"] = utc_now_iso()
+    persist_chat(chat)
+    return chat_detail_payload(chat)
 
 
 @app.delete("/chats/{chat_id}")
@@ -611,6 +684,7 @@ async def stream_chat_message(chat_id: str, request: SendMessageRequest) -> Stre
 
             chat["remote_conversation_id"] = client.data.get("conversation_id")
             chat["remote_parent_message_id"] = client.data.get("parent_message_id")
+            update_chat_transport_diagnostics(chat, client)
             assistant_message = {
                 "id": str(uuid4()),
                 "role": "assistant",
@@ -623,15 +697,7 @@ async def stream_chat_message(chat_id: str, request: SendMessageRequest) -> Stre
             persist_chat(chat)
             yield sse_event({
                 "type": "done",
-                "chat": {
-                    **chat_summary(chat),
-                    "messages": chat["messages"],
-                    "session_id": chat["session_id"],
-                    "thinking_mode": chat["thinking_mode"],
-                    "model_name": chat["model_name"],
-                    "transport_mode": chat["transport_mode"],
-                    "allow_anon_fallback": chat.get("allow_anon_fallback", False),
-                },
+                "chat": chat_detail_payload(chat),
             })
         except Exception as exc:
             if chat["messages"] and chat["messages"][-1]["id"] == user_message["id"]:
@@ -670,6 +736,7 @@ async def send_chat_message(chat_id: str, request: SendMessageRequest) -> dict[s
 
         chat["remote_conversation_id"] = client.data.get("conversation_id")
         chat["remote_parent_message_id"] = client.data.get("parent_message_id")
+        update_chat_transport_diagnostics(chat, client)
 
         assistant_message = {
             "id": str(uuid4()),
@@ -681,15 +748,7 @@ async def send_chat_message(chat_id: str, request: SendMessageRequest) -> dict[s
         chat["messages"].append(assistant_message)
         chat["updated_at"] = utc_now_iso()
         persist_chat(chat)
-        return {
-            **chat_summary(chat),
-            "messages": chat["messages"],
-            "session_id": chat["session_id"],
-            "thinking_mode": chat["thinking_mode"],
-            "model_name": chat["model_name"],
-            "transport_mode": chat["transport_mode"],
-            "allow_anon_fallback": chat.get("allow_anon_fallback", False),
-        }
+        return chat_detail_payload(chat)
     except HTTPException:
         raise
     except Exception as e:

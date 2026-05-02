@@ -161,6 +161,8 @@ def test_chat_endpoints_create_list_get_and_send(monkeypatch):
     assert first_payload["messages"][0]["role"] == "user"
     assert first_payload["messages"][1]["role"] == "assistant"
     assert first_payload["messages"][1]["content"] == "answer:hello"
+    assert first_payload["verification"]["remote_conversation_exists"] is True
+    assert first_payload["last_transport_diagnostics"]["selected_transport_mode"] == "anon"
     assert dummy_client.calls[0] == ("ask_question", "hello", None)
 
     second_message = client.post(f"/chats/{chat_id}/messages", json={"message": "again"})
@@ -210,7 +212,43 @@ def test_debug_transport_endpoint_returns_client_diagnostics(monkeypatch):
     payload = response.json()
     assert payload["chat_id"] == chat_id
     assert payload["transport_mode"] == "anon"
+    assert payload["verification"]["history_verification"] == "not_checked"
     assert payload["debug_summary"]["request_diagnostics"]["selected_transport_mode"] == "anon"
+
+
+def test_verification_endpoint_updates_history_sidebar_and_notes(monkeypatch):
+    dummy_client = DummyChatClient()
+    monkeypatch.setattr(api_server, "build_client", lambda session_material: dummy_client)
+    client = TestClient(api_server.app)
+
+    create_response = client.post(
+        "/chats",
+        json={
+            "title": "Verify chat",
+            "session_id": "session-verify",
+            "cookies": [{"name": "session", "value": "token"}],
+            "authorization": "Bearer abc",
+            "transport_mode": "authenticated",
+        },
+    )
+    chat_id = create_response.json()["id"]
+
+    response = client.patch(
+        f"/chats/{chat_id}/verification",
+        json={
+            "history_verification": "failed",
+            "sidebar_visible": False,
+            "title_verification": "not_checked",
+            "missing_browser_stage": "sidebar sync request",
+            "notes": "chat answered but did not appear in sidebar",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["verification"]["history_verification"] == "failed"
+    assert payload["verification"]["sidebar_visible"] is False
+    assert payload["verification"]["missing_browser_stage"] == "sidebar sync request"
+    assert payload["verification"]["notes"] == "chat answered but did not appear in sidebar"
 
 
 def test_load_chats_from_db_restores_persisted_chat(monkeypatch):

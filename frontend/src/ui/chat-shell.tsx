@@ -14,15 +14,15 @@
  *   react-markdown  remark-gfm
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useParams, useRouterState } from '@tanstack/react-router'
 import clsx from 'clsx'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-  createChat, deleteChat, getChat, listChats, renameChat, streamMessage,
-  type ChatMessage, type SessionConfig,
+  createChat, deleteChat, getChat, getDebugTransport, listChats, renameChat, streamMessage, updateChatVerification,
+  type ChatDetail, type ChatMessage, type DebugTransportPayload, type SessionConfig, type VerificationState,
 } from '../lib/api'
 
 /* ─── session persistence ─── */
@@ -35,6 +35,8 @@ const defaultSessionConfig: SessionFormState = {
   authorization: '',
   thinking_mode: 'extended',
   model_name: 'auto',
+  transport_mode: 'authenticated',
+  allow_anon_fallback: false,
 }
 
 function loadSessionConfig(): SessionFormState {
@@ -266,6 +268,84 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
+function VerificationPanel({
+  chat,
+  debug,
+  draft,
+  setDraft,
+  refresh,
+  save,
+  saving,
+}: {
+  chat: ChatDetail
+  debug?: DebugTransportPayload
+  draft: VerificationState
+  setDraft: Dispatch<SetStateAction<VerificationState>>
+  refresh: () => void
+  save: () => void
+  saving: boolean
+}) {
+  const diagnostics = debug?.debug_summary?.request_diagnostics ?? chat.last_transport_diagnostics ?? {}
+
+  return (
+    <div className="verify-panel fade-in">
+      <div className="verify-head">
+        <div>
+          <div className="verify-title">Verification / Transport Debug</div>
+          <div className="verify-sub">Use this while checking chatgpt.com sidebar/title behavior.</div>
+        </div>
+        <div className="verify-actions">
+          <button className="verify-btn verify-btn-subtle" onClick={refresh}>Refresh</button>
+          <button className="verify-btn" onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save verification'}</button>
+        </div>
+      </div>
+
+      <div className="verify-grid">
+        <div className="verify-card"><span>Selected mode</span><strong>{String(diagnostics.selected_transport_mode ?? chat.transport_mode ?? '—')}</strong></div>
+        <div className="verify-card"><span>Effective mode</span><strong>{String(diagnostics.effective_transport_mode ?? '—')}</strong></div>
+        <div className="verify-card"><span>Endpoint family</span><strong>{String(diagnostics.endpoint_family ?? '—')}</strong></div>
+        <div className="verify-card"><span>Fallback</span><strong>{diagnostics.fallback_occurred ? 'yes' : 'no'}</strong></div>
+        <div className="verify-card"><span>Remote conversation id</span><strong className="verify-mono">{String(diagnostics.remote_conversation_id ?? '—')}</strong></div>
+        <div className="verify-card"><span>Remote parent/message id</span><strong className="verify-mono">{String(diagnostics.remote_parent_message_id ?? '—')}</strong></div>
+      </div>
+
+      <div className="verify-form-grid">
+        <Field label="History verification">
+          <select className="s-input" value={draft.history_verification ?? chat.verification?.history_verification ?? 'not_checked'} onChange={(e) => setDraft((s) => ({ ...s, history_verification: e.target.value as VerificationState['history_verification'] }))}>
+            <option value="not_checked">not_checked</option>
+            <option value="passed">passed</option>
+            <option value="failed">failed</option>
+          </select>
+        </Field>
+        <Field label="Title verification">
+          <select className="s-input" value={draft.title_verification ?? chat.verification?.title_verification ?? 'not_checked'} onChange={(e) => setDraft((s) => ({ ...s, title_verification: e.target.value as VerificationState['title_verification'] }))}>
+            <option value="not_checked">not_checked</option>
+            <option value="passed">passed</option>
+            <option value="failed">failed</option>
+          </select>
+        </Field>
+        <Field label="Sidebar visible">
+          <select className="s-input" value={String(draft.sidebar_visible ?? chat.verification?.sidebar_visible ?? '')} onChange={(e) => setDraft((s) => ({ ...s, sidebar_visible: e.target.value === '' ? null : e.target.value === 'true' }))}>
+            <option value="">unknown</option>
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </Field>
+        <Field label="Remote conversation exists">
+          <div className="verify-pill">{chat.verification?.remote_conversation_exists ? 'yes' : 'no'}</div>
+        </Field>
+      </div>
+
+      <Field label="Missing browser stage">
+        <input className="s-input" value={draft.missing_browser_stage ?? chat.verification?.missing_browser_stage ?? ''} onChange={(e) => setDraft((s) => ({ ...s, missing_browser_stage: e.target.value }))} placeholder="e.g. sidebar sync request" />
+      </Field>
+      <Field label="Notes">
+        <textarea className="s-input s-textarea" value={draft.notes ?? chat.verification?.notes ?? ''} onChange={(e) => setDraft((s) => ({ ...s, notes: e.target.value }))} placeholder="What happened after checking chatgpt.com?" />
+      </Field>
+    </div>
+  )
+}
+
 /* ════════════════════════════════════════════════
    MAIN COMPONENT
 ═══════════════════════════════════════════════════ */
@@ -283,6 +363,8 @@ export function ChatShell() {
   const [isStreaming, setIsStreaming] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [verificationOpen, setVerificationOpen] = useState(false)
+  const [verificationDraft, setVerificationDraft] = useState<VerificationState>({})
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -291,6 +373,13 @@ export function ChatShell() {
   const chatQuery = useQuery({
     queryKey: ['chat', activeChatId],
     queryFn: () => getChat(activeChatId!),
+    enabled: Boolean(activeChatId),
+    retry: false,
+  })
+
+  const debugTransportQuery = useQuery({
+    queryKey: ['debug-transport', activeChatId],
+    queryFn: () => getDebugTransport(activeChatId!),
     enabled: Boolean(activeChatId),
     retry: false,
   })
@@ -317,6 +406,14 @@ export function ChatShell() {
       queryClient.removeQueries({ queryKey: ['chat', id] })
       queryClient.invalidateQueries({ queryKey: ['chats'] })
       if (id === activeChatId) navigate({ to: '/' })
+    },
+  })
+
+  const verificationMutation = useMutation({
+    mutationFn: async () => updateChatVerification(activeChatId!, verificationDraft),
+    onSuccess: (chat) => {
+      queryClient.setQueryData(['chat', chat.id], chat)
+      queryClient.invalidateQueries({ queryKey: ['debug-transport', chat.id] })
     },
   })
 
@@ -407,6 +504,17 @@ export function ChatShell() {
     navigate({ to: '/chat/$chatId', params: { chatId: chatsQuery.data[0].id } })
   }, [activeChatId, chatsQuery.data, navigate, pathname])
 
+  useEffect(() => {
+    if (!chatQuery.data) return
+    setVerificationDraft({
+      history_verification: chatQuery.data.verification?.history_verification,
+      title_verification: chatQuery.data.verification?.title_verification,
+      sidebar_visible: chatQuery.data.verification?.sidebar_visible ?? null,
+      missing_browser_stage: chatQuery.data.verification?.missing_browser_stage ?? '',
+      notes: chatQuery.data.verification?.notes ?? '',
+    })
+  }, [chatQuery.data?.id])
+
   const saveSession = () => window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionConfig))
 
   return (
@@ -480,6 +588,15 @@ export function ChatShell() {
                     <option value="pro">pro</option>
                   </select>
                 </Field>
+                <Field label="Transport mode">
+                  <select className="s-input" value={sessionConfig.transport_mode ?? 'authenticated'} onChange={(e) => setSessionConfig((s) => ({ ...s, transport_mode: e.target.value as SessionFormState['transport_mode'] }))}>
+                    <option value="authenticated">authenticated</option>
+                    <option value="anon">anon</option>
+                  </select>
+                </Field>
+                <Field label="Allow anon fallback">
+                  <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /> <span>Enable explicit anon fallback</span></label>
+                </Field>
                 <Field label="Authorization">
                   <textarea className="s-input s-textarea" value={sessionConfig.authorization ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, authorization: e.target.value }))} />
                 </Field>
@@ -503,7 +620,8 @@ export function ChatShell() {
             <div className="topbar-info">
               <span className="topbar-title">{chatQuery.data?.title ?? (pathname === '/' ? 'New conversation' : '…')}</span>
               <span className="topbar-meta">
-                {sessionConfig.model_name}<span className="meta-dot" />{sessionConfig.thinking_mode}
+                {sessionConfig.model_name}<span className="meta-dot" />{sessionConfig.thinking_mode}<span className="meta-dot" />{chatQuery.data?.transport_mode ?? sessionConfig.transport_mode}
+                {chatQuery.data?.verification?.history_verification && <><span className="meta-dot" /><span>{chatQuery.data.verification.history_verification}</span></>}
                 {isStreaming && <><span className="meta-dot" /><span className="stream-indicator"><span className="pulse-dot" />streaming</span></>}
               </span>
             </div>
@@ -528,11 +646,37 @@ export function ChatShell() {
             )}
           </div>
 
-          {(streamError || sendMessageMutation.error || createChatMutation.error) && (
+          {activeChatId && chatQuery.data && (
+            <div className="verify-wrap">
+              <button className="settings-toggle verify-toggle" onClick={() => setVerificationOpen((s) => !s)}>
+                Verification / Transport Debug
+                <span className="verify-status-badge">{chatQuery.data.verification?.history_verification ?? 'not_checked'}</span>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
+                  style={{ marginLeft: 'auto', transform: verificationOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+              {verificationOpen && (
+                <VerificationPanel
+                  chat={chatQuery.data}
+                  debug={debugTransportQuery.data}
+                  draft={verificationDraft}
+                  setDraft={setVerificationDraft}
+                  refresh={() => debugTransportQuery.refetch()}
+                  save={() => verificationMutation.mutate()}
+                  saving={verificationMutation.isPending}
+                />
+              )}
+            </div>
+          )}
+
+          {(streamError || sendMessageMutation.error || createChatMutation.error || verificationMutation.error || debugTransportQuery.error) && (
             <div className="error-zone">
               {streamError && <div className="error-banner">{streamError}</div>}
               {sendMessageMutation.error && <div className="error-banner">{String(sendMessageMutation.error.message)}</div>}
               {createChatMutation.error && <div className="error-banner">{String(createChatMutation.error.message)}</div>}
+              {verificationMutation.error && <div className="error-banner">{String(verificationMutation.error.message)}</div>}
+              {debugTransportQuery.error && <div className="error-banner">{String(debugTransportQuery.error.message)}</div>}
             </div>
           )}
 
@@ -717,6 +861,26 @@ input:focus, textarea:focus, select:focus { outline:none; }
   color:var(--muted);
   transition:color .12s, background .12s;
 }
+.check-row { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--txt); }
+.check-row input { accent-color: var(--accent); }
+.verify-wrap { padding: 0 18px 10px; }
+.verify-toggle { margin: 6px auto 0; max-width: 1100px; border:1px solid var(--border); background:rgba(255,255,255,.03); }
+.verify-status-badge { margin-left: 8px; padding:2px 7px; border-radius:999px; background:rgba(232,160,48,.14); color:var(--accent-hi); font-size:10px; letter-spacing:0; text-transform:none; }
+.verify-panel { max-width:1100px; margin:10px auto 0; border:1px solid var(--border); background:rgba(18,20,29,.82); backdrop-filter:blur(18px); border-radius:16px; padding:16px; }
+.verify-head { display:flex; gap:12px; justify-content:space-between; align-items:flex-start; margin-bottom:14px; }
+.verify-title { color:var(--heading); font-weight:700; font-size:14px; }
+.verify-sub { color:var(--muted); font-size:12px; margin-top:4px; }
+.verify-actions { display:flex; gap:8px; }
+.verify-btn { padding:8px 12px; border-radius:10px; background:var(--accent); color:#1a1307; font-weight:700; font-size:12px; }
+.verify-btn-subtle { background:rgba(255,255,255,.06); color:var(--txt); }
+.verify-btn:disabled { opacity:.6; cursor:not-allowed; }
+.verify-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:14px; }
+.verify-card { border:1px solid var(--border); background:rgba(255,255,255,.025); border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:6px; }
+.verify-card span { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+.verify-card strong { color:var(--heading); font-size:12px; }
+.verify-mono { font-family:'JetBrains Mono', monospace; font-size:11px !important; word-break:break-all; }
+.verify-form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:6px; }
+.verify-pill { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:rgba(255,255,255,.03); color:var(--heading); font-size:12px; }
 .settings-toggle:hover { color:var(--txt-dim); background:rgba(255,255,255,.04); }
 .settings-body { padding:8px 2px 4px; display:flex; flex-direction:column; gap:10px; }
 @keyframes settDown{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}

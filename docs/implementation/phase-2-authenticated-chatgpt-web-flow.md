@@ -667,7 +667,7 @@ The point of authenticated mode is not just getting answers; it is getting norma
 - [ ] Verify whether follow-up messages remain linked to the same remote conversation
 - [ ] Verify whether remote conversation title is created automatically or requires additional calls
 - [ ] Identify any metadata update/title/sidebar sync calls performed by the browser after first send
-- [ ] Add structured diagnostics/logging for:
+- [x] Add structured diagnostics/logging for:
   - selected transport mode
   - endpoint family
   - remote conversation id
@@ -689,8 +689,38 @@ For each tested flow, classify as:
 
 - [ ] We can clearly tell whether authenticated flow produces true account-backed chat history
 - [ ] Any missing sidebar/title sync stage is identified explicitly
-- [ ] Diagnostics are strong enough to distinguish “answered” from “account conversation created”
+- [x] Diagnostics are strong enough to distinguish “answered” from “account conversation created”
 - [ ] If sidebar/history parity is not achieved, the exact missing browser request stage is documented
+
+### Verification Scaffolding Implemented
+
+Workstream G now has app-level verification plumbing even before full manual account validation is completed:
+
+- the frontend now includes a built-in `Verification / Transport Debug` panel for the active chat
+- the frontend can fetch `GET /debug/transports/{chat_id}` directly
+- the frontend can persist verification outcomes through `PATCH /chats/{chat_id}/verification`
+- transport mode and explicit anon fallback can be configured in the frontend session settings for direct real-session testing
+
+- chat records persist `verification` metadata with:
+  - `history_verification`
+  - `title_verification`
+  - `sidebar_visible`
+  - `missing_browser_stage`
+  - `notes`
+  - `remote_conversation_exists`
+- chat records persist `last_transport_diagnostics` from the wrapper
+- `GET /debug/transports/{chat_id}` exposes verification state alongside wrapper diagnostics
+- `PATCH /chats/{chat_id}/verification` allows marking:
+  - sidebar/history passed/failed/not_checked
+  - title verification state
+  - missing browser sync stage
+  - manual notes from real session testing
+
+This means the backend can now distinguish between:
+- response worked only
+- remote conversation id was created
+- sidebar/title verification still not checked
+- sidebar/title verification failed with a concrete missing stage note
 
 ---
 
