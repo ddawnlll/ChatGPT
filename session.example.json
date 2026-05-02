@@ -1,7 +1,10 @@
 {
+  "debug_label": "local-session-template",
+  "require_login": true,
   "session_id": "example-session-001",
   "message": "Test",
-  "thinking_mode": "instant",
+  "thinking_mode": "extended",
+  "model_name": "generic-model-id",
   "authorization": null,
   "cookies": [
     {

@@ -378,15 +378,56 @@ client = ChatGPT(
 
 ---
 
-## 14. What Phase 2 Inherits
+## 14. Phase 2 Candidate — Generic Model Routing
 
-### 14.1 Capability expansion themes or inherited state
+**Status:** Complete
+
+### Problem / Goal
+
+Allow the API to carry an explicit, backend-agnostic model selection field alongside thinking mode so downstream adapters can route requests consistently.
+
+### Non-Goals
+
+- [ ] Do not hard-code any provider-specific private model names into the public API contract
+- [ ] Do not couple routing logic to a single transport implementation
+- [ ] Do not change the existing default behavior until this workstream is implemented
+
+### Implementation Tasks
+
+- [x] Add a generic `model_name` field to the request schema
+- [x] Validate allowed values at the API boundary for the selected backend
+- [x] Keep a safe default when `model_name` is omitted
+- [x] Preserve separate `thinking_mode` / `effort` semantics
+- [x] Add tests for model selection and fallback behavior
+
+### Configuration / Code Reference (if applicable)
+
+```json
+{
+  "model_name": "generic-model-id",
+  "thinking_mode": "extended"
+}
+```
+
+### Acceptance Criteria
+
+- [x] Callers can specify a model explicitly without changing the rest of the payload shape
+- [x] The API rejects unsupported model values cleanly
+- [x] Default behavior remains unchanged when no model is supplied
+- [x] Model selection and thinking mode remain independently configurable
+
+---
+
+## 15. What Phase 2 Inherits
+
+### 15.1 Capability expansion themes or inherited state
 
 - A stable API contract for auth/session inputs
 - A reusable session representation across requests
 - A cleaner boundary between API, session management, and client execution
+- A generic model-routing field that can be adapted per backend
 
-### 14.2 Phase Boundary
+### 15.2 Phase Boundary
 
 - Phase 2 is capability expansion on top of authenticated session plumbing.
 - Phase 1 is the prerequisite.
@@ -394,15 +435,15 @@ client = ChatGPT(
 
 ---
 
-## 15. Compact Mental Model
+## 16. Compact Mental Model
 
-### 15.1 Phase Relationships
+### 16.1 Phase Relationships
 
 - Phase 0: existing reverse-engineered conversation flow
 - Phase 1: make auth/session state a first-class API concept
 - Phase 2: build whatever higher-level account capabilities depend on that state
 - Phase 3: harden and scale the whole interface
 
-### 15.2 Key Takeaway
+### 16.2 Key Takeaway
 
 The merge already introduced pieces of auth support inside the client, but the system still lacks a real session model. This phase turns those partial hooks into a coherent contract so the API can carry auth state without breaking existing behavior.

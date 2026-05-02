@@ -33,6 +33,7 @@ def test_resolve_session_material_stores_and_reuses_session_state():
         cookies=[{"name": "session", "value": "token"}],
         authorization="Bearer abc",
         thinking_mode="extended",
+        model_name="generic-model-id",
     )
 
     resolved_1 = api_server.resolve_session_material(request_1)
@@ -40,6 +41,7 @@ def test_resolve_session_material_stores_and_reuses_session_state():
     assert resolved_1["cookies"] == {"session": "token"}
     assert resolved_1["authorization"] == "Bearer abc"
     assert resolved_1["thinking_mode"] == "extended"
+    assert resolved_1["model_name"] == "generic-model-id"
 
     request_2 = api_server.ConversationRequest(
         message="hello again",
@@ -50,6 +52,7 @@ def test_resolve_session_material_stores_and_reuses_session_state():
     assert resolved_2["cookies"] == {"session": "token"}
     assert resolved_2["authorization"] == "Bearer abc"
     assert resolved_2["thinking_mode"] == "extended"
+    assert resolved_2["model_name"] == "generic-model-id"
 
 
 def test_resolve_session_material_rejects_invalid_thinking_mode():
@@ -60,3 +63,14 @@ def test_resolve_session_material_rejects_invalid_thinking_mode():
 
     with pytest.raises(api_server.HTTPException):
         api_server.resolve_session_material(request)
+
+
+def test_resolve_session_material_accepts_model_name_without_session_id():
+    request = api_server.ConversationRequest(
+        message="hello",
+        model_name="generic-model-id",
+    )
+
+    resolved = api_server.resolve_session_material(request)
+    assert resolved["model_name"] == "generic-model-id"
+    assert resolved["thinking_mode"] == "instant"

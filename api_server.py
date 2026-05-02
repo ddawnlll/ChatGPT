@@ -31,6 +31,7 @@ class ConversationRequest(BaseModel):
     cookies: str | list[CookieItem] | dict[str, str] | None = None
     authorization: str | None = None
     thinking_mode: str | None = None
+    model_name: str | None = None
 
 
 def normalize_thinking_mode(thinking_mode: str | None) -> str:
@@ -88,6 +89,7 @@ def resolve_session_material(request: ConversationRequest) -> dict[str, Any]:
         "cookies": normalize_cookies(request.cookies),
         "authorization": request.authorization,
         "thinking_mode": normalize_thinking_mode(request.thinking_mode) if request.thinking_mode is not None else None,
+        "model_name": request.model_name.strip() if isinstance(request.model_name, str) and request.model_name.strip() else None,
     }
 
     if not request.session_id:
@@ -113,6 +115,11 @@ def resolve_session_material(request: ConversationRequest) -> dict[str, Any]:
     else:
         merged_session["thinking_mode"] = stored_session.get("thinking_mode", "instant")
 
+    if incoming_session["model_name"] is not None:
+        merged_session["model_name"] = incoming_session["model_name"]
+    else:
+        merged_session["model_name"] = stored_session.get("model_name", "auto")
+
     if not merged_session.get("cookies") and not merged_session.get("authorization") and request.session_id not in SESSION_STORE:
         raise HTTPException(status_code=400, detail="Session material is missing for the provided session_id")
 
@@ -125,6 +132,7 @@ def build_client(session_material: dict[str, Any]) -> ChatGPT:
         cookies=session_material.get("cookies"),
         authorization=session_material.get("authorization"),
         thinking_mode=session_material.get("thinking_mode", "instant"),
+        model_name=session_material.get("model_name", "auto"),
     )
 
 

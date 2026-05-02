@@ -51,8 +51,14 @@ def test_ask_question_text_payload_includes_selected_thinking_mode(monkeypatch):
             '"conversation_id": "conv-123", "message_id": "msg-123"\n'
         )
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="extended")
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
     client.session.post = fake_post
+
+    status = client.get_session_status()
+    assert status["model_name"] == "generic-model-id"
+    assert status["thinking_mode"] == "extended"
+    assert status["bootstrap_ready"] is True
+    assert status["login_state"] == "NOT_VERIFIED"
 
     response = client.ask_question("hello")
 
@@ -60,6 +66,7 @@ def test_ask_question_text_payload_includes_selected_thinking_mode(monkeypatch):
     assert captured["url"] == "https://chatgpt.com/backend-anon/f/conversation"
     assert captured["timeout"] == (30, 300)
     assert captured["json"]["effort"] == "extended"
+    assert captured["json"]["model"] == "generic-model-id"
     assert captured["json"]["messages"][0]["content"]["content_type"] == "text"
     assert captured["json"]["messages"][0]["content"]["parts"] == ["hello"]
 
@@ -88,8 +95,13 @@ def test_ask_question_image_path_uses_multimodal_payload(monkeypatch):
 
     monkeypatch.setattr(chatgpt_mod.ChatGPT, "upload_file", fake_upload_file)
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="pro")
+    client = chatgpt_mod.ChatGPT(thinking_mode="pro", model_name="generic-model-id")
     client.session.post = fake_post
+
+    status = client.get_session_status()
+    assert status["model_name"] == "generic-model-id"
+    assert status["thinking_mode"] == "pro"
+    assert status["login_state"] == "NOT_VERIFIED"
 
     response = client.ask_question("describe this", "data:image/png;base64,AAAA")
 
@@ -97,5 +109,6 @@ def test_ask_question_image_path_uses_multimodal_payload(monkeypatch):
     assert captured["timeout"] == (30, 300)
     assert captured["upload"]["is_image"] is True
     assert captured["json"]["effort"] == "pro"
+    assert captured["json"]["model"] == "generic-model-id"
     assert captured["json"]["messages"][0]["content"]["content_type"] == "multimodal_text"
     assert captured["json"]["messages"][0]["content"]["parts"][1] == "describe this"

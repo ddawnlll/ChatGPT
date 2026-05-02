@@ -13,12 +13,13 @@ from PIL import Image
 from io import BytesIO
 
 class ChatGPT:
-    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant") -> Any:
+    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant", model_name: str = "auto") -> Any:
         self.session: requests.session.Session = requests.Session(impersonate="chrome133a")
         self.session.headers = Headers.DEFAULT
         self.data: dict = {}
         self.authorization: str = authorization
         self.thinking_mode: str = self._normalize_thinking_mode(thinking_mode)
+        self.model_name: str = self._normalize_model_name(model_name)
         if self.authorization:
             self.session.headers.update({
                 'Authorization': self.authorization
@@ -32,6 +33,11 @@ class ChatGPT:
             
         self.ip_info: list = IP_Info.fetch_info(self.session)
         self.timezone_offset: int = int(datetime.now(ZoneInfo(self.ip_info[5])).utcoffset().total_seconds() / 60)
+        self._proxy_supplied: bool = bool(proxy)
+        self._supplied_cookies: Any = cookies
+        self.session_status: dict = {}
+        self.last_request_summary: dict = {'request_sent': False}
+        self.last_response_summary: dict = {'response_received': False}
         self.reacts: list = [
             "location",
             "__reactContainer$" + self._generate_react(),
@@ -300,6 +306,8 @@ class ChatGPT:
         else:
             self.session.cookies.update(self._normalize_cookies(cookies))
             self._fetch_cookies()
+
+        self._update_session_status(self._proxy_supplied, self._supplied_cookies)
             
     def _normalize_cookies(self, cookies: Any) -> dict:
         if isinstance(cookies, dict):
@@ -332,6 +340,68 @@ class ChatGPT:
         if normalized_mode not in allowed_modes:
             raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
         return normalized_mode
+
+    def _normalize_model_name(self, model_name: str) -> str:
+        normalized_model = (model_name or 'auto').strip()
+        if not normalized_model:
+            return 'auto'
+        return normalized_model
+
+    def _has_identity_cookie(self, cookie_names: list[str]) -> bool:
+        identity_cookie_names = {'oai-did', '__Secure-oai-is'}
+        identity_cookie_prefixes = ('__Secure-next-auth.session-token',)
+        return any(
+            name in identity_cookie_names or any(name.startswith(prefix) for prefix in identity_cookie_prefixes)
+            for name in cookie_names
+        )
+
+    def _update_session_status(self, proxy_supplied: bool, supplied_cookies: Any) -> None:
+        normalized_supplied_cookies = self._normalize_cookies(supplied_cookies) if supplied_cookies else {}
+        supplied_cookie_names = list(normalized_supplied_cookies.keys())
+        current_cookie_names = list(self.session.cookies.keys())
+        has_supplied_identity_cookie = self._has_identity_cookie(supplied_cookie_names)
+        has_current_identity_cookie = self._has_identity_cookie(current_cookie_names)
+        device_id_present = bool(self.session.cookies.get('oai-did'))
+        session_material_loaded = bool(supplied_cookies) or bool(self.authorization)
+
+        login_reasons: list[str] = []
+        if not session_material_loaded:
+            login_reasons.append('no session material supplied')
+        if session_material_loaded and not bool(self.authorization):
+            login_reasons.append('authorization not supplied; cookie presence alone is not sufficient for verification')
+        if session_material_loaded and not (has_supplied_identity_cookie or bool(self.authorization)):
+            login_reasons.append('no recognizable identity cookie or authorization supplied')
+        if session_material_loaded and not device_id_present:
+            login_reasons.append('oai-did cookie missing after bootstrap')
+
+        login_state = 'LIKELY_AUTHENTICATED' if session_material_loaded and bool(self.authorization) and device_id_present else 'NOT_VERIFIED'
+        if login_state == 'LIKELY_AUTHENTICATED':
+            login_reasons = []
+
+        self.session_status = {
+            'proxy_supplied': proxy_supplied,
+            'cookies_supplied': bool(supplied_cookies),
+            'authorization_supplied': bool(self.authorization),
+            'thinking_mode': self.thinking_mode,
+            'model_name': self.model_name,
+            'device_id_present': device_id_present,
+            'session_material_loaded': session_material_loaded,
+            'supplied_identity_cookie_present': has_supplied_identity_cookie,
+            'current_identity_cookie_present': has_current_identity_cookie,
+            'login_state': login_state,
+            'login_reasons': login_reasons,
+            'bootstrap_ready': True,
+        }
+
+    def get_session_status(self) -> dict:
+        return dict(self.session_status)
+
+    def get_debug_summary(self) -> dict:
+        return {
+            'session_status': dict(self.session_status),
+            'last_request_summary': dict(self.last_request_summary),
+            'last_response_summary': dict(self.last_response_summary),
+        }
 
     def _generate_react(self) -> str:
         n = random() 
@@ -665,7 +735,8 @@ class ChatGPT:
         
         return self.response
 
-    def ask_question_with_file(self, message: str, model: str = "auto", file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
+    def ask_question_with_file(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
+        model = model or self.model_name
         self._get_tokens()
         conduit_token: str = self.get_conduit()
 
@@ -783,8 +854,28 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
 
+        self.last_request_summary = {
+            'request_sent': True,
+            'url': 'https://chatgpt.com/backend-anon/f/conversation',
+            'model': model,
+            'thinking_mode': self.thinking_mode,
+            'message_length': len(message),
+            'has_image': is_image,
+            'authorization_supplied': bool(self.authorization),
+            'cookies_supplied': bool(self._supplied_cookies),
+            'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
+        }
+
         conversation_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300))
         self.session.cookies.update(conversation_request.cookies)
+        self.last_response_summary = {
+            'response_received': True,
+            'status_code': getattr(conversation_request, 'status_code', None),
+            'text_preview': conversation_request.text[:300],
+            'unusual_activity': 'Unusual activity' in conversation_request.text,
+            'conversation_id_found': '"conversation_id": "' in conversation_request.text,
+            'message_id_found': '"message_id": "' in conversation_request.text,
+        }
         
         if 'Unusual activity' in conversation_request.text:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
