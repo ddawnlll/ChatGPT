@@ -21,6 +21,8 @@ def main() -> None:
         authorization=session.get("authorization"),
         thinking_mode=session.get("thinking_mode", "extended"),
         model_name=session.get("model_name", "auto"),
+        transport_mode=session.get("transport_mode", "anon"),
+        allow_anon_fallback=bool(session.get("allow_anon_fallback", False)),
     )
 
     message = session.get("message", "Test")

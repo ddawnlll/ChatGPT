@@ -10,6 +10,15 @@ class DummyChatClient:
         self.calls = []
         self.data = {"conversation_id": None, "parent_message_id": None}
 
+    def get_session_status(self):
+        return {"transport_mode": "anon", "bootstrap_ready": True}
+
+    def get_debug_summary(self):
+        return {"request_diagnostics": {"selected_transport_mode": "anon"}}
+
+    def get_transport_audit(self):
+        return {"anon_endpoints": {"conversation": "https://chatgpt.com/backend-anon/f/conversation"}}
+
     def ask_question(self, message, image=None):
         self.calls.append(("ask_question", message, image))
         self.data["conversation_id"] = "conv-1"
@@ -61,6 +70,8 @@ def test_resolve_session_material_stores_and_reuses_session_state():
         authorization="Bearer abc",
         thinking_mode="extended",
         model_name="generic-model-id",
+        endpoint_overrides={"conversation": "https://chatgpt.com/backend-api/conversation"},
+        extra_headers={"x-test": "1"},
     )
 
     resolved_1 = api_server.resolve_session_material(request_1)
@@ -69,6 +80,10 @@ def test_resolve_session_material_stores_and_reuses_session_state():
     assert resolved_1["authorization"] == "Bearer abc"
     assert resolved_1["thinking_mode"] == "extended"
     assert resolved_1["model_name"] == "generic-model-id"
+    assert resolved_1["transport_mode"] == "authenticated"
+    assert resolved_1["allow_anon_fallback"] is False
+    assert resolved_1["endpoint_overrides"]["conversation"] == "https://chatgpt.com/backend-api/conversation"
+    assert resolved_1["extra_headers"]["x-test"] == "1"
 
     request_2 = api_server.ConversationRequest(
         message="hello again",
@@ -80,6 +95,10 @@ def test_resolve_session_material_stores_and_reuses_session_state():
     assert resolved_2["authorization"] == "Bearer abc"
     assert resolved_2["thinking_mode"] == "extended"
     assert resolved_2["model_name"] == "generic-model-id"
+    assert resolved_2["transport_mode"] == "authenticated"
+    assert resolved_2["allow_anon_fallback"] is False
+    assert resolved_2["endpoint_overrides"]["conversation"] == "https://chatgpt.com/backend-api/conversation"
+    assert resolved_2["extra_headers"]["x-test"] == "1"
 
 
 def test_resolve_session_material_rejects_invalid_thinking_mode():
@@ -101,6 +120,8 @@ def test_resolve_session_material_accepts_model_name_without_session_id():
     resolved = api_server.resolve_session_material(request)
     assert resolved["model_name"] == "generic-model-id"
     assert resolved["thinking_mode"] == "instant"
+    assert resolved["transport_mode"] == "authenticated"
+    assert resolved["allow_anon_fallback"] is False
 
 
 def test_chat_endpoints_create_list_get_and_send(monkeypatch):
@@ -118,6 +139,7 @@ def test_chat_endpoints_create_list_get_and_send(monkeypatch):
             "authorization": "Bearer abc",
             "thinking_mode": "extended",
             "model_name": "generic-model-id",
+            "transport_mode": "anon",
         },
     )
     assert create_response.status_code == 200
@@ -126,6 +148,8 @@ def test_chat_endpoints_create_list_get_and_send(monkeypatch):
     assert chat["title"] == "Test chat"
     assert chat["thinking_mode"] == "extended"
     assert chat["model_name"] == "generic-model-id"
+    assert chat["transport_mode"] == "anon"
+    assert chat["allow_anon_fallback"] is False
 
     list_response = client.get("/chats")
     assert list_response.status_code == 200
@@ -164,6 +188,31 @@ def test_chat_endpoints_create_list_get_and_send(monkeypatch):
     assert missing_response.status_code == 404
 
 
+def test_debug_transport_endpoint_returns_client_diagnostics(monkeypatch):
+    dummy_client = DummyChatClient()
+    monkeypatch.setattr(api_server, "build_client", lambda session_material: dummy_client)
+    client = TestClient(api_server.app)
+
+    create_response = client.post(
+        "/chats",
+        json={
+            "title": "Debug chat",
+            "session_id": "session-debug",
+            "cookies": [{"name": "session", "value": "token"}],
+            "authorization": "Bearer abc",
+            "transport_mode": "anon",
+        },
+    )
+    chat_id = create_response.json()["id"]
+
+    response = client.get(f"/debug/transports/{chat_id}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["chat_id"] == chat_id
+    assert payload["transport_mode"] == "anon"
+    assert payload["debug_summary"]["request_diagnostics"]["selected_transport_mode"] == "anon"
+
+
 def test_load_chats_from_db_restores_persisted_chat(monkeypatch):
     dummy_client = DummyChatClient()
     monkeypatch.setattr(api_server, "build_client", lambda session_material: dummy_client)
@@ -176,6 +225,7 @@ def test_load_chats_from_db_restores_persisted_chat(monkeypatch):
             "session_id": "session-2",
             "cookies": [{"name": "session", "value": "token"}],
             "authorization": "Bearer abc",
+            "transport_mode": "anon",
         },
     )
     chat_id = create_response.json()["id"]

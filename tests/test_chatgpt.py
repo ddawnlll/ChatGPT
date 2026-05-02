@@ -52,12 +52,13 @@ def test_ask_question_text_payload_includes_selected_thinking_mode(monkeypatch):
             '"conversation_id": "conv-123", "message_id": "msg-123"\n'
         )
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id", transport_mode="anon")
     client.session.post = fake_post
 
     status = client.get_session_status()
     assert status["model_name"] == "generic-model-id"
     assert status["thinking_mode"] == "extended"
+    assert status["transport_mode"] == "anon"
     assert status["bootstrap_ready"] is True
     assert status["login_state"] == "NOT_VERIFIED"
 
@@ -71,6 +72,12 @@ def test_ask_question_text_payload_includes_selected_thinking_mode(monkeypatch):
     assert captured["json"]["messages"][0]["content"]["content_type"] == "text"
     assert captured["json"]["messages"][0]["content"]["parts"] == ["hello"]
 
+    diagnostics = client.get_debug_summary()["request_diagnostics"]
+    assert diagnostics["selected_transport_mode"] == "anon"
+    assert diagnostics["effective_transport_mode"] == "anon"
+    assert diagnostics["endpoint_family"] == "backend-anon"
+    assert diagnostics["fallback_occurred"] is False
+
 
 def test_ask_question_without_ids_still_returns_answer(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
@@ -78,7 +85,7 @@ def test_ask_question_without_ids_still_returns_answer(monkeypatch):
     def fake_post(url, json=None, timeout=None):
         return DummyResponse('data: {"o":"append","p":"/message/content/parts/0","v":"plain answer"}\n')
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id", transport_mode="anon")
     client.session.post = fake_post
 
     response = client.ask_question("hello")
@@ -109,7 +116,7 @@ def test_ask_question_image_path_uses_multimodal_payload(monkeypatch):
 
     monkeypatch.setattr(chatgpt_mod.ChatGPT, "upload_file", fake_upload_file)
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="pro", model_name="generic-model-id")
+    client = chatgpt_mod.ChatGPT(thinking_mode="pro", model_name="generic-model-id", transport_mode="anon")
     client.session.post = fake_post
 
     status = client.get_session_status()
@@ -132,12 +139,94 @@ def test_ask_question_raises_clear_error_when_response_is_empty(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
 
     def fake_post(url, json=None, timeout=None):
-        return DummyResponse('unexpected response')
+        return DummyResponse("unexpected response")
 
-    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id", transport_mode="anon")
     client.session.post = fake_post
 
     with pytest.raises(RuntimeError) as exc:
         client.ask_question("hello")
 
     assert "Conversation response did not contain a usable answer or conversation id" in str(exc.value)
+
+
+def test_authenticated_mode_fails_loudly_without_required_session_material(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(transport_mode="authenticated")
+
+    with pytest.raises(RuntimeError) as exc:
+        client.ask_question("hello")
+
+    message = str(exc.value)
+    assert "Authenticated transport preflight failed" in message
+    assert "authorization" in message
+
+    diagnostics = client.get_debug_summary()["request_diagnostics"]
+    assert diagnostics["selected_transport_mode"] == "authenticated"
+    assert diagnostics["effective_transport_mode"] == "authenticated"
+    assert diagnostics["endpoint_family"] == "authenticated-web"
+    assert diagnostics["fallback_occurred"] is False
+    assert diagnostics["history_verification"] == "not_checked"
+
+
+def test_transport_audit_exposes_anon_endpoints_and_authenticated_slots(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(
+        transport_mode="anon",
+        endpoint_overrides={"conversation": "https://chatgpt.com/backend-api/conversation"},
+        extra_headers={"x-test": "1"},
+    )
+    audit = client.get_transport_audit()
+
+    assert audit["selected_transport_mode"] == "anon"
+    assert audit["anon_endpoints"]["conversation"] == "https://chatgpt.com/backend-anon/f/conversation"
+    assert audit["anon_header_inventory"]["conversation"][0] == "oai-client-version"
+    assert "history_and_training_disabled" in audit["anon_payload_audit"]["history_suppressing_fields"]
+    assert "prepare_conversation_conduit_token" in audit["anon_flow_stages"]
+    assert "history_sync" in audit["authenticated_endpoint_slots"]
+    assert audit["authenticated_endpoint_slots"]["conversation"] is None
+    assert audit["endpoint_overrides"]["conversation"] == "https://chatgpt.com/backend-api/conversation"
+    assert audit["extra_headers"] == ["x-test"]
+
+
+def test_authenticated_mode_preflight_passes_then_hits_placeholder(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(
+        transport_mode="authenticated",
+        cookies={"session": "token"},
+        authorization="Bearer abc",
+    )
+
+    with pytest.raises(NotImplementedError) as exc:
+        client.ask_question("hello")
+
+    assert "authenticated request sequence has not been implemented yet" in str(exc.value).lower()
+    diagnostics = client.get_debug_summary()["request_diagnostics"]
+    assert diagnostics["effective_transport_mode"] == "authenticated"
+    assert diagnostics["endpoint_family"] == "authenticated-web"
+    assert diagnostics["fallback_occurred"] is False
+
+
+def test_authenticated_mode_can_explicitly_fallback_to_anon(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    def fake_post(url, json=None, timeout=None):
+        return DummyResponse(
+            'data: {"o":"append","p":"/message/content/parts/0","v":"fallback answer"}\n'
+            '"conversation_id": "conv-123", "message_id": "msg-123"\n'
+        )
+
+    client = chatgpt_mod.ChatGPT(transport_mode="authenticated", allow_anon_fallback=True)
+    client.session.post = fake_post
+
+    response = client.ask_question("hello")
+    assert response == "fallback answer"
+
+    diagnostics = client.get_debug_summary()["request_diagnostics"]
+    assert diagnostics["selected_transport_mode"] == "authenticated"
+    assert diagnostics["effective_transport_mode"] == "anon"
+    assert diagnostics["endpoint_family"] == "backend-anon"
+    assert diagnostics["fallback_occurred"] is True

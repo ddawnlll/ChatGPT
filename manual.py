@@ -27,6 +27,8 @@ def build_client_from_fixture(session_data: dict) -> ChatGPT:
         authorization=session_data.get("authorization"),
         thinking_mode=session_data.get("thinking_mode", "extended"),
         model_name=session_data.get("model_name", "auto"),
+        transport_mode=session_data.get("transport_mode", "anon"),
+        allow_anon_fallback=bool(session_data.get("allow_anon_fallback", False)),
     )
 
 
@@ -205,7 +207,7 @@ def enforce_login_requirement(session_data: dict, client: ChatGPT) -> None:
 def main() -> None:
     session_data = load_session_fixture()
     if not session_data:
-        print(ChatGPT().ask_question("Test"))
+        print(ChatGPT(transport_mode="anon").ask_question("Test"))
         return
 
     print_session_preflight(session_data)

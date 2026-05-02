@@ -6,12 +6,14 @@ import manual
 
 
 class DummyChatGPT:
-    def __init__(self, proxy=None, cookies=None, authorization=None, thinking_mode="instant", model_name="auto"):
+    def __init__(self, proxy=None, cookies=None, authorization=None, thinking_mode="instant", model_name="auto", transport_mode="authenticated", allow_anon_fallback=False):
         self.proxy = proxy
         self.cookies = cookies
         self.authorization = authorization
         self.thinking_mode = thinking_mode
         self.model_name = model_name
+        self.transport_mode = transport_mode
+        self.allow_anon_fallback = allow_anon_fallback
 
     def ask_question(self, message, image=None):
         return {
@@ -51,6 +53,8 @@ def test_build_client_from_fixture_uses_session_fields(monkeypatch):
     assert client.authorization == "Bearer abc"
     assert client.thinking_mode == "pro"
     assert client.model_name == "generic-model-id"
+    assert client.transport_mode == "anon"
+    assert client.allow_anon_fallback is False
 
 
 def test_get_session_preflight_detects_identity_cookie():

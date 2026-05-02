@@ -31,6 +31,7 @@ SESSION_STORE: dict[str, dict[str, Any]] = {}
 CHAT_STORE: dict[str, dict[str, Any]] = {}
 CHAT_CLIENTS: dict[str, ChatGPT] = {}
 ALLOWED_THINKING_MODES = {"instant", "extended", "pro"}
+ALLOWED_TRANSPORT_MODES = {"authenticated", "anon"}
 
 
 class CookieItem(BaseModel):
@@ -51,6 +52,10 @@ class SessionMaterialRequest(BaseModel):
     authorization: str | None = None
     thinking_mode: str | None = None
     model_name: str | None = None
+    transport_mode: str | None = None
+    allow_anon_fallback: bool = False
+    endpoint_overrides: dict[str, str] | None = None
+    extra_headers: dict[str, str] | None = None
 
 
 class ConversationRequest(SessionMaterialRequest):
@@ -84,6 +89,8 @@ class ChatDetail(ChatSummary):
     session_id: str | None = None
     thinking_mode: str
     model_name: str
+    transport_mode: str
+    allow_anon_fallback: bool = False
 
 
 class MessageRecord(BaseModel):
@@ -120,6 +127,8 @@ def init_db() -> None:
                 session_id TEXT,
                 thinking_mode TEXT NOT NULL,
                 model_name TEXT NOT NULL,
+                transport_mode TEXT NOT NULL DEFAULT 'authenticated',
+                allow_anon_fallback INTEGER NOT NULL DEFAULT 0,
                 session_material_json TEXT NOT NULL,
                 remote_conversation_started INTEGER NOT NULL DEFAULT 0,
                 remote_conversation_id TEXT,
@@ -140,6 +149,11 @@ def init_db() -> None:
             )
             """
         )
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)").fetchall()}
+        if "transport_mode" not in existing_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN transport_mode TEXT NOT NULL DEFAULT 'authenticated'")
+        if "allow_anon_fallback" not in existing_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN allow_anon_fallback INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
 
@@ -163,6 +177,13 @@ def normalize_thinking_mode(thinking_mode: str | None) -> str:
 def normalize_model_name(model_name: str | None) -> str:
     normalized = (model_name or "auto").strip()
     return normalized or "auto"
+
+
+def normalize_transport_mode(transport_mode: str | None) -> str:
+    normalized = (transport_mode or "authenticated").strip().lower()
+    if normalized not in ALLOWED_TRANSPORT_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid transport mode: {transport_mode}")
+    return normalized
 
 
 
@@ -218,11 +239,16 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
         "authorization": request.authorization,
         "thinking_mode": normalize_thinking_mode(request.thinking_mode) if request.thinking_mode is not None else None,
         "model_name": request.model_name.strip() if isinstance(request.model_name, str) and request.model_name.strip() else None,
+        "transport_mode": normalize_transport_mode(request.transport_mode) if request.transport_mode is not None else None,
+        "allow_anon_fallback": bool(request.allow_anon_fallback),
+        "endpoint_overrides": dict(request.endpoint_overrides or {}),
+        "extra_headers": dict(request.extra_headers or {}),
     }
 
     if not request.session_id:
         incoming_session["thinking_mode"] = incoming_session["thinking_mode"] or "instant"
         incoming_session["model_name"] = incoming_session["model_name"] or "auto"
+        incoming_session["transport_mode"] = incoming_session["transport_mode"] or "authenticated"
         return incoming_session
 
     stored_session = SESSION_STORE.get(request.session_id, {})
@@ -242,6 +268,10 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
 
     merged_session["thinking_mode"] = incoming_session["thinking_mode"] or stored_session.get("thinking_mode", "instant")
     merged_session["model_name"] = incoming_session["model_name"] or stored_session.get("model_name", "auto")
+    merged_session["transport_mode"] = incoming_session["transport_mode"] or stored_session.get("transport_mode", "authenticated")
+    merged_session["allow_anon_fallback"] = incoming_session["allow_anon_fallback"] or stored_session.get("allow_anon_fallback", False)
+    merged_session["endpoint_overrides"] = incoming_session["endpoint_overrides"] or stored_session.get("endpoint_overrides", {})
+    merged_session["extra_headers"] = incoming_session["extra_headers"] or stored_session.get("extra_headers", {})
 
     if not merged_session.get("cookies") and not merged_session.get("authorization") and request.session_id not in SESSION_STORE:
         raise HTTPException(status_code=400, detail="Session material is missing for the provided session_id")
@@ -258,6 +288,10 @@ def build_client(session_material: dict[str, Any]) -> ChatGPT:
         authorization=session_material.get("authorization"),
         thinking_mode=session_material.get("thinking_mode", "instant"),
         model_name=session_material.get("model_name", "auto"),
+        transport_mode=session_material.get("transport_mode", "authenticated"),
+        allow_anon_fallback=session_material.get("allow_anon_fallback", False),
+        endpoint_overrides=session_material.get("endpoint_overrides"),
+        extra_headers=session_material.get("extra_headers"),
     )
 
 
@@ -279,8 +313,8 @@ def persist_chat(chat: dict[str, Any]) -> None:
             """
             INSERT INTO chats (
                 id, title, created_at, updated_at, session_id, thinking_mode, model_name,
-                session_material_json, remote_conversation_started, remote_conversation_id, remote_parent_message_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transport_mode, allow_anon_fallback, session_material_json, remote_conversation_started, remote_conversation_id, remote_parent_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
                 created_at=excluded.created_at,
@@ -288,6 +322,8 @@ def persist_chat(chat: dict[str, Any]) -> None:
                 session_id=excluded.session_id,
                 thinking_mode=excluded.thinking_mode,
                 model_name=excluded.model_name,
+                transport_mode=excluded.transport_mode,
+                allow_anon_fallback=excluded.allow_anon_fallback,
                 session_material_json=excluded.session_material_json,
                 remote_conversation_started=excluded.remote_conversation_started,
                 remote_conversation_id=excluded.remote_conversation_id,
@@ -301,6 +337,8 @@ def persist_chat(chat: dict[str, Any]) -> None:
                 chat.get("session_id"),
                 chat["thinking_mode"],
                 chat["model_name"],
+                chat.get("transport_mode", "authenticated"),
+                1 if chat.get("allow_anon_fallback", False) else 0,
                 json.dumps(chat["session_material"]),
                 1 if chat.get("remote_conversation_started", False) else 0,
                 chat.get("remote_conversation_id"),
@@ -353,6 +391,8 @@ def load_chats_from_db() -> None:
                 "session_id": row["session_id"],
                 "thinking_mode": row["thinking_mode"],
                 "model_name": row["model_name"],
+                "transport_mode": row["transport_mode"] if "transport_mode" in row.keys() else "authenticated",
+                "allow_anon_fallback": bool(row["allow_anon_fallback"]) if "allow_anon_fallback" in row.keys() else False,
                 "session_material": json.loads(row["session_material_json"]),
                 "remote_conversation_started": bool(row["remote_conversation_started"]),
                 "remote_conversation_id": row["remote_conversation_id"],
@@ -412,6 +452,20 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug/transports/{chat_id}")
+async def debug_chat_transport(chat_id: str) -> dict[str, Any]:
+    chat = ensure_chat(chat_id)
+    client = get_chat_client(chat_id, chat)
+    return {
+        "chat_id": chat_id,
+        "transport_mode": chat.get("transport_mode"),
+        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
+        "session_status": client.get_session_status(),
+        "debug_summary": client.get_debug_summary(),
+        "transport_audit": client.get_transport_audit(),
+    }
+
+
 @app.post("/conversation")
 async def create_conversation(request: ConversationRequest):
     if not request.message:
@@ -456,6 +510,8 @@ async def create_chat(request: CreateChatRequest) -> dict[str, Any]:
         "session_id": session_material.get("session_id"),
         "thinking_mode": session_material.get("thinking_mode", "instant"),
         "model_name": session_material.get("model_name", "auto"),
+        "transport_mode": session_material.get("transport_mode", "authenticated"),
+        "allow_anon_fallback": session_material.get("allow_anon_fallback", False),
         "session_material": session_material,
         "remote_conversation_started": False,
         "remote_conversation_id": None,
@@ -469,6 +525,8 @@ async def create_chat(request: CreateChatRequest) -> dict[str, Any]:
         "session_id": chat["session_id"],
         "thinking_mode": chat["thinking_mode"],
         "model_name": chat["model_name"],
+        "transport_mode": chat["transport_mode"],
+        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
     }
 
 
@@ -481,6 +539,8 @@ async def get_chat(chat_id: str) -> dict[str, Any]:
         "session_id": chat["session_id"],
         "thinking_mode": chat["thinking_mode"],
         "model_name": chat["model_name"],
+        "transport_mode": chat["transport_mode"],
+        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
     }
 
 
@@ -499,6 +559,8 @@ async def rename_chat(chat_id: str, request: RenameChatRequest) -> dict[str, Any
         "session_id": chat["session_id"],
         "thinking_mode": chat["thinking_mode"],
         "model_name": chat["model_name"],
+        "transport_mode": chat["transport_mode"],
+        "allow_anon_fallback": chat.get("allow_anon_fallback", False),
     }
 
 
@@ -567,6 +629,8 @@ async def stream_chat_message(chat_id: str, request: SendMessageRequest) -> Stre
                     "session_id": chat["session_id"],
                     "thinking_mode": chat["thinking_mode"],
                     "model_name": chat["model_name"],
+                    "transport_mode": chat["transport_mode"],
+                    "allow_anon_fallback": chat.get("allow_anon_fallback", False),
                 },
             })
         except Exception as exc:
@@ -623,6 +687,8 @@ async def send_chat_message(chat_id: str, request: SendMessageRequest) -> dict[s
             "session_id": chat["session_id"],
             "thinking_mode": chat["thinking_mode"],
             "model_name": chat["model_name"],
+            "transport_mode": chat["transport_mode"],
+            "allow_anon_fallback": chat.get("allow_anon_fallback", False),
         }
     except HTTPException:
         raise

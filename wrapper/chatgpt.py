@@ -13,17 +13,103 @@ from PIL import Image
 from io import BytesIO
 
 class ChatGPT:
-    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant", model_name: str = "auto") -> Any:
+    ANON_ENDPOINTS = {
+        'requirements': 'https://chatgpt.com/backend-anon/sentinel/chat-requirements',
+        'prepare_conversation': 'https://chatgpt.com/backend-anon/f/conversation/prepare',
+        'conversation': 'https://chatgpt.com/backend-anon/f/conversation',
+        'files': 'https://chatgpt.com/backend-anon/files',
+        'process_upload_stream': 'https://chatgpt.com/backend-anon/files/process_upload_stream',
+    }
+    ANON_HEADER_INVENTORY = {
+        'requirements': ['oai-client-version', 'oai-device-id', 'Authorization'],
+        'prepare_conversation': ['oai-client-version', 'oai-device-id', 'Authorization'],
+        'conversation': [
+            'oai-client-version',
+            'oai-device-id',
+            'oai-echo-logs',
+            'openai-sentinel-chat-requirements-token',
+            'openai-sentinel-proof-token',
+            'openai-sentinel-turnstile-token',
+            'x-conduit-token',
+            'Authorization',
+        ],
+        'files': ['oai-client-version', 'oai-device-id', 'Authorization'],
+        'process_upload_stream': ['oai-client-version', 'oai-device-id', 'Authorization'],
+        'file_upload_put': ['Authorization'],
+    }
+    ANON_PAYLOAD_AUDIT = {
+        'history_suppressing_fields': ['history_and_training_disabled'],
+        'account-history-risk_fields': ['history_and_training_disabled'],
+        'shared_conversation_fields': [
+            'action',
+            'messages',
+            'conversation_id',
+            'parent_message_id',
+            'model',
+            'effort',
+            'timezone_offset_min',
+            'timezone',
+            'conversation_mode',
+            'enable_message_followups',
+            'system_hints',
+            'supports_buffering',
+            'supported_encodings',
+            'client_contextual_info',
+            'paragen_cot_summary_display_override',
+            'force_parallel_switch',
+        ],
+        'prepare_payload_fields': [
+            'action',
+            'fork_from_shared_post',
+            'parent_message_id',
+            'conversation_id',
+            'model',
+            'timezone_offset_min',
+            'timezone',
+            'history_and_training_disabled',
+            'conversation_mode',
+            'system_hints',
+            'supports_buffering',
+            'supported_encodings',
+        ],
+        'file_payload_fields': ['file_name', 'file_size', 'use_case', 'timezone_offset_min', 'reset_rate_limits'],
+        'process_upload_fields': ['file_id', 'use_case', 'index_for_retrieval', 'file_name'],
+    }
+    ANON_FLOW_STAGES = [
+        'bootstrap_cookies_and_client_version',
+        'requirements_token_and_turnstile_bootstrap',
+        'prepare_conversation_conduit_token',
+        'optional_file_create_upload_process',
+        'initial_or_followup_conversation_send',
+        'event_stream_parse_and_state_extraction',
+    ]
+    AUTHENTICATED_ENDPOINT_SLOTS = {
+        'requirements': None,
+        'prepare_conversation': None,
+        'conversation': None,
+        'files': None,
+        'process_upload_stream': None,
+        'history_sync': None,
+        'title_sync': None,
+    }
+
+    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant", model_name: str = "auto", transport_mode: str = "authenticated", allow_anon_fallback: bool = False, endpoint_overrides: dict[str, str] | None = None, extra_headers: dict[str, str] | None = None) -> Any:
         self.session: requests.session.Session = requests.Session(impersonate="chrome133a")
         self.session.headers = Headers.DEFAULT
         self.data: dict = {}
         self.authorization: str = authorization
         self.thinking_mode: str = self._normalize_thinking_mode(thinking_mode)
         self.model_name: str = self._normalize_model_name(model_name)
+        self.transport_mode: str = self._normalize_transport_mode(transport_mode)
+        self.allow_anon_fallback: bool = bool(allow_anon_fallback)
+        self.endpoint_overrides: dict[str, str] = dict(endpoint_overrides or {})
+        self.extra_headers: dict[str, str] = dict(extra_headers or {})
         if self.authorization:
             self.session.headers.update({
                 'Authorization': self.authorization
             })
+        if self.extra_headers:
+            self.session.headers.update(self.extra_headers)
 
         if proxy:
             
@@ -38,6 +124,16 @@ class ChatGPT:
         self.session_status: dict = {}
         self.last_request_summary: dict = {'request_sent': False}
         self.last_response_summary: dict = {'response_received': False}
+        self.request_diagnostics: dict = {
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.transport_mode,
+            'endpoint_family': None,
+            'remote_conversation_id': None,
+            'remote_parent_message_id': None,
+            'fallback_occurred': False,
+            'history_verification': 'not_checked',
+            'missing_requirements': [],
+        }
         self.reacts: list = [
             "location",
             "__reactContainer$" + self._generate_react(),
@@ -347,6 +443,12 @@ class ChatGPT:
             return 'auto'
         return normalized_model
 
+    def _normalize_transport_mode(self, transport_mode: str) -> str:
+        normalized_mode = (transport_mode or 'authenticated').strip().lower()
+        if normalized_mode not in {'authenticated', 'anon'}:
+            raise ValueError(f"Unsupported transport_mode: {transport_mode}")
+        return normalized_mode
+
     def _has_identity_cookie(self, cookie_names: list[str]) -> bool:
         identity_cookie_names = {'oai-did', '__Secure-oai-is'}
         identity_cookie_prefixes = ('__Secure-next-auth.session-token',)
@@ -384,7 +486,12 @@ class ChatGPT:
             'authorization_supplied': bool(self.authorization),
             'thinking_mode': self.thinking_mode,
             'model_name': self.model_name,
+            'transport_mode': self.transport_mode,
+            'allow_anon_fallback': self.allow_anon_fallback,
+            'endpoint_override_keys': sorted(self.endpoint_overrides.keys()),
+            'extra_header_keys': sorted(self.extra_headers.keys()),
             'device_id_present': device_id_present,
+            'client_version_present': bool(self.data.get('prod')),
             'session_material_loaded': session_material_loaded,
             'supplied_identity_cookie_present': has_supplied_identity_cookie,
             'current_identity_cookie_present': has_current_identity_cookie,
@@ -401,7 +508,141 @@ class ChatGPT:
             'session_status': dict(self.session_status),
             'last_request_summary': dict(self.last_request_summary),
             'last_response_summary': dict(self.last_response_summary),
+            'request_diagnostics': dict(self.request_diagnostics),
         }
+
+    def _update_request_diagnostics(self, **updates: Any) -> None:
+        self.request_diagnostics.update(updates)
+        if self.data.get('conversation_id'):
+            self.request_diagnostics['remote_conversation_id'] = self.data.get('conversation_id')
+        if self.data.get('parent_message_id'):
+            self.request_diagnostics['remote_parent_message_id'] = self.data.get('parent_message_id')
+
+    def get_transport_audit(self) -> dict:
+        return {
+            'selected_transport_mode': self.transport_mode,
+            'allow_anon_fallback': self.allow_anon_fallback,
+            'anon_endpoints': dict(self.ANON_ENDPOINTS),
+            'anon_header_inventory': dict(self.ANON_HEADER_INVENTORY),
+            'anon_payload_audit': dict(self.ANON_PAYLOAD_AUDIT),
+            'anon_flow_stages': list(self.ANON_FLOW_STAGES),
+            'authenticated_endpoint_slots': dict(self.AUTHENTICATED_ENDPOINT_SLOTS),
+            'diagnostics': dict(self.request_diagnostics),
+            'endpoint_overrides': dict(self.endpoint_overrides),
+            'extra_headers': sorted(self.extra_headers.keys()),
+        }
+
+    def _endpoint_for(self, endpoint_name: str) -> str:
+        if self.request_diagnostics.get('effective_transport_mode') == 'anon' or self.transport_mode == 'anon':
+            return self.ANON_ENDPOINTS[endpoint_name]
+
+        if endpoint_name in self.endpoint_overrides:
+            return self.endpoint_overrides[endpoint_name]
+
+        endpoint = self.AUTHENTICATED_ENDPOINT_SLOTS.get(endpoint_name)
+        if endpoint:
+            return endpoint
+        raise NotImplementedError(
+            f"Authenticated endpoint discovery is incomplete for '{endpoint_name}'. "
+            "Capture logged-in browser traffic before enabling this path."
+        )
+
+    def _missing_authenticated_requirements(self) -> list[str]:
+        missing: list[str] = []
+        if not self.session.cookies:
+            missing.append('cookies')
+        if not self.authorization:
+            missing.append('authorization')
+        if not self.data.get('device-id'):
+            missing.append('device/client header source: oai-device-id')
+        if not self.data.get('prod'):
+            missing.append('device/client header source: oai-client-version')
+        return missing
+
+    def _activate_anon_fallback(self, missing: list[str], reason: str) -> None:
+        self._update_request_diagnostics(
+            effective_transport_mode='anon',
+            endpoint_family='backend-anon',
+            fallback_occurred=True,
+            missing_requirements=missing,
+        )
+        self.last_request_summary = {
+            'request_sent': False,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': 'anon',
+            'endpoint_family': 'backend-anon',
+            'fallback_occurred': True,
+            'missing_requirements': missing,
+            'reason': reason,
+        }
+
+    def _ensure_transport_ready(self, action: str) -> None:
+        if self.transport_mode == 'anon':
+            self._update_request_diagnostics(
+                effective_transport_mode='anon',
+                endpoint_family='backend-anon',
+                fallback_occurred=False,
+                missing_requirements=[],
+            )
+            return
+
+        missing = self._missing_authenticated_requirements()
+        self._update_request_diagnostics(
+            effective_transport_mode='authenticated',
+            endpoint_family='authenticated-web',
+            fallback_occurred=False,
+            missing_requirements=missing,
+        )
+        self.last_request_summary = {
+            'request_sent': False,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': 'authenticated',
+            'endpoint_family': 'authenticated-web',
+            'fallback_occurred': False,
+            'missing_requirements': missing,
+            'action': action,
+        }
+
+        if missing:
+            if self.allow_anon_fallback:
+                self._activate_anon_fallback(missing, f'authenticated preflight failed before {action}')
+                return
+            raise RuntimeError(
+                'Authenticated transport preflight failed; missing required session material: ' + ', '.join(missing)
+            )
+
+        raise NotImplementedError(
+            'Authenticated ChatGPT web transport scaffolding is enabled, but the authenticated request sequence '
+            'has not been implemented yet. Capture logged-in browser traffic before enabling authenticated sends.'
+        )
+
+    def _authenticated_request_placeholder(self, stage: str) -> None:
+        self._update_request_diagnostics(
+            endpoint_family='authenticated-web',
+            history_verification='not_checked',
+        )
+        raise NotImplementedError(
+            f"Authenticated ChatGPT web stage '{stage}' has not been implemented yet. "
+            "Use captured logged-in browser traffic to fill in the endpoint, headers, and payload sequence."
+        )
+
+    def _authenticated_send_initial(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('send_initial')
+
+    def _authenticated_send_followup(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('send_followup')
+
+    def _authenticated_stream_initial(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('stream_initial')
+
+    def _authenticated_stream_followup(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('stream_followup')
+
+    def _authenticated_upload_file(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('upload_file')
+
+    def _authenticated_prepare_conversation(self, *args: Any, **kwargs: Any):
+        self._authenticated_request_placeholder('prepare_conversation')
 
     def _generate_react(self) -> str:
         n = random() 
@@ -489,6 +730,10 @@ class ChatGPT:
             self.data['conversation_id'] = conversation_id
         if parent_message_id:
             self.data['parent_message_id'] = parent_message_id
+        self._update_request_diagnostics(
+            remote_conversation_id=self.data.get('conversation_id'),
+            remote_parent_message_id=self.data.get('parent_message_id'),
+        )
 
         self.response = ''.join(response_parts)
         if not self.response and not conversation_id:
@@ -524,7 +769,7 @@ class ChatGPT:
             'p': p_value,
         }
         
-        requirements_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/sentinel/chat-requirements', json=requirements_data)
+        requirements_request: requests.models.Response = self.session.post(self._endpoint_for('requirements'), json=requirements_data)
 
         if requirements_request.status_code == 200:
             self.data["token"] = requirements_request.json().get("token")
@@ -603,7 +848,7 @@ class ChatGPT:
                 ],
             }
                     
-        conduit_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation/prepare', json=post_data)
+        conduit_request: requests.models.Response = self.session.post(self._endpoint_for('prepare_conversation'), json=post_data)
         
         if '"status":"ok"' in conduit_request.text:
             return conduit_request.json().get("conduit_token")
@@ -614,9 +859,11 @@ class ChatGPT:
             return None
     
     def start_conversation(self, message: str) -> None:
+        self._ensure_transport_ready('start_conversation')
         return self.ask_question_with_file(message)
 
     def upload_file(self, file_name: str, file_b64: str, is_image: bool = False, is_zip: bool = False) -> None:
+        self._ensure_transport_ready('upload_file')
         self.session.headers = Headers.REQUIREMENTS
         self.session.headers.update({
             'oai-client-version': self.data["prod"],
@@ -641,7 +888,7 @@ class ChatGPT:
             'timezone_offset_min': self.timezone_offset,
             'reset_rate_limits': False,
         }
-        file_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/files', json=file_data)
+        file_request: requests.models.Response = self.session.post(self._endpoint_for('files'), json=file_data)
         file_id: str = file_request.json().get("file_id")
         upload_url: str = file_request.json().get("upload_url")
 
@@ -665,7 +912,7 @@ class ChatGPT:
             'file_name': file_name,
         }
 
-        process_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/files/process_upload_stream', json=process_data)
+        process_request: requests.models.Response = self.session.post(self._endpoint_for('process_upload_stream'), json=process_data)
         if "Succeeded processing " in process_request.text:
             return file_id, file_size, width, height
         else:
@@ -676,6 +923,7 @@ class ChatGPT:
         self.ask_question_with_file(message, file_name, image)
     
     def hold_conversation(self, message: str, new: bool = True) -> None:
+        self._ensure_transport_ready('hold_conversation')
         self.index = 2000
         
         if new:
@@ -761,7 +1009,23 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
         
-        conversation_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation', json=conversation_data)
+        self._update_request_diagnostics(endpoint_family='backend-anon')
+        self.last_request_summary = {
+            'request_sent': True,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.request_diagnostics.get('effective_transport_mode'),
+            'endpoint_family': 'backend-anon',
+            'fallback_occurred': self.request_diagnostics.get('fallback_occurred', False),
+            'url': 'https://chatgpt.com/backend-anon/f/conversation',
+            'model': 'auto',
+            'thinking_mode': self.thinking_mode,
+            'message_length': len(new_message),
+            'has_image': False,
+            'authorization_supplied': bool(self.authorization),
+            'cookies_supplied': bool(self._supplied_cookies),
+            'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
+        }
+        conversation_request: requests.models.Response = self.session.post(self._endpoint_for('conversation'), json=conversation_data)
         self.session.cookies.update(conversation_request.cookies)
         
         if 'Unusual activity' in conversation_request.text:
@@ -774,10 +1038,15 @@ class ChatGPT:
             self.data["conversation_id"] = conversation_id
         if parent_message_id:
             self.data["parent_message_id"] = parent_message_id
+        self._update_request_diagnostics(
+            remote_conversation_id=self.data.get('conversation_id'),
+            remote_parent_message_id=self.data.get('parent_message_id'),
+        )
         
         self.response = self._parse_event_stream(conversation_request.text)
 
     def hold_conversation_stream(self, message: str):
+        self._ensure_transport_ready('hold_conversation_stream')
         conduit_token: str = self.get_conduit(next=True)
         self._get_tokens(randint(2000, 3000))
         time_1: int = randint(3000, 6000)
@@ -833,8 +1102,13 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
 
+        self._update_request_diagnostics(endpoint_family='backend-anon')
         self.last_request_summary = {
             'request_sent': True,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.request_diagnostics.get('effective_transport_mode'),
+            'endpoint_family': 'backend-anon',
+            'fallback_occurred': self.request_diagnostics.get('fallback_occurred', False),
             'url': 'https://chatgpt.com/backend-anon/f/conversation',
             'model': self.model_name,
             'thinking_mode': self.thinking_mode,
@@ -846,7 +1120,7 @@ class ChatGPT:
         }
 
         conversation_request: requests.models.Response = self.session.post(
-            'https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300), stream=True
+            self._endpoint_for('conversation'), json=conversation_data, timeout=(30, 300), stream=True
         )
         yield from self._consume_stream_response(conversation_request)
     
@@ -868,6 +1142,7 @@ class ChatGPT:
         return self.response
 
     def ask_question_with_file_stream(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
+        self._ensure_transport_ready('ask_question_with_file_stream')
         model = model or self.model_name
         self._get_tokens()
         conduit_token: str = self.get_conduit()
@@ -957,8 +1232,13 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
 
+        self._update_request_diagnostics(endpoint_family='backend-anon')
         self.last_request_summary = {
             'request_sent': True,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.request_diagnostics.get('effective_transport_mode'),
+            'endpoint_family': 'backend-anon',
+            'fallback_occurred': self.request_diagnostics.get('fallback_occurred', False),
             'url': 'https://chatgpt.com/backend-anon/f/conversation',
             'model': model,
             'thinking_mode': self.thinking_mode,
@@ -970,11 +1250,12 @@ class ChatGPT:
         }
 
         conversation_request: requests.models.Response = self.session.post(
-            'https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300), stream=True
+            self._endpoint_for('conversation'), json=conversation_data, timeout=(30, 300), stream=True
         )
         yield from self._consume_stream_response(conversation_request)
 
     def ask_question_with_file(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
+        self._ensure_transport_ready('ask_question_with_file')
         model = model or self.model_name
         self._get_tokens()
         conduit_token: str = self.get_conduit()
@@ -1093,8 +1374,13 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
 
+        self._update_request_diagnostics(endpoint_family='backend-anon')
         self.last_request_summary = {
             'request_sent': True,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.request_diagnostics.get('effective_transport_mode'),
+            'endpoint_family': 'backend-anon',
+            'fallback_occurred': self.request_diagnostics.get('fallback_occurred', False),
             'url': 'https://chatgpt.com/backend-anon/f/conversation',
             'model': model,
             'thinking_mode': self.thinking_mode,
@@ -1105,7 +1391,7 @@ class ChatGPT:
             'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
         }
 
-        conversation_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300))
+        conversation_request: requests.models.Response = self.session.post(self._endpoint_for('conversation'), json=conversation_data, timeout=(30, 300))
         self.session.cookies.update(conversation_request.cookies)
         self.last_response_summary = {
             'response_received': True,
@@ -1126,6 +1412,10 @@ class ChatGPT:
             self.data["conversation_id"] = conversation_id
         if parent_message_id:
             self.data["parent_message_id"] = parent_message_id
+        self._update_request_diagnostics(
+            remote_conversation_id=self.data.get('conversation_id'),
+            remote_parent_message_id=self.data.get('parent_message_id'),
+        )
         self.response = self._parse_event_stream(conversation_request.text)
         if not self.response and not conversation_id:
             preview = conversation_request.text[:300]
