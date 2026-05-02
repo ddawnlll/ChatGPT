@@ -13,11 +13,12 @@ from PIL import Image
 from io import BytesIO
 
 class ChatGPT:
-    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None) -> Any:
+    def __init__(self, proxy: str=None, cookies: dict = None, authorization: str = None, thinking_mode: str = "instant") -> Any:
         self.session: requests.session.Session = requests.Session(impersonate="chrome133a")
         self.session.headers = Headers.DEFAULT
         self.data: dict = {}
         self.authorization: str = authorization
+        self.thinking_mode: str = self._normalize_thinking_mode(thinking_mode)
         if self.authorization:
             self.session.headers.update({
                 'Authorization': self.authorization
@@ -297,9 +298,41 @@ class ChatGPT:
         if not cookies:
             self._fetch_cookies()
         else:
-            self.session.cookies.update(cookies)
+            self.session.cookies.update(self._normalize_cookies(cookies))
             self._fetch_cookies()
             
+    def _normalize_cookies(self, cookies: Any) -> dict:
+        if isinstance(cookies, dict):
+            return cookies
+
+        if isinstance(cookies, str):
+            normalized: dict = {}
+            for item in cookies.split(';'):
+                if '=' not in item:
+                    continue
+                name, value = item.split('=', 1)
+                name = name.strip()
+                value = value.strip()
+                if name:
+                    normalized[name] = value
+            return normalized
+
+        if isinstance(cookies, list):
+            normalized: dict = {}
+            for cookie in cookies:
+                if isinstance(cookie, dict) and cookie.get('name') is not None:
+                    normalized[str(cookie['name'])] = str(cookie.get('value', ''))
+            return normalized
+
+        return {}
+
+    def _normalize_thinking_mode(self, thinking_mode: str) -> str:
+        allowed_modes = {'instant', 'extended', 'pro'}
+        normalized_mode = (thinking_mode or 'instant').strip().lower()
+        if normalized_mode not in allowed_modes:
+            raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
+        return normalized_mode
+
     def _generate_react(self) -> str:
         n = random() 
         base36 = ''
@@ -628,11 +661,11 @@ class ChatGPT:
             self.ask_question_with_file(message)
         else:
             file_name = f"{str(uuid4())}.png"
-            self.ask_question_with_file(message, file_name, image, is_image=True)
+            self.ask_question_with_file(message, file_name=file_name, file_b64=image, is_image=True)
         
         return self.response
 
-    def ask_question_with_file(self, message: str, model: str = "auto", file_name: str = None, file_b64: str = None) -> str:
+    def ask_question_with_file(self, message: str, model: str = "auto", file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
         self._get_tokens()
         conduit_token: str = self.get_conduit()
 
@@ -724,6 +757,7 @@ class ChatGPT:
             ],
             'parent_message_id': 'client-created-root',
             'model': model,
+            'effort': self.thinking_mode,
             'timezone_offset_min': self.timezone_offset,
             'timezone': self.ip_info[5],
             'history_and_training_disabled': True,
@@ -749,7 +783,7 @@ class ChatGPT:
             'force_parallel_switch': 'auto',
         }
 
-        conversation_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, None))
+        conversation_request: requests.models.Response = self.session.post('https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300))
         self.session.cookies.update(conversation_request.cookies)
         
         if 'Unusual activity' in conversation_request.text:

@@ -1,0 +1,17 @@
+{
+  "session_id": "example-session-001",
+  "message": "Test",
+  "thinking_mode": "instant",
+  "authorization": null,
+  "cookies": [
+    {
+      "name": "session_cookie",
+      "value": "REDACTED",
+      "domain": "example.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    }
+  ]
+}
