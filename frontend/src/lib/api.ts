@@ -42,7 +42,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || `Request failed with ${response.status}`)
+    throw new Error(`${response.status}: ${text || `Request failed with ${response.status}`}`)
   }
 
   return response.json() as Promise<T>

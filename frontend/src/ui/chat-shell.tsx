@@ -36,12 +36,13 @@ export function ChatShell() {
   const [titleInput, setTitleInput] = useState('')
   const [renameInput, setRenameInput] = useState('')
 
-  const chatsQuery = useQuery({ queryKey: ['chats'], queryFn: listChats })
+  const chatsQuery = useQuery({ queryKey: ['chats'], queryFn: listChats, retry: false })
   const activeChatId = params.chatId
   const chatQuery = useQuery({
     queryKey: ['chat', activeChatId],
     queryFn: () => getChat(activeChatId!),
     enabled: Boolean(activeChatId),
+    retry: false,
   })
 
   const createChatMutation = useMutation({

@@ -361,6 +361,7 @@ def load_chats_from_db() -> None:
             session_id = chat.get("session_id")
             if session_id:
                 SESSION_STORE[session_id] = chat["session_material"]
+    print(f"[startup] loaded {len(CHAT_STORE)} chats from {DB_PATH}")
 
 
 

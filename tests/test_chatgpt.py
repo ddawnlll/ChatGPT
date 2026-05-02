@@ -1,3 +1,4 @@
+import pytest
 import wrapper.chatgpt as chatgpt_mod
 
 
@@ -71,6 +72,19 @@ def test_ask_question_text_payload_includes_selected_thinking_mode(monkeypatch):
     assert captured["json"]["messages"][0]["content"]["parts"] == ["hello"]
 
 
+def test_ask_question_without_ids_still_returns_answer(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    def fake_post(url, json=None, timeout=None):
+        return DummyResponse('data: {"o":"append","p":"/message/content/parts/0","v":"plain answer"}\n')
+
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
+    client.session.post = fake_post
+
+    response = client.ask_question("hello")
+    assert response == "plain answer"
+
+
 def test_ask_question_image_path_uses_multimodal_payload(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
 
@@ -112,3 +126,18 @@ def test_ask_question_image_path_uses_multimodal_payload(monkeypatch):
     assert captured["json"]["model"] == "generic-model-id"
     assert captured["json"]["messages"][0]["content"]["content_type"] == "multimodal_text"
     assert captured["json"]["messages"][0]["content"]["parts"][1] == "describe this"
+
+
+def test_ask_question_raises_clear_error_when_response_is_empty(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    def fake_post(url, json=None, timeout=None):
+        return DummyResponse('unexpected response')
+
+    client = chatgpt_mod.ChatGPT(thinking_mode="extended", model_name="generic-model-id")
+    client.session.post = fake_post
+
+    with pytest.raises(RuntimeError) as exc:
+        client.ask_question("hello")
+
+    assert "Conversation response did not contain a usable answer or conversation id" in str(exc.value)

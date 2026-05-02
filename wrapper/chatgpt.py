@@ -413,6 +413,12 @@ class ChatGPT:
             base36 = chars[r] + base36
         return base36
     
+    def _safe_extract(self, text: str, start: str, end: str) -> str | None:
+        try:
+            return Utils.between(text, start, end)
+        except Exception:
+            return None
+
     def _parse_event_stream(self, stream_data: str) -> str:
         result: list = []
         lines: list = stream_data.strip().split('\n')
@@ -720,8 +726,12 @@ class ChatGPT:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
             exit(conversation_request.status_code)
         
-        self.data["conversation_id"] = Utils.between(conversation_request.text, '"conversation_id": "', '"')
-        self.data["parent_message_id"] = Utils.between(conversation_request.text, '"message_id": "', '"')
+        conversation_id = self._safe_extract(conversation_request.text, '"conversation_id": "', '"')
+        parent_message_id = self._safe_extract(conversation_request.text, '"message_id": "', '"')
+        if conversation_id:
+            self.data["conversation_id"] = conversation_id
+        if parent_message_id:
+            self.data["parent_message_id"] = parent_message_id
         
         self.response = self._parse_event_stream(conversation_request.text)
     
@@ -881,7 +891,14 @@ class ChatGPT:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
             exit(conversation_request.status_code)
         
-        self.data["conversation_id"] = Utils.between(conversation_request.text, '"conversation_id": "', '"')
-        self.data["parent_message_id"] = Utils.between(conversation_request.text, '"message_id": "', '"')
+        conversation_id = self._safe_extract(conversation_request.text, '"conversation_id": "', '"')
+        parent_message_id = self._safe_extract(conversation_request.text, '"message_id": "', '"')
+        if conversation_id:
+            self.data["conversation_id"] = conversation_id
+        if parent_message_id:
+            self.data["parent_message_id"] = parent_message_id
         self.response = self._parse_event_stream(conversation_request.text)
+        if not self.response and not conversation_id:
+            preview = conversation_request.text[:300]
+            raise RuntimeError(f"Conversation response did not contain a usable answer or conversation id. Preview: {preview}")
         return self.response
