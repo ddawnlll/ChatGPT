@@ -245,6 +245,27 @@ def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(m
     assert client.get_debug_summary()["last_request_summary"]["history_and_training_disabled_sent"] is False
 
 
+def test_centralized_header_builder_does_not_mutate_templates(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    original_conversation_authorization = chatgpt_mod.Headers.CONVERSATION.get("Authorization")
+    client = chatgpt_mod.ChatGPT(transport_mode="anon", authorization="Bearer abc")
+
+    headers = client._headers_for(
+        "conversation",
+        extra={"x-conduit-token": "conduit-token", "openai-sentinel-proof-token": "proof-token"},
+        authenticated=False,
+    )
+
+    assert headers["Authorization"] == "Bearer abc"
+    assert headers["oai-client-version"] == "prod-123"
+    assert headers["oai-device-id"] == "did-123"
+    assert headers["x-conduit-token"] == "conduit-token"
+    assert headers["openai-sentinel-proof-token"] == "proof-token"
+    assert chatgpt_mod.Headers.CONVERSATION.get("Authorization") == original_conversation_authorization
+    assert chatgpt_mod.Headers.CONVERSATION["x-conduit-token"] == ""
+
+
 def test_authenticated_mode_can_explicitly_fallback_to_anon(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
 

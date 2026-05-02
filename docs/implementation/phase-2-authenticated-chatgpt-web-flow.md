@@ -454,7 +454,7 @@ Title/sidebar/history-specific result:
 
 ## 8. Workstream C — `wrapper/chatgpt.py` Refactor into Anon vs Authenticated Paths
 
-**Status:** In progress
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -469,12 +469,12 @@ The current wrapper has one dominant path built around `backend-anon`. We need t
 - [x] Split request construction into anon vs authenticated branches at the scaffolding boundary
 - [x] Enforce that authenticated branches do not call any `/backend-anon/...` endpoints in the current scaffolding pass
 - [x] Add an authenticated session validation step before any send/stream operation
-- [ ] Separate shared logic from transport-specific logic:
+- [x] Separate shared logic from transport-specific logic:
   - event stream parsing
   - response extraction
   - conversation state updates
   - file metadata assembly
-- [ ] Centralize header construction for each mode
+- [x] Centralize header construction for each mode
 - [x] Centralize endpoint selection for each mode
 - [x] Add diagnostics showing which transport path was used and which required auth/session fields were present
 
@@ -502,6 +502,18 @@ class ChatGPT:
 - [x] Authenticated mode is the default constructor behavior
 - [x] Authenticated mode never silently routes into anon flow
 - [x] Existing anon behavior remains usable for debugging/fallback
+
+### Completion Notes
+
+Workstream C is complete as a structural refactor boundary:
+
+- endpoint selection is centralized through `_endpoint_for(...)`
+- mode readiness/fallback behavior is centralized through `_ensure_transport_ready(...)`
+- per-stage header construction is centralized through `_headers_for(...)` / `_set_headers_for(...)`
+- stream parsing is shared through `_extract_stream_chunks(...)`, `_parse_event_stream(...)`, and `_consume_stream_response(...)`
+- remote state extraction/update is shared through `_extract_conversation_state(...)` and `_apply_conversation_state_from_text(...)`
+- authenticated file/message metadata construction is factored into `_build_message_payload(...)`
+- anon mode remains available and still uses the existing sentinel/conduit implementation behind explicit `transport_mode="anon"` or explicit fallback
 
 ---
 

@@ -619,15 +619,40 @@ class ChatGPT:
 
         return
 
-    def _authenticated_headers(self, accept: str = 'text/event-stream') -> dict[str, str]:
-        headers = {
-            'accept': accept,
-            'content-type': 'application/json',
+    def _headers_for(self, stage: str, extra: dict[str, Any] | None = None, authenticated: bool | None = None) -> dict[str, str]:
+        authenticated = self.request_diagnostics.get('effective_transport_mode') == 'authenticated' if authenticated is None else authenticated
+        templates = {
+            'default': Headers.DEFAULT,
+            'requirements': Headers.REQUIREMENTS,
+            'prepare_conversation': Headers.CONDUIT,
+            'conversation': Headers.CONVERSATION,
+            'files': Headers.REQUIREMENTS,
+            'process_upload_stream': Headers.REQUIREMENTS,
+            'file_upload_put': Headers.FILE,
+        }
+        headers = dict(templates.get(stage, Headers.DEFAULT))
+        common = {
             'oai-client-version': self.data.get('prod'),
             'oai-device-id': self.data.get('device-id'),
-            'Authorization': self.authorization,
         }
-        return {key: value for key, value in headers.items() if value}
+        if authenticated:
+            common['oai-language'] = headers.get('oai-language', 'de-DE')
+        if self.authorization:
+            common['Authorization'] = self.authorization
+        headers.update({key: value for key, value in common.items() if value})
+        if extra:
+            headers.update({key: str(value) for key, value in extra.items() if value is not None})
+        return headers
+
+    def _set_headers_for(self, stage: str, extra: dict[str, Any] | None = None, authenticated: bool | None = None) -> None:
+        self.session.headers = self._headers_for(stage, extra=extra, authenticated=authenticated)
+
+    def _authenticated_headers(self, accept: str = 'text/event-stream') -> dict[str, str]:
+        return self._headers_for(
+            'conversation',
+            extra={'accept': accept, 'content-type': 'application/json'},
+            authenticated=True,
+        )
 
     def _build_message_payload(self, message: str, file_name: str = None, file_b64: str = None, is_image: bool = False) -> tuple[dict, bool]:
         msg = {
@@ -707,6 +732,18 @@ class ChatGPT:
         message_id = self._safe_extract(text, '"message_id": "', '"') or self._safe_extract(text, '"message_id":"', '"')
         return conversation_id, message_id
 
+    def _apply_conversation_state_from_text(self, text: str) -> tuple[str | None, str | None]:
+        conversation_id, parent_message_id = self._extract_conversation_state(text)
+        if conversation_id:
+            self.data['conversation_id'] = conversation_id
+        if parent_message_id:
+            self.data['parent_message_id'] = parent_message_id
+        self._update_request_diagnostics(
+            remote_conversation_id=self.data.get('conversation_id'),
+            remote_parent_message_id=self.data.get('parent_message_id'),
+        )
+        return conversation_id, parent_message_id
+
     def _record_conversation_request(self, url: str, model: str, message: str, has_image: bool, stream: bool = False) -> None:
         self._update_request_diagnostics(endpoint_family='authenticated-web')
         self.last_request_summary = {
@@ -731,20 +768,12 @@ class ChatGPT:
         model = model or self.model_name
         payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
         url = self._endpoint_for('conversation')
-        self.session.headers = self._authenticated_headers()
+        self._set_headers_for('conversation', authenticated=True)
         self._record_conversation_request(url, model, message, has_image)
         conversation_request = self.session.post(url, json=payload, timeout=(30, 300))
         self.session.cookies.update(conversation_request.cookies)
         text = conversation_request.text
-        conversation_id, parent_message_id = self._extract_conversation_state(text)
-        if conversation_id:
-            self.data['conversation_id'] = conversation_id
-        if parent_message_id:
-            self.data['parent_message_id'] = parent_message_id
-        self._update_request_diagnostics(
-            remote_conversation_id=self.data.get('conversation_id'),
-            remote_parent_message_id=self.data.get('parent_message_id'),
-        )
+        conversation_id, parent_message_id = self._apply_conversation_state_from_text(text)
         self.last_response_summary = {
             'response_received': True,
             'status_code': getattr(conversation_request, 'status_code', None),
@@ -768,7 +797,7 @@ class ChatGPT:
         model = model or self.model_name
         payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
         url = self._endpoint_for('conversation')
-        self.session.headers = self._authenticated_headers()
+        self._set_headers_for('conversation', authenticated=True)
         self._record_conversation_request(url, model, message, has_image, stream=True)
         conversation_request = self.session.post(url, json=payload, timeout=(30, 300), stream=True)
         yield from self._consume_stream_response(conversation_request)
@@ -794,7 +823,7 @@ class ChatGPT:
             'timezone_offset_min': self.timezone_offset,
             'reset_rate_limits': False,
         }
-        self.session.headers = self._authenticated_headers('application/json')
+        self._set_headers_for('files', authenticated=True)
         create_request = self.session.post(self._endpoint_for('files'), json=file_data, timeout=(30, 120))
         created = create_request.json()
         file_id = created.get('file_id') or created.get('id')
@@ -897,16 +926,7 @@ class ChatGPT:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
             exit(conversation_request.status_code)
 
-        conversation_id = self._safe_extract(raw_text, '"conversation_id": "', '"')
-        parent_message_id = self._safe_extract(raw_text, '"message_id": "', '"')
-        if conversation_id:
-            self.data['conversation_id'] = conversation_id
-        if parent_message_id:
-            self.data['parent_message_id'] = parent_message_id
-        self._update_request_diagnostics(
-            remote_conversation_id=self.data.get('conversation_id'),
-            remote_parent_message_id=self.data.get('parent_message_id'),
-        )
+        conversation_id, _ = self._apply_conversation_state_from_text(raw_text)
 
         self.response = ''.join(response_parts)
         if not self.response and not conversation_id:
@@ -927,12 +947,7 @@ class ChatGPT:
     
     def _get_tokens(self, process_time: int=randint(1400, 2000)) -> None:
         
-        self.session.headers = Headers.REQUIREMENTS
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
-            'Authorization': self.authorization
-        })
+        self._set_headers_for('requirements')
         
         p_value: str = Challenges.generate_token(self.data["config"])
         self.data["vm_token"] = p_value
@@ -975,12 +990,7 @@ class ChatGPT:
         ]
 
     def get_conduit(self, next: bool = False) -> str:
-        self.session.headers = Headers.CONDUIT
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
-            'Authorization': self.authorization
-        })
+        self._set_headers_for('prepare_conversation')
 
         if not next:
             post_data: dict = {
@@ -1040,12 +1050,7 @@ class ChatGPT:
         if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
             return self._authenticated_upload_file(file_name, file_b64, is_image=is_image, is_zip=is_zip)
 
-        self.session.headers = Headers.REQUIREMENTS
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
-            'Authorization': self.authorization
-        })
+        self._set_headers_for('files')
 
         if file_b64.startswith("data:"):
             file_b64 = file_b64.split(",")[1]
@@ -1068,18 +1073,10 @@ class ChatGPT:
         file_id: str = file_request.json().get("file_id")
         upload_url: str = file_request.json().get("upload_url")
 
-        self.session.headers = Headers.FILE
-        self.session.headers.update({
-            'Authorization': self.authorization
-        })
+        self._set_headers_for('file_upload_put')
         upload_request: requests.models.Response = self.session.put(upload_url, data=b64decode(file_b64))
 
-        self.session.headers = Headers.REQUIREMENTS
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
-            'Authorization': self.authorization
-        })
+        self._set_headers_for('process_upload_stream')
 
         process_data: dict = {
             'file_id': file_id,
@@ -1120,16 +1117,12 @@ class ChatGPT:
         turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
 
 
-        self.session.headers = Headers.CONVERSATION
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
+        self._set_headers_for('conversation', extra={
             'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
             'openai-sentinel-chat-requirements-token': self.data["token"],
             'openai-sentinel-proof-token': proof_token,
             'openai-sentinel-turnstile-token': turnstile_token,
             'x-conduit-token': conduit_token,
-            'Authorization': self.authorization
         })
         
         if new:
@@ -1212,16 +1205,7 @@ class ChatGPT:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
             exit(conversation_request.status_code)
         
-        conversation_id = self._safe_extract(conversation_request.text, '"conversation_id": "', '"')
-        parent_message_id = self._safe_extract(conversation_request.text, '"message_id": "', '"')
-        if conversation_id:
-            self.data["conversation_id"] = conversation_id
-        if parent_message_id:
-            self.data["parent_message_id"] = parent_message_id
-        self._update_request_diagnostics(
-            remote_conversation_id=self.data.get('conversation_id'),
-            remote_parent_message_id=self.data.get('parent_message_id'),
-        )
+        self._apply_conversation_state_from_text(conversation_request.text)
         
         self.response = self._parse_event_stream(conversation_request.text)
 
@@ -1237,16 +1221,12 @@ class ChatGPT:
         proof_token: str = Challenges.solve_pow(self.data["proofofwork"]["seed"], self.data["proofofwork"]["difficulty"], self.data["config"])
         turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
 
-        self.session.headers = Headers.CONVERSATION
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
+        self._set_headers_for('conversation', extra={
             'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
             'openai-sentinel-chat-requirements-token': self.data["token"],
             'openai-sentinel-proof-token': proof_token,
             'openai-sentinel-turnstile-token': turnstile_token,
             'x-conduit-token': conduit_token,
-            'Authorization': self.authorization
         })
 
         conversation_data = {
@@ -1339,16 +1319,12 @@ class ChatGPT:
         proof_token: str = Challenges.solve_pow(self.data["proofofwork"]["seed"], self.data["proofofwork"]["difficulty"], self.data["config"])
         turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
 
-        self.session.headers = Headers.CONVERSATION
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
+        self._set_headers_for('conversation', extra={
             'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
             'openai-sentinel-chat-requirements-token': self.data["token"],
             'openai-sentinel-proof-token': proof_token,
             'openai-sentinel-turnstile-token': turnstile_token,
             'x-conduit-token': conduit_token,
-            'Authorization': self.authorization
         })
 
         msg = {
@@ -1455,16 +1431,12 @@ class ChatGPT:
         proof_token: str = Challenges.solve_pow(self.data["proofofwork"]["seed"], self.data["proofofwork"]["difficulty"], self.data["config"])
         turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
 
-        self.session.headers = Headers.CONVERSATION
-        self.session.headers.update({
-            'oai-client-version': self.data["prod"],
-            'oai-device-id': self.data["device-id"],
+        self._set_headers_for('conversation', extra={
             'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
             'openai-sentinel-chat-requirements-token': self.data["token"],
             'openai-sentinel-proof-token': proof_token,
             'openai-sentinel-turnstile-token': turnstile_token,
             'x-conduit-token': conduit_token,
-            'Authorization': self.authorization
         })
 
         
@@ -1597,16 +1569,7 @@ class ChatGPT:
             Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
             exit(conversation_request.status_code)
         
-        conversation_id = self._safe_extract(conversation_request.text, '"conversation_id": "', '"')
-        parent_message_id = self._safe_extract(conversation_request.text, '"message_id": "', '"')
-        if conversation_id:
-            self.data["conversation_id"] = conversation_id
-        if parent_message_id:
-            self.data["parent_message_id"] = parent_message_id
-        self._update_request_diagnostics(
-            remote_conversation_id=self.data.get('conversation_id'),
-            remote_parent_message_id=self.data.get('parent_message_id'),
-        )
+        conversation_id, _ = self._apply_conversation_state_from_text(conversation_request.text)
         self.response = self._parse_event_stream(conversation_request.text)
         if not self.response and not conversation_id:
             preview = conversation_request.text[:300]
