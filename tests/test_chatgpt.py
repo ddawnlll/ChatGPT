@@ -181,6 +181,19 @@ def test_authenticated_mode_fails_loudly_without_required_session_material(monke
     assert diagnostics["history_verification"] == "not_checked"
 
 
+def test_authenticated_mode_accepts_cookie_session_without_authorization(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(transport_mode="authenticated", cookies={"session": "token"})
+
+    with pytest.raises(NotImplementedError):
+        client._endpoint_for("missing-auth-endpoint")
+
+    missing = client._missing_authenticated_requirements()
+    assert "authorization" not in " ".join(missing)
+    assert "cookies" not in missing
+
+
 def test_transport_audit_exposes_anon_endpoints_and_authenticated_slots(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
 
@@ -204,13 +217,21 @@ def test_transport_audit_exposes_anon_endpoints_and_authenticated_slots(monkeypa
 
 def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
+    monkeypatch.setattr(chatgpt_mod.Challenges, "generate_token", staticmethod(lambda config: "vm-token"))
 
-    captured = {}
+    calls = []
 
     def fake_post(url, json=None, timeout=None):
-        captured["url"] = url
-        captured["json"] = json
-        captured["timeout"] = timeout
+        calls.append({"url": url, "json": json, "timeout": timeout, "headers": dict(client.session.headers)})
+        if url.endswith("/f/conversation/prepare"):
+            return DummyResponse('{"status":"ok","conduit_token":"conduit-auth"}', json_data={"status": "ok", "conduit_token": "conduit-auth"})
+        if url.endswith("/sentinel/chat-requirements/prepare"):
+            return DummyResponse(
+                '{"prepare_token":"prep-auth","proofofwork":{"seed":"seed","difficulty":"abc"},"turnstile":{"dx":"dx"}}',
+                json_data={"prepare_token": "prep-auth", "proofofwork": {"seed": "seed", "difficulty": "abc"}, "turnstile": {"dx": "dx"}},
+            )
+        if url.endswith("/sentinel/chat-requirements/finalize"):
+            return DummyResponse('{"token":"requirements-auth"}', json_data={"token": "requirements-auth"})
         return DummyResponse(
             'data: {"o":"append","p":"/message/content/parts/0","v":"auth answer"}\n'
             '"conversation_id":"conv-auth","message_id":"msg-auth"\n'
@@ -226,14 +247,29 @@ def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(m
     response = client.ask_question("hello")
 
     assert response == "auth answer"
-    assert captured["url"] == "https://chatgpt.com/backend-api/f/conversation"
-    assert captured["timeout"] == (30, 300)
-    assert captured["json"]["action"] == "next"
-    assert captured["json"]["parent_message_id"] == "client-created-root"
-    assert captured["json"]["messages"][0]["content"]["parts"] == ["hello"]
-    assert captured["json"]["thinking_effort"] == "instant"
-    assert "effort" not in captured["json"]
-    assert "history_and_training_disabled" not in captured["json"]
+    assert [call["url"] for call in calls] == [
+        "https://chatgpt.com/backend-api/f/conversation/prepare",
+        "https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare",
+        "https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize",
+        "https://chatgpt.com/backend-api/f/conversation",
+    ]
+    prepare_payload = calls[0]["json"]
+    assert prepare_payload["client_prepare_state"] == "none"
+    assert prepare_payload["partial_query"]["content"]["parts"] == ["h"]
+
+    send_call = calls[-1]
+    assert send_call["timeout"] == (30, 300)
+    assert send_call["headers"]["x-conduit-token"] == "conduit-auth"
+    assert send_call["headers"]["openai-sentinel-chat-requirements-token"] == "requirements-auth"
+    assert send_call["headers"]["openai-sentinel-proof-token"] == "proof-token"
+    assert send_call["headers"]["openai-sentinel-turnstile-token"] == "turnstile-token"
+    assert send_call["json"]["action"] == "next"
+    assert send_call["json"]["parent_message_id"] == "client-created-root"
+    assert send_call["json"]["client_prepare_state"] == "success"
+    assert send_call["json"]["messages"][0]["content"]["parts"] == ["hello"]
+    assert send_call["json"]["thinking_effort"] == "instant"
+    assert "effort" not in send_call["json"]
+    assert "history_and_training_disabled" not in send_call["json"]
     assert client.data["conversation_id"] == "conv-auth"
     assert client.data["parent_message_id"] == "msg-auth"
 
@@ -243,6 +279,42 @@ def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(m
     assert diagnostics["fallback_occurred"] is False
     assert diagnostics["remote_conversation_id"] == "conv-auth"
     assert client.get_debug_summary()["last_request_summary"]["history_and_training_disabled_sent"] is False
+
+
+def test_authenticated_stream_handoff_updates_state_without_text_chunks(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(transport_mode="authenticated", cookies={"session": "token"})
+    response = DummyResponse(
+        'event: delta_encoding\n'
+        'data: "v1"\n\n'
+        'data: {"type":"resume_conversation_token","token":"resume-token"}\n\n'
+        'data: {"type":"stream_handoff","conversation_id":"conv-auth","turn_exchange_id":"turn-auth"}\n\n'
+        'data: [DONE]\n'
+    )
+
+    chunks = list(client._consume_stream_response(response))
+
+    assert chunks == []
+    assert client.data["conversation_id"] == "conv-auth"
+    assert client.data["turn_exchange_id"] == "turn-auth"
+    assert client.data["resume_conversation_token"] == "resume-token"
+    summary = client.get_debug_summary()["last_response_summary"]
+    assert summary["conversation_id_found"] is True
+    assert summary["stream_handoff_found"] is True
+    assert summary["resume_token_found"] is True
+
+
+def test_authenticated_stream_parser_handles_delta_shapes(monkeypatch):
+    _patch_chatgpt_bootstrap(monkeypatch)
+
+    client = chatgpt_mod.ChatGPT(transport_mode="authenticated", cookies={"session": "token"})
+
+    assert client._extract_stream_chunks('data: {"type":"delta","delta":"hello"}') == ["hello"]
+    assert client._extract_stream_chunks('data: {"type":"message_delta","text":" there"}') == [" there"]
+    assert client._extract_stream_chunks(
+        'data: {"type":"message","message":{"content":{"parts":["nested"]}}}'
+    ) == ["nested"]
 
 
 def test_centralized_header_builder_does_not_mutate_templates(monkeypatch):

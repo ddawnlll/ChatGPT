@@ -557,8 +557,8 @@ class ChatGPT:
         missing: list[str] = []
         if not self._supplied_cookies:
             missing.append('cookies')
-        if not self.authorization:
-            missing.append('authorization')
+        if not (self.authorization or self._supplied_cookies):
+            missing.append('authorization or authenticated cookies')
         if not self.data.get('device-id'):
             missing.append('device/client header source: oai-device-id')
         if not self.data.get('prod'):
@@ -696,7 +696,48 @@ class ChatGPT:
         msg['content'] = {'content_type': 'text', 'parts': [message]}
         return msg, False
 
-    def _authenticated_conversation_payload(self, message: str, model: str, file_name: str = None, file_b64: str = None, is_image: bool = False) -> tuple[dict, bool]:
+    def _authenticated_client_contextual_info(self) -> dict:
+        return {
+            'is_dark_mode': True,
+            'time_since_loaded': randint(3, 6),
+            'page_height': 1219,
+            'page_width': 3440,
+            'pixel_ratio': 1,
+            'screen_height': 1440,
+            'screen_width': 3440,
+        }
+
+    def _authenticated_prepare_payload(self, message: str, model: str, file_name: str = None) -> dict:
+        payload = {
+            'action': 'next',
+            'fork_from_shared_post': False,
+            'parent_message_id': self.data.get('parent_message_id') or 'client-created-root',
+            'model': model,
+            'timezone_offset_min': self.timezone_offset,
+            'timezone': self.ip_info[5],
+            'conversation_mode': {'kind': 'primary_assistant'},
+            'system_hints': [],
+            'supports_buffering': True,
+            'supported_encodings': ['v1'],
+            'client_contextual_info': self._authenticated_client_contextual_info(),
+            'client_prepare_state': 'none',
+            'thinking_effort': self.thinking_mode,
+        }
+        if message:
+            payload['partial_query'] = {
+                'id': str(uuid4()),
+                'author': {'role': 'user'},
+                'content': {'content_type': 'text', 'parts': [message[:1]]},
+            }
+        if self.data.get('conversation_id'):
+            payload['conversation_id'] = self.data['conversation_id']
+        if file_name:
+            mime_type = guess_type(file_name)[0]
+            if mime_type:
+                payload['attachment_mime_types'] = [mime_type]
+        return payload
+
+    def _authenticated_conversation_payload(self, message: str, model: str, file_name: str = None, file_b64: str = None, is_image: bool = False, client_prepare_state: str = 'success') -> tuple[dict, bool]:
         msg, has_image = self._build_message_payload(message, file_name, file_b64, is_image)
         payload = {
             'action': 'next',
@@ -711,15 +752,8 @@ class ChatGPT:
             'system_hints': [],
             'supports_buffering': True,
             'supported_encodings': ['v1'],
-            'client_contextual_info': {
-                'is_dark_mode': True,
-                'time_since_loaded': randint(3, 6),
-                'page_height': 1219,
-                'page_width': 3440,
-                'pixel_ratio': 1,
-                'screen_height': 1440,
-                'screen_width': 3440,
-            },
+            'client_contextual_info': self._authenticated_client_contextual_info(),
+            'client_prepare_state': client_prepare_state,
             'paragen_cot_summary_display_override': 'allow',
             'force_parallel_switch': 'auto',
         }
@@ -731,6 +765,35 @@ class ChatGPT:
         conversation_id = self._safe_extract(text, '"conversation_id": "', '"') or self._safe_extract(text, '"conversation_id":"', '"')
         message_id = self._safe_extract(text, '"message_id": "', '"') or self._safe_extract(text, '"message_id":"', '"')
         return conversation_id, message_id
+
+    def _extract_authenticated_stream_metadata(self, text: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            'stream_handoff_found': False,
+            'resume_token_found': False,
+            'turn_exchange_id': None,
+        }
+        for line in text.splitlines():
+            if not line.startswith('data:'):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == '[DONE]':
+                continue
+            try:
+                data = loads(data_str)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get('type') == 'stream_handoff':
+                metadata['stream_handoff_found'] = True
+                metadata['turn_exchange_id'] = data.get('turn_exchange_id')
+                if data.get('turn_exchange_id'):
+                    self.data['turn_exchange_id'] = data.get('turn_exchange_id')
+            if data.get('type') == 'resume_conversation_token':
+                metadata['resume_token_found'] = bool(data.get('token'))
+                if data.get('token'):
+                    self.data['resume_conversation_token'] = data.get('token')
+        return metadata
 
     def _apply_conversation_state_from_text(self, text: str) -> tuple[str | None, str | None]:
         conversation_id, parent_message_id = self._extract_conversation_state(text)
@@ -764,16 +827,76 @@ class ChatGPT:
             'history_and_training_disabled_sent': False,
         }
 
+    def _authenticated_chat_requirements(self) -> dict:
+        self._set_headers_for('requirements', authenticated=True)
+        p_value = Challenges.generate_token(self.data['config'])
+        self.data['vm_token'] = p_value
+        self.data['config'] = self._get_config(randint(1400, 2000))
+        prepare_request = self.session.post(self._endpoint_for('requirements'), json={'p': p_value}, timeout=(30, 120))
+        if prepare_request.status_code and prepare_request.status_code >= 400:
+            raise RuntimeError(f"Authenticated requirements prepare failed with status {prepare_request.status_code}. Preview: {prepare_request.text[:300]}")
+        prepared = prepare_request.json()
+        proof_token = Challenges.solve_pow(
+            prepared.get('proofofwork', {}).get('seed'),
+            prepared.get('proofofwork', {}).get('difficulty'),
+            self.data['config'],
+        )
+        turnstile_dx = (prepared.get('turnstile') or {}).get('dx')
+        turnstile_token = VM.get_turnstile(turnstile_dx, p_value, str(self.ip_info[:-1])) if turnstile_dx else None
+        finalize_payload = {
+            'prepare_token': prepared.get('prepare_token'),
+            'proofofwork': proof_token,
+            'turnstile': turnstile_token,
+        }
+        self._set_headers_for('requirements', authenticated=True)
+        finalize_request = self.session.post(self._endpoint_for('requirements_finalize'), json=finalize_payload, timeout=(30, 120))
+        if finalize_request.status_code and finalize_request.status_code >= 400:
+            raise RuntimeError(f"Authenticated requirements finalize failed with status {finalize_request.status_code}. Preview: {finalize_request.text[:300]}")
+        finalized = finalize_request.json()
+        token = finalized.get('token')
+        if not token:
+            raise RuntimeError(f"Authenticated requirements finalize response did not include token. Preview: {finalize_request.text[:300]}")
+        self.data['token'] = token
+        self.data['proof_token'] = proof_token
+        self.data['turnstile_token'] = turnstile_token
+        return {
+            'chat_requirements_token': token,
+            'proof_token': proof_token,
+            'turnstile_token': turnstile_token,
+        }
+
+    def _authenticated_prepare_conversation(self, message: str, model: str, file_name: str = None) -> str:
+        payload = self._authenticated_prepare_payload(message, model, file_name=file_name)
+        self._set_headers_for('prepare_conversation', authenticated=True)
+        prepare_request = self.session.post(self._endpoint_for('prepare_conversation'), json=payload, timeout=(30, 120))
+        if prepare_request.status_code and prepare_request.status_code >= 400:
+            raise RuntimeError(f"Authenticated conversation prepare failed with status {prepare_request.status_code}. Preview: {prepare_request.text[:300]}")
+        prepared = prepare_request.json()
+        conduit_token = prepared.get('conduit_token')
+        if not conduit_token:
+            raise RuntimeError(f"Authenticated conversation prepare response did not include conduit_token. Preview: {prepare_request.text[:300]}")
+        self.data['conduit_token'] = conduit_token
+        return conduit_token
+
     def _authenticated_send_initial(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
         model = model or self.model_name
+        conduit_token = self._authenticated_prepare_conversation(message, model, file_name=file_name)
+        requirements = self._authenticated_chat_requirements()
         payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
         url = self._endpoint_for('conversation')
-        self._set_headers_for('conversation', authenticated=True)
+        self._set_headers_for('conversation', extra={
+            'openai-sentinel-chat-requirements-token': requirements['chat_requirements_token'],
+            'openai-sentinel-proof-token': requirements['proof_token'],
+            'openai-sentinel-turnstile-token': requirements['turnstile_token'],
+            'x-conduit-token': conduit_token,
+        }, authenticated=True)
         self._record_conversation_request(url, model, message, has_image)
         conversation_request = self.session.post(url, json=payload, timeout=(30, 300))
         self.session.cookies.update(conversation_request.cookies)
         text = conversation_request.text
         conversation_id, parent_message_id = self._apply_conversation_state_from_text(text)
+        stream_metadata = self._extract_authenticated_stream_metadata(text)
+        self._update_request_diagnostics(**stream_metadata)
         self.last_response_summary = {
             'response_received': True,
             'status_code': getattr(conversation_request, 'status_code', None),
@@ -781,6 +904,7 @@ class ChatGPT:
             'unusual_activity': 'Unusual activity' in text,
             'conversation_id_found': bool(conversation_id),
             'message_id_found': bool(parent_message_id),
+            **stream_metadata,
         }
         if 'Unusual activity' in text:
             Log.Error('Your IP got flagged by chatgpt, retry with a new IP')
@@ -795,9 +919,16 @@ class ChatGPT:
 
     def _authenticated_stream_initial(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
         model = model or self.model_name
+        conduit_token = self._authenticated_prepare_conversation(message, model, file_name=file_name)
+        requirements = self._authenticated_chat_requirements()
         payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
         url = self._endpoint_for('conversation')
-        self._set_headers_for('conversation', authenticated=True)
+        self._set_headers_for('conversation', extra={
+            'openai-sentinel-chat-requirements-token': requirements['chat_requirements_token'],
+            'openai-sentinel-proof-token': requirements['proof_token'],
+            'openai-sentinel-turnstile-token': requirements['turnstile_token'],
+            'x-conduit-token': conduit_token,
+        }, authenticated=True)
         self._record_conversation_request(url, model, message, has_image, stream=True)
         conversation_request = self.session.post(url, json=payload, timeout=(30, 300), stream=True)
         yield from self._consume_stream_response(conversation_request)
@@ -843,9 +974,6 @@ class ChatGPT:
             raise RuntimeError(f"Authenticated file processing failed with status {process_request.status_code}. Preview: {process_request.text[:300]}")
         return file_id, file_size, width, height
 
-    def _authenticated_prepare_conversation(self, *args: Any, **kwargs: Any):
-        return None
-
     def _generate_react(self) -> str:
         n = random() 
         base36 = ''
@@ -871,7 +999,7 @@ class ChatGPT:
             return []
 
         try:
-            data: dict = loads(data_str)
+            data: Any = loads(data_str)
         except Exception:
             return []
 
@@ -883,9 +1011,38 @@ class ChatGPT:
                 for op in data.get('v'):
                     if op.get('o') == 'append' and op.get('p') == '/message/content/parts/0' and isinstance(op.get('v'), str):
                         chunks.append(op.get('v'))
+            elif data.get('type') in {'delta', 'content_delta', 'text_delta'} and isinstance(data.get('delta'), str):
+                chunks.append(data['delta'])
+            elif data.get('type') in {'message_delta', 'content_part'} and isinstance(data.get('text'), str):
+                chunks.append(data['text'])
+            elif data.get('type') == 'message' and isinstance(data.get('message'), dict):
+                chunks.extend(self._extract_text_from_content_tree(data['message']))
+            elif data.get('type') in {'stream_handoff', 'resume_conversation_token'}:
+                return []
             elif 'v' in data and isinstance(data['v'], str):
                 chunks.append(data['v'])
         return chunks
+
+    def _extract_text_from_content_tree(self, value: Any) -> list[str]:
+        if isinstance(value, dict):
+            content = value.get('content')
+            if isinstance(content, dict):
+                parts = content.get('parts')
+                if isinstance(parts, list):
+                    return [part for part in parts if isinstance(part, str)]
+            text = value.get('text')
+            if isinstance(text, str):
+                return [text]
+            result: list[str] = []
+            for nested in value.values():
+                result.extend(self._extract_text_from_content_tree(nested))
+            return result
+        if isinstance(value, list):
+            result: list[str] = []
+            for item in value:
+                result.extend(self._extract_text_from_content_tree(item))
+            return result
+        return []
 
     def _parse_event_stream(self, stream_data: str) -> str:
         result: list = []
@@ -913,13 +1070,16 @@ class ChatGPT:
 
         raw_text = '\n'.join(raw_lines)
         self.session.cookies.update(conversation_request.cookies)
+        conversation_id_preview, message_id_preview = self._extract_conversation_state(raw_text)
+        stream_metadata = self._extract_authenticated_stream_metadata(raw_text)
         self.last_response_summary = {
             'response_received': True,
             'status_code': getattr(conversation_request, 'status_code', None),
             'text_preview': raw_text[:300],
             'unusual_activity': 'Unusual activity' in raw_text,
-            'conversation_id_found': '"conversation_id": "' in raw_text,
-            'message_id_found': '"message_id": "' in raw_text,
+            'conversation_id_found': bool(conversation_id_preview),
+            'message_id_found': bool(message_id_preview),
+            **stream_metadata,
         }
 
         if 'Unusual activity' in raw_text:
@@ -927,6 +1087,7 @@ class ChatGPT:
             exit(conversation_request.status_code)
 
         conversation_id, _ = self._apply_conversation_state_from_text(raw_text)
+        self._update_request_diagnostics(**stream_metadata)
 
         self.response = ''.join(response_parts)
         if not self.response and not conversation_id:
