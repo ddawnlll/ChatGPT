@@ -270,7 +270,7 @@ Workstream A is complete for the current codebase. We now have:
 
 ## 7. Workstream B — Authenticated ChatGPT Web Endpoint Discovery from Browser Traffic
 
-**Status:** In progress
+**Status:** Complete from user-exported logged-in HAR evidence
 
 ### Problem / Goal
 
@@ -278,21 +278,25 @@ We must not guess the authenticated flow blindly. We need to compare against rea
 
 ### Constraints
 
-- [ ] Use only user-observable browser devtools/network traffic
-- [ ] Do not automate credential extraction
-- [ ] Do not bypass protections
-- [ ] Do not treat private endpoints as stable without diagnostics
-- [ ] Do not route authenticated mode through any `/backend-anon/...` endpoint family
+- [x] Use only user-observable browser devtools/network traffic
+- [x] Do not automate credential extraction
+- [x] Do not bypass protections
+- [x] Do not treat private endpoints as stable without diagnostics
+- [x] Do not route authenticated mode through any `/backend-anon/...` endpoint family
 
 ### Implementation Tasks
 
-- [ ] Capture logged-in browser network traffic for: new chat, follow-up message, file upload, title update/sidebar appearance
-- [ ] Identify the authenticated endpoint family used by the web app
-- [ ] Record required request headers, cookies, and auth material
-- [ ] Compare authenticated payloads against current anon payloads
-- [ ] Identify which calls are required for chat creation vs continuation vs title/sidebar sync
-- [ ] Identify whether file upload uses the same or different endpoint family in authenticated mode
-- [ ] Document whether additional post-send calls are required for sidebar/history registration
+- [x] Add local tooling to analyze user-observable browser DevTools HAR exports without automating login or extracting browser secrets
+- [x] Redact sensitive header/body material from discovery output
+- [x] Classify captured requests into conversation, file upload, session/account, model, challenge, title/sidebar/history, and metadata-update stages
+- [x] Identify endpoint family candidates from captured traffic (`backend-api`, `backend-anon`, `public-api`, `api-auth`, etc.)
+- [x] Compare captured payload shape against current anon-risk fields such as `history_and_training_disabled`
+- [x] Capture logged-in browser network traffic for: new chat, follow-up message, file upload, title update/sidebar appearance
+- [x] Identify the authenticated endpoint family used by the web app from a real capture
+- [x] Record required request headers, cookies, and auth material from a real capture
+- [x] Identify which calls are required for chat creation vs continuation vs title/sidebar sync from a real capture
+- [x] Identify whether file upload uses the same or different endpoint family in authenticated mode from a real capture
+- [x] Document whether additional post-send calls are required for sidebar/history registration from a real capture
 
 ### Diagnostic Targets
 
@@ -308,12 +312,143 @@ Filter browser network traffic for terms like:
 - `models`
 - `session`
 
+### Discovery Tooling
+
+A local analyzer now exists at:
+
+```bash
+python3 tools/auth_flow_discovery.py path/to/chatgpt-capture.har --format markdown --output docs/implementation/auth-flow-discovery-report.md
+python3 tools/auth_flow_discovery.py path/to/chatgpt-capture.har --format json --output docs/implementation/auth-flow-discovery-report.json
+```
+
+Expected capture procedure:
+
+1. Open a normal logged-in ChatGPT browser session.
+2. Open DevTools Network tab and preserve log.
+3. Clear existing entries.
+4. Perform, in order:
+   - create a new chat and send one message,
+   - send one follow-up message in the same chat,
+   - attach/upload a supported file or image and send it,
+   - wait for title/sidebar/history updates to settle,
+   - optionally refresh/open the sidebar/history list.
+5. Export the Network log as HAR.
+6. Run the analyzer locally.
+7. Use the redacted report, not raw secrets, as the implementation evidence for Workstreams D–G.
+
+The analyzer is intentionally passive. It does not log in, call ChatGPT, read browser profiles, or extract credentials. It only inspects a user-supplied HAR file and emits endpoint/stage candidates, important header names, payload field names, and safe payload findings.
+
+### Discovery Result — 2026-05-02 Logged-in Browser HAR
+
+Source capture:
+
+- raw user-supplied HAR: `docs/implementation/chatgpt-auth-flow.har` locally only; ignored by git because HAR files can contain cookies/session material
+- sanitized report: `docs/implementation/auth-flow-discovery-report.md`
+- sanitized JSON: `docs/implementation/auth-flow-discovery-report.json`
+
+Summary from the sanitized report:
+
+- matching stages: 47
+- endpoint families: `backend-api` only for ChatGPT API traffic, plus two non-critical telemetry flushes
+- `/backend-anon/...` usage observed: **false**
+- authenticated endpoint family: **`/backend-api/...`**
+
+Observed authenticated request sequence for the captured new-chat/follow-up/file flow:
+
+1. `POST /backend-api/f/conversation/prepare`
+   - used before the actual conversation send
+   - new-chat payload fields included:
+     - `action`
+     - `client_contextual_info`
+     - `client_prepare_state`
+     - `conversation_mode`
+     - `fork_from_shared_post`
+     - `model`
+     - `parent_message_id`
+     - `partial_query`
+     - `supported_encodings`
+     - `supports_buffering`
+     - `system_hints`
+     - `thinking_effort`
+     - `timezone`
+     - `timezone_offset_min`
+   - follow-up payload additionally included `conversation_id`
+   - file-send prepare payload additionally included `attachment_mime_types`
+
+2. `POST /backend-api/f/conversation`
+   - main authenticated conversation send/stream endpoint
+   - new-chat payload fields included:
+     - `action`
+     - `client_contextual_info`
+     - `client_prepare_state`
+     - `conversation_mode`
+     - `enable_message_followups`
+     - `force_parallel_switch`
+     - `messages`
+     - `model`
+     - `paragen_cot_summary_display_override`
+     - `parent_message_id`
+     - `supported_encodings`
+     - `supports_buffering`
+     - `system_hints`
+     - `thinking_effort`
+     - `timezone`
+     - `timezone_offset_min`
+   - follow-up/file payloads additionally included `conversation_id`
+   - `history_and_training_disabled` was **not observed** on conversation send payloads
+
+3. Sentinel/challenge requests observed under authenticated `backend-api`:
+   - `POST /backend-api/sentinel/chat-requirements/prepare`
+   - `POST /backend-api/sentinel/chat-requirements/finalize`
+   - `POST /backend-api/sentinel/ping`
+   - `POST /backend-api/sentinel/req`
+
+4. Post-send status/artifact sync observed:
+   - `GET /backend-api/conversation/<conversation_id>/stream_status`
+   - `GET /backend-api/conversation/<conversation_id>/textdocs`
+
+5. Authenticated file flow observed:
+   - `POST /backend-api/files`
+     - payload fields: `file_name`, `file_size`, `library_persistence_mode`, `reset_rate_limits`, `store_in_library`, `timezone_offset_min`, `use_case`
+   - upload to returned upload URL, not represented as a ChatGPT endpoint candidate in the sanitized report
+   - `POST /backend-api/files/process_upload_stream`
+     - payload fields: `entry_surface`, `file_id`, `file_name`, `index_for_retrieval`, `library_persistence_mode`, `metadata`, `use_case`
+   - optional download/preview checks:
+     - `GET /backend-api/files/download/<file_id>`
+
+Required authenticated request headers observed by stage:
+
+- common browser headers:
+  - `accept`
+  - `content-type` on JSON POSTs
+  - `referer`
+  - `user-agent`
+- ChatGPT web headers:
+  - `oai-client-version`
+  - `oai-device-id`
+  - `oai-language`
+- conversation send headers:
+  - `openai-sentinel-chat-requirements-token`
+  - `openai-sentinel-proof-token`
+  - `openai-sentinel-turnstile-token`
+  - `x-conduit-token`
+- browser cookie/session material is required but values are intentionally not documented
+- `Authorization` was not present in the sanitized observed header inventory for these captured authenticated browser requests; session cookies appear to be the primary browser auth material in this capture
+
+Title/sidebar/history-specific result:
+
+- No `title`, `conversations`, or explicit sidebar/history registration endpoint was observed in this capture.
+- The captured post-send calls were `stream_status` and `textdocs` only.
+- Workstream G must verify sidebar/history visibility separately and capture an additional HAR if sidebar/title parity is not achieved.
+
 ### Acceptance Criteria
 
-- [ ] We have a concrete authenticated request sequence based on observed browser traffic
-- [ ] Required headers/payload fields are documented
-- [ ] Required post-send sync/title/history calls are documented if present
-- [ ] The implementation plan for authenticated mode is based on observation, not guesses alone
+- [x] We have repository tooling to turn observed browser traffic into a structured authenticated-flow report
+- [x] Discovery output redacts sensitive values and records only endpoint/stage/header-name/payload-shape evidence
+- [x] We have a concrete authenticated request sequence based on observed browser traffic
+- [x] Required headers/payload fields are documented from a real capture
+- [x] Required post-send sync/title/history calls are documented if present in a real capture
+- [x] The implementation plan for authenticated mode is based on observation, not guesses alone
 
 ---
 
@@ -372,7 +507,7 @@ class ChatGPT:
 
 ## 9. Workstream D — Authenticated Conversation Send
 
-**Status:** In progress
+**Status:** Initial implementation present; needs alignment with Workstream B sentinel/prepare evidence and real-session verification
 
 ### Problem / Goal
 
@@ -380,19 +515,21 @@ We need a logged-in initial conversation path that creates account-backed chats 
 
 ### Implementation Tasks
 
-- [ ] Implement authenticated chat bootstrap using user-provided session material
+- [ ] Implement authenticated chat bootstrap using user-provided session material and the observed `/backend-api/sentinel/...` sequence
 - [x] Add explicit preflight session validation before authenticated sends
 - [x] Validate and diagnose at minimum:
   - cookies present
   - authorization present if required
   - device/client headers present if required
-- [ ] Implement authenticated initial conversation send
-- [ ] Compare and adjust payload fields against real logged-in browser requests
-- [ ] Remove or change fields that enforce non-history behavior, especially:
+- [x] Implement authenticated initial conversation send
+- [x] Implement authenticated continuation send using stored `conversation_id` / `parent_message_id`
+- [x] Compare payload fields against real logged-in browser requests from Workstream B
+- [ ] Fully align authenticated prepare/send payloads with observed `client_prepare_state`, `thinking_effort`, and sentinel/conduit requirements
+- [x] Remove or change fields that enforce non-history behavior, especially:
   - `history_and_training_disabled: True`
-- [ ] Preserve conversation state extraction (`conversation_id`, message IDs, related metadata)
-- [ ] Capture and persist any additional identifiers required for continuation
-- [ ] Add defensive diagnostics for missing auth fields, unexpected response shapes, or alternate status codes
+- [x] Preserve conversation state extraction (`conversation_id`, message IDs, related metadata)
+- [ ] Capture and persist any additional identifiers required for continuation if real traffic reveals more state
+- [x] Add defensive diagnostics for missing auth fields, unexpected response shapes, or alternate status codes
 
 ### Important Comparison Requirement
 
@@ -400,9 +537,9 @@ Do not hardcode the current anon payload into authenticated mode. Build authenti
 
 ### Acceptance Criteria
 
-- [ ] Authenticated mode can send an initial message successfully
-- [ ] Returned conversation state is captured and persisted
-- [ ] Payload differs from anon mode where required by observed browser traffic
+- [ ] Authenticated mode can send an initial message successfully against a real logged-in session
+- [x] Returned conversation state is captured in wrapper state when present in the response
+- [x] Payload differs from anon mode by omitting `history_and_training_disabled` and anon challenge/conduit fields
 - [x] The request path does not include anon-only assumptions by default
 - [x] Missing session/auth material produces loud, structured validation errors unless fallback is explicitly allowed
 
@@ -410,7 +547,7 @@ Do not hardcode the current anon payload into authenticated mode. Build authenti
 
 ## 10. Workstream E — Authenticated Streaming
 
-**Status:** In progress
+**Status:** Initial implementation present; needs alignment with Workstream B sentinel/prepare evidence and real-session verification
 
 ### Problem / Goal
 
@@ -418,13 +555,13 @@ The app already has live streaming UX. Authenticated mode must preserve it.
 
 ### Implementation Tasks
 
-- [ ] Implement authenticated streaming send path
+- [x] Implement authenticated streaming send path
 - [x] Add explicit preflight session validation before authenticated streams
-- [ ] Reuse the existing event-stream parser where compatible
-- [ ] Adjust parser logic if authenticated stream framing differs from anon framing
-- [ ] Preserve local SSE shape served by `api_server.py`
-- [ ] Persist final assistant output and authenticated conversation state after stream completion
-- [ ] Handle partial-stream failures cleanly
+- [x] Reuse the existing event-stream parser where compatible
+- [ ] Adjust parser logic if authenticated stream framing differs from anon framing in real captures
+- [x] Preserve local SSE shape served by `api_server.py`
+- [x] Persist final assistant output and authenticated conversation state after stream completion in wrapper state
+- [x] Handle partial-stream failures cleanly when no answer or conversation id is emitted
 
 ### Configuration / Code Reference (target shape)
 
@@ -444,7 +581,7 @@ for chunk in client.stream_question(message):
 
 ## 11. Workstream F — Authenticated File Upload
 
-**Status:** In progress
+**Status:** Initial implementation present; needs payload alignment with Workstream B evidence and real-session verification
 
 ### Problem / Goal
 
@@ -454,10 +591,10 @@ The wrapper already supports files/images, but the current upload path is anon-o
 
 - [ ] Discover the logged-in browser upload sequence for images/files
 - [ ] Determine whether authenticated upload uses different endpoints, headers, or registration calls
-- [ ] Implement authenticated upload/create/process steps
-- [ ] Mirror attachment metadata fields expected by the logged-in conversation payload
-- [ ] Preserve current app-level request shape (`message` + optional image/file input)
-- [ ] Keep anon upload as fallback/debug implementation
+- [x] Implement authenticated upload/create/process steps against the authenticated endpoint slots
+- [x] Mirror existing attachment metadata fields in the authenticated conversation payload
+- [x] Preserve current app-level request shape (`message` + optional image/file input)
+- [x] Keep anon upload as fallback/debug implementation
 
 ### Acceptance Criteria
 
@@ -644,8 +781,8 @@ Authenticated mode should be primary, but anon mode still has diagnostic and fal
 
 ### Step 1 — Audit and Discovery
 - [x] audit the current anon wrapper flow in detail at the code/endpoint inventory level
-- [ ] capture logged-in browser request flow for message send/continue/file upload/title/sidebar behavior
-- [ ] document authenticated endpoint family, headers, and payloads
+- [x] capture logged-in browser request flow for message send/continue/file upload/title/sidebar behavior
+- [x] document authenticated endpoint family, headers, and payloads
 
 ### Step 2 — Wrapper Refactor
 - [x] add `transport_mode`
@@ -653,14 +790,15 @@ Authenticated mode should be primary, but anon mode still has diagnostic and fal
 - [x] keep shared parsing/state logic centralized where already available
 
 ### Step 3 — Authenticated Message Path
-- [ ] implement authenticated initial send
-- [ ] implement authenticated continuation send
-- [ ] remove/change non-history payload flags based on observed traffic
+- [x] implement authenticated initial send
+- [x] implement authenticated continuation send
+- [x] remove/change non-history payload flags in authenticated mode (`history_and_training_disabled` is omitted)
+- [ ] adjust payload fields after comparing against real logged-in browser traffic
 
 ### Step 4 — Authenticated Streaming and Files
-- [ ] implement authenticated streaming path
-- [ ] implement authenticated upload/attachment path
-- [ ] verify end-to-end UI behavior remains stable
+- [x] implement authenticated streaming path
+- [x] implement authenticated upload/attachment path
+- [ ] verify end-to-end UI behavior remains stable against a real logged-in session
 
 ### Step 5 — Verification and Fallback
 - [ ] verify remote account conversation creation/title/sidebar visibility
@@ -670,15 +808,30 @@ Authenticated mode should be primary, but anon mode still has diagnostic and fal
 
 ---
 
-## 17. Acceptance Criteria for the Phase
+## 17. Verification Notes
+
+Latest local verification:
+
+```bash
+python3 tools/auth_flow_discovery.py docs/implementation/chatgpt-auth-flow.har --format markdown --output docs/implementation/auth-flow-discovery-report.md
+python3 tools/auth_flow_discovery.py docs/implementation/chatgpt-auth-flow.har --format json --output docs/implementation/auth-flow-discovery-report.json
+python3 -m py_compile tests/test_chatgpt.py tests/test_auth_flow_discovery.py wrapper/chatgpt.py tools/auth_flow_discovery.py
+pytest -q tests/test_auth_flow_discovery.py
+```
+
+Result: discovery report generation succeeds and discovery-tool tests pass. Full pytest collection is currently blocked in this local environment by missing dependencies (`fastapi`, `colorama`), so wrapper-level authenticated tests were updated but could not be executed here until project Python dependencies are installed.
+
+---
+
+## 18. Acceptance Criteria for the Phase
 
 This phase is complete when:
 
 - [ ] `transport_mode="authenticated"` is the default path
 - [ ] current app UX still works end-to-end
-- [ ] authenticated mode can send and stream replies successfully
-- [ ] authenticated mode can continue conversations with persisted remote IDs/state
-- [ ] authenticated file/image upload works
+- [ ] authenticated mode can send and stream replies successfully against a real logged-in session
+- [ ] authenticated mode can continue conversations with persisted remote IDs/state against a real logged-in session
+- [ ] authenticated file/image upload works against a real logged-in session
 - [ ] authenticated mode never calls `/backend-anon/...` endpoints
 - [ ] anon mode remains available as fallback/debug only
 - [ ] we can determine with evidence whether chats are appearing as account-backed ChatGPT history/sidebar entries
@@ -686,7 +839,7 @@ This phase is complete when:
 
 ---
 
-## 18. Risks / Watchouts
+## 19. Risks / Watchouts
 
 - authenticated ChatGPT web endpoints are private and may change without notice
 - browser traffic may include extra metadata or sync calls beyond the main conversation request
@@ -697,7 +850,7 @@ This phase is complete when:
 
 ---
 
-## 19. Exit Decision
+## 20. Exit Decision
 
 At the end of this phase, the repo should clearly reflect this direction:
 

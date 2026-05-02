@@ -84,12 +84,18 @@ class ChatGPT:
         'event_stream_parse_and_state_extraction',
     ]
     AUTHENTICATED_ENDPOINT_SLOTS = {
-        'requirements': None,
-        'prepare_conversation': None,
-        'conversation': None,
-        'files': None,
-        'process_upload_stream': None,
-        'history_sync': None,
+        'requirements': 'https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare',
+        'requirements_finalize': 'https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize',
+        'requirements_ping': 'https://chatgpt.com/backend-api/sentinel/ping',
+        'sentinel_req': 'https://chatgpt.com/backend-api/sentinel/req',
+        'prepare_conversation': 'https://chatgpt.com/backend-api/f/conversation/prepare',
+        'conversation': 'https://chatgpt.com/backend-api/f/conversation',
+        'files': 'https://chatgpt.com/backend-api/files',
+        'process_upload_stream': 'https://chatgpt.com/backend-api/files/process_upload_stream',
+        'file_download': 'https://chatgpt.com/backend-api/files/download/{file_id}',
+        'stream_status': 'https://chatgpt.com/backend-api/conversation/{conversation_id}/stream_status',
+        'textdocs': 'https://chatgpt.com/backend-api/conversation/{conversation_id}/textdocs',
+        'history_sync': 'https://chatgpt.com/backend-api/conversations',
         'title_sync': None,
     }
 
@@ -549,7 +555,7 @@ class ChatGPT:
 
     def _missing_authenticated_requirements(self) -> list[str]:
         missing: list[str] = []
-        if not self.session.cookies:
+        if not self._supplied_cookies:
             missing.append('cookies')
         if not self.authorization:
             missing.append('authorization')
@@ -611,38 +617,205 @@ class ChatGPT:
                 'Authenticated transport preflight failed; missing required session material: ' + ', '.join(missing)
             )
 
-        raise NotImplementedError(
-            'Authenticated ChatGPT web transport scaffolding is enabled, but the authenticated request sequence '
-            'has not been implemented yet. Capture logged-in browser traffic before enabling authenticated sends.'
-        )
+        return
 
-    def _authenticated_request_placeholder(self, stage: str) -> None:
+    def _authenticated_headers(self, accept: str = 'text/event-stream') -> dict[str, str]:
+        headers = {
+            'accept': accept,
+            'content-type': 'application/json',
+            'oai-client-version': self.data.get('prod'),
+            'oai-device-id': self.data.get('device-id'),
+            'Authorization': self.authorization,
+        }
+        return {key: value for key, value in headers.items() if value}
+
+    def _build_message_payload(self, message: str, file_name: str = None, file_b64: str = None, is_image: bool = False) -> tuple[dict, bool]:
+        msg = {
+            'id': str(uuid4()),
+            'author': {'role': 'user'},
+            'create_time': round(time(), 3),
+            'metadata': {
+                'selected_github_repos': [],
+                'selected_all_github_repos': False,
+                'selected_sources': [],
+                'serialization_metadata': {'custom_symbol_offsets': []},
+            },
+        }
+
+        if file_name and file_b64:
+            mime_type = guess_type(file_name)[0]
+            is_zip = file_name.endswith('.zip')
+            is_image = file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'))
+            mime_type = 'application/zip' if is_zip else 'image/png' if is_image else mime_type
+            file_id, file_size, width, height = self.upload_file(file_name, file_b64, is_image=is_image, is_zip=is_zip)
+            attachment = {'id': file_id, 'size': file_size, 'name': file_name, 'mime_type': mime_type, 'source': 'local'}
+            if is_image:
+                attachment.update({'width': width, 'height': height})
+            msg['metadata']['attachments'] = [attachment]
+            if is_image:
+                msg['content'] = {
+                    'content_type': 'multimodal_text',
+                    'parts': [
+                        {
+                            'content_type': 'image_asset_pointer',
+                            'asset_pointer': f'file-service://{file_id}',
+                            'size_bytes': file_size,
+                            'width': width,
+                            'height': height,
+                        },
+                        message,
+                    ],
+                }
+                return msg, True
+
+        msg['content'] = {'content_type': 'text', 'parts': [message]}
+        return msg, False
+
+    def _authenticated_conversation_payload(self, message: str, model: str, file_name: str = None, file_b64: str = None, is_image: bool = False) -> tuple[dict, bool]:
+        msg, has_image = self._build_message_payload(message, file_name, file_b64, is_image)
+        payload = {
+            'action': 'next',
+            'messages': [msg],
+            'parent_message_id': self.data.get('parent_message_id') or 'client-created-root',
+            'model': model,
+            'thinking_effort': self.thinking_mode,
+            'timezone_offset_min': self.timezone_offset,
+            'timezone': self.ip_info[5],
+            'conversation_mode': {'kind': 'primary_assistant'},
+            'enable_message_followups': True,
+            'system_hints': [],
+            'supports_buffering': True,
+            'supported_encodings': ['v1'],
+            'client_contextual_info': {
+                'is_dark_mode': True,
+                'time_since_loaded': randint(3, 6),
+                'page_height': 1219,
+                'page_width': 3440,
+                'pixel_ratio': 1,
+                'screen_height': 1440,
+                'screen_width': 3440,
+            },
+            'paragen_cot_summary_display_override': 'allow',
+            'force_parallel_switch': 'auto',
+        }
+        if self.data.get('conversation_id'):
+            payload['conversation_id'] = self.data['conversation_id']
+        return payload, has_image
+
+    def _extract_conversation_state(self, text: str) -> tuple[str | None, str | None]:
+        conversation_id = self._safe_extract(text, '"conversation_id": "', '"') or self._safe_extract(text, '"conversation_id":"', '"')
+        message_id = self._safe_extract(text, '"message_id": "', '"') or self._safe_extract(text, '"message_id":"', '"')
+        return conversation_id, message_id
+
+    def _record_conversation_request(self, url: str, model: str, message: str, has_image: bool, stream: bool = False) -> None:
+        self._update_request_diagnostics(endpoint_family='authenticated-web')
+        self.last_request_summary = {
+            'request_sent': True,
+            'selected_transport_mode': self.transport_mode,
+            'effective_transport_mode': self.request_diagnostics.get('effective_transport_mode'),
+            'endpoint_family': 'authenticated-web',
+            'fallback_occurred': self.request_diagnostics.get('fallback_occurred', False),
+            'url': url,
+            'model': model,
+            'thinking_mode': self.thinking_mode,
+            'message_length': len(message),
+            'has_image': has_image,
+            'stream': stream,
+            'authorization_supplied': bool(self.authorization),
+            'cookies_supplied': bool(self._supplied_cookies),
+            'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
+            'history_and_training_disabled_sent': False,
+        }
+
+    def _authenticated_send_initial(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
+        model = model or self.model_name
+        payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
+        url = self._endpoint_for('conversation')
+        self.session.headers = self._authenticated_headers()
+        self._record_conversation_request(url, model, message, has_image)
+        conversation_request = self.session.post(url, json=payload, timeout=(30, 300))
+        self.session.cookies.update(conversation_request.cookies)
+        text = conversation_request.text
+        conversation_id, parent_message_id = self._extract_conversation_state(text)
+        if conversation_id:
+            self.data['conversation_id'] = conversation_id
+        if parent_message_id:
+            self.data['parent_message_id'] = parent_message_id
         self._update_request_diagnostics(
-            endpoint_family='authenticated-web',
-            history_verification='not_checked',
+            remote_conversation_id=self.data.get('conversation_id'),
+            remote_parent_message_id=self.data.get('parent_message_id'),
         )
-        raise NotImplementedError(
-            f"Authenticated ChatGPT web stage '{stage}' has not been implemented yet. "
-            "Use captured logged-in browser traffic to fill in the endpoint, headers, and payload sequence."
-        )
+        self.last_response_summary = {
+            'response_received': True,
+            'status_code': getattr(conversation_request, 'status_code', None),
+            'text_preview': text[:300],
+            'unusual_activity': 'Unusual activity' in text,
+            'conversation_id_found': bool(conversation_id),
+            'message_id_found': bool(parent_message_id),
+        }
+        if 'Unusual activity' in text:
+            Log.Error('Your IP got flagged by chatgpt, retry with a new IP')
+            exit(conversation_request.status_code)
+        self.response = self._parse_event_stream(text)
+        if not self.response and not conversation_id:
+            raise RuntimeError(f"Authenticated conversation response did not contain a usable answer or conversation id. Preview: {text[:300]}")
+        return self.response
 
-    def _authenticated_send_initial(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('send_initial')
+    def _authenticated_send_followup(self, message: str, model: str | None = None):
+        return self._authenticated_send_initial(message, model=model)
 
-    def _authenticated_send_followup(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('send_followup')
+    def _authenticated_stream_initial(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
+        model = model or self.model_name
+        payload, has_image = self._authenticated_conversation_payload(message, model, file_name, file_b64, is_image)
+        url = self._endpoint_for('conversation')
+        self.session.headers = self._authenticated_headers()
+        self._record_conversation_request(url, model, message, has_image, stream=True)
+        conversation_request = self.session.post(url, json=payload, timeout=(30, 300), stream=True)
+        yield from self._consume_stream_response(conversation_request)
 
-    def _authenticated_stream_initial(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('stream_initial')
+    def _authenticated_stream_followup(self, message: str, model: str | None = None):
+        yield from self._authenticated_stream_initial(message, model=model)
 
-    def _authenticated_stream_followup(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('stream_followup')
+    def _authenticated_upload_file(self, file_name: str, file_b64: str, is_image: bool = False, is_zip: bool = False):
+        if file_b64.startswith('data:'):
+            file_b64 = file_b64.split(',', 1)[1]
+        raw_file = b64decode(file_b64)
+        file_size = len(raw_file)
+        use_case = 'ace_upload' if is_zip else 'my_files'
+        width, height = None, None
+        if is_image:
+            width, height = Image.open(BytesIO(raw_file)).size
+            use_case = 'multimodal'
 
-    def _authenticated_upload_file(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('upload_file')
+        file_data = {
+            'file_name': file_name,
+            'file_size': file_size,
+            'use_case': use_case,
+            'timezone_offset_min': self.timezone_offset,
+            'reset_rate_limits': False,
+        }
+        self.session.headers = self._authenticated_headers('application/json')
+        create_request = self.session.post(self._endpoint_for('files'), json=file_data, timeout=(30, 120))
+        created = create_request.json()
+        file_id = created.get('file_id') or created.get('id')
+        upload_url = created.get('upload_url')
+        if not file_id or not upload_url:
+            raise RuntimeError(f"Authenticated file create response did not include file_id/upload_url. Preview: {create_request.text[:300]}")
+
+        self.session.put(upload_url, data=raw_file, timeout=(30, 300))
+        process_data = {
+            'file_id': file_id,
+            'use_case': use_case,
+            'index_for_retrieval': False,
+            'file_name': file_name,
+        }
+        process_request = self.session.post(self._endpoint_for('process_upload_stream'), json=process_data, timeout=(30, 300))
+        if process_request.status_code and process_request.status_code >= 400:
+            raise RuntimeError(f"Authenticated file processing failed with status {process_request.status_code}. Preview: {process_request.text[:300]}")
+        return file_id, file_size, width, height
 
     def _authenticated_prepare_conversation(self, *args: Any, **kwargs: Any):
-        self._authenticated_request_placeholder('prepare_conversation')
+        return None
 
     def _generate_react(self) -> str:
         n = random() 
@@ -864,6 +1037,9 @@ class ChatGPT:
 
     def upload_file(self, file_name: str, file_b64: str, is_image: bool = False, is_zip: bool = False) -> None:
         self._ensure_transport_ready('upload_file')
+        if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
+            return self._authenticated_upload_file(file_name, file_b64, is_image=is_image, is_zip=is_zip)
+
         self.session.headers = Headers.REQUIREMENTS
         self.session.headers.update({
             'oai-client-version': self.data["prod"],
@@ -924,6 +1100,10 @@ class ChatGPT:
     
     def hold_conversation(self, message: str, new: bool = True) -> None:
         self._ensure_transport_ready('hold_conversation')
+        if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
+            self._authenticated_send_initial(message)
+            return
+
         self.index = 2000
         
         if new:
@@ -1047,6 +1227,10 @@ class ChatGPT:
 
     def hold_conversation_stream(self, message: str):
         self._ensure_transport_ready('hold_conversation_stream')
+        if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
+            yield from self._authenticated_stream_initial(message)
+            return
+
         conduit_token: str = self.get_conduit(next=True)
         self._get_tokens(randint(2000, 3000))
         time_1: int = randint(3000, 6000)
@@ -1143,6 +1327,10 @@ class ChatGPT:
 
     def ask_question_with_file_stream(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
         self._ensure_transport_ready('ask_question_with_file_stream')
+        if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
+            yield from self._authenticated_stream_initial(message, model=model, file_name=file_name, file_b64=file_b64, is_image=is_image)
+            return
+
         model = model or self.model_name
         self._get_tokens()
         conduit_token: str = self.get_conduit()
@@ -1256,6 +1444,9 @@ class ChatGPT:
 
     def ask_question_with_file(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
         self._ensure_transport_ready('ask_question_with_file')
+        if self.request_diagnostics.get('effective_transport_mode') == 'authenticated':
+            return self._authenticated_send_initial(message, model=model, file_name=file_name, file_b64=file_b64, is_image=is_image)
+
         model = model or self.model_name
         self._get_tokens()
         conduit_token: str = self.get_conduit()

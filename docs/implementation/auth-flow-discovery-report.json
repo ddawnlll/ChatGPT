@@ -1,0 +1,1179 @@
+{
+  "stages": [
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 1,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_mode",
+        "fork_from_shared_post",
+        "model",
+        "parent_message_id",
+        "partial_query",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "prepare_conversation",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 3,
+      "method": "POST",
+      "payload_fields": [
+        "history_and_training_disabled",
+        "in_search_mode",
+        "input_text",
+        "num_completions"
+      ],
+      "payload_findings": {
+        "history_and_training_disabled": false
+      },
+      "stage": "autocomplete",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/conversation/experimental/generate_autocompletions"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 4,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_mode",
+        "enable_message_followups",
+        "force_parallel_switch",
+        "messages",
+        "model",
+        "paragen_cot_summary_display_override",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "messages_count": 1,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "conversation_send_or_stream",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 6,
+      "method": "POST",
+      "payload_fields": [
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 7,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "referer",
+        "user-agent"
+      ],
+      "index": 8,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 9,
+      "method": "POST",
+      "payload_fields": [
+        "prepare_token",
+        "proofofwork",
+        "turnstile"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize"
+    },
+    {
+      "endpoint_family": "other",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 10,
+      "method": "POST",
+      "payload_fields": [
+        "client_type",
+        "counters",
+        "histograms"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/ces/statsc/flush"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 11,
+      "method": "GET",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "post_send_stream_status",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/conversation/<conversation_id>/stream_status"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 16,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 19,
+      "method": "GET",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "post_send_artifact_sync",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/conversation/<conversation_id>/textdocs"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 21,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "referer",
+        "user-agent"
+      ],
+      "index": 22,
+      "method": "POST",
+      "payload_fields": [
+        "flow",
+        "id",
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/req"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 25,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "fork_from_shared_post",
+        "model",
+        "parent_message_id",
+        "partial_query",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "prepare_conversation",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 26,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 27,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "enable_message_followups",
+        "force_parallel_switch",
+        "messages",
+        "model",
+        "paragen_cot_summary_display_override",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "messages_count": 1,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "conversation_send_or_stream",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 29,
+      "method": "POST",
+      "payload_fields": [
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 30,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "referer",
+        "user-agent"
+      ],
+      "index": 31,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 32,
+      "method": "POST",
+      "payload_fields": [
+        "prepare_token",
+        "proofofwork",
+        "turnstile"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 34,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 36,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 39,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "fork_from_shared_post",
+        "model",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "prepare_conversation",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 40,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "referer",
+        "user-agent"
+      ],
+      "index": 41,
+      "method": "POST",
+      "payload_fields": [
+        "flow",
+        "id",
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/req"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 46,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 47,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "attachment_mime_types",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "fork_from_shared_post",
+        "model",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "prepare_conversation",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 49,
+      "method": "POST",
+      "payload_fields": [
+        "file_name",
+        "file_size",
+        "library_persistence_mode",
+        "reset_rate_limits",
+        "store_in_library",
+        "timezone_offset_min",
+        "use_case"
+      ],
+      "payload_findings": {},
+      "stage": "file_upload_or_attachment",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/files"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 52,
+      "method": "POST",
+      "payload_fields": [
+        "entry_surface",
+        "file_id",
+        "file_name",
+        "index_for_retrieval",
+        "library_persistence_mode",
+        "metadata",
+        "use_case"
+      ],
+      "payload_findings": {},
+      "stage": "file_upload_or_attachment",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/files/process_upload_stream"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 53,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 54,
+      "method": "GET",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "file_upload_or_attachment",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/files/download/<file_id>"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 56,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "enable_message_followups",
+        "force_parallel_switch",
+        "messages",
+        "model",
+        "paragen_cot_summary_display_override",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "messages_count": 1,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "conversation_send_or_stream",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 58,
+      "method": "POST",
+      "payload_fields": [
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 59,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "referer",
+        "user-agent"
+      ],
+      "index": 61,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 62,
+      "method": "POST",
+      "payload_fields": [
+        "prepare_token",
+        "proofofwork",
+        "turnstile"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 64,
+      "method": "GET",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "file_upload_or_attachment",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/files/download/<file_id>?post_id=&inline=false"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 67,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 69,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent",
+        "x-conduit-token"
+      ],
+      "index": 72,
+      "method": "POST",
+      "payload_fields": [
+        "action",
+        "client_contextual_info",
+        "client_prepare_state",
+        "conversation_id",
+        "conversation_mode",
+        "fork_from_shared_post",
+        "model",
+        "parent_message_id",
+        "supported_encodings",
+        "supports_buffering",
+        "system_hints",
+        "thinking_effort",
+        "timezone",
+        "timezone_offset_min"
+      ],
+      "payload_findings": {
+        "conversation_id_present": true,
+        "model_present": true,
+        "parent_message_id_present": true
+      },
+      "stage": "prepare_conversation",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/f/conversation/prepare"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "referer",
+        "user-agent"
+      ],
+      "index": 73,
+      "method": "POST",
+      "payload_fields": [
+        "flow",
+        "id",
+        "p"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/req"
+    },
+    {
+      "endpoint_family": "other",
+      "important_headers": [
+        "accept",
+        "content-type",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "referer",
+        "user-agent"
+      ],
+      "index": 74,
+      "method": "POST",
+      "payload_fields": [
+        "client_type",
+        "counters",
+        "histograms"
+      ],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/ces/statsc/flush"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 75,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 76,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 79,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 82,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    },
+    {
+      "endpoint_family": "backend-api",
+      "important_headers": [
+        "accept",
+        "oai-client-version",
+        "oai-device-id",
+        "oai-language",
+        "openai-sentinel-chat-requirements-token",
+        "openai-sentinel-proof-token",
+        "openai-sentinel-turnstile-token",
+        "referer",
+        "user-agent"
+      ],
+      "index": 85,
+      "method": "POST",
+      "payload_fields": [],
+      "payload_findings": {},
+      "stage": "challenge_or_requirements",
+      "status": 200,
+      "url": "https://chatgpt.com/backend-api/sentinel/ping"
+    }
+  ],
+  "summary": {
+    "authenticated_endpoint_families": [
+      "backend-api"
+    ],
+    "conversation_endpoint_candidates": [
+      "https://chatgpt.com/backend-api/f/conversation"
+    ],
+    "endpoint_family_counts": {
+      "backend-api": 45,
+      "other": 2
+    },
+    "file_endpoint_candidates": [
+      "https://chatgpt.com/backend-api/files",
+      "https://chatgpt.com/backend-api/files/download/<file_id>",
+      "https://chatgpt.com/backend-api/files/download/<file_id>?post_id=&inline=false",
+      "https://chatgpt.com/backend-api/files/process_upload_stream"
+    ],
+    "history_or_title_endpoint_candidates": [],
+    "stage_count": 47,
+    "stage_counts": {
+      "autocomplete": 1,
+      "challenge_or_requirements": 32,
+      "conversation_send_or_stream": 3,
+      "file_upload_or_attachment": 4,
+      "post_send_artifact_sync": 1,
+      "post_send_stream_status": 1,
+      "prepare_conversation": 5
+    },
+    "uses_backend_anon": false
+  }
+}

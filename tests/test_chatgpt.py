@@ -3,9 +3,20 @@ import wrapper.chatgpt as chatgpt_mod
 
 
 class DummyResponse:
-    def __init__(self, text: str, cookies=None):
+    def __init__(self, text: str, cookies=None, status_code: int = 200, json_data=None):
         self.text = text
         self.cookies = cookies or {}
+        self.status_code = status_code
+        self._json_data = json_data
+
+    def json(self):
+        if self._json_data is not None:
+            return self._json_data
+        return {}
+
+    def iter_lines(self):
+        for line in self.text.splitlines():
+            yield line
 
 
 def _patch_chatgpt_bootstrap(monkeypatch):
@@ -186,28 +197,52 @@ def test_transport_audit_exposes_anon_endpoints_and_authenticated_slots(monkeypa
     assert "history_and_training_disabled" in audit["anon_payload_audit"]["history_suppressing_fields"]
     assert "prepare_conversation_conduit_token" in audit["anon_flow_stages"]
     assert "history_sync" in audit["authenticated_endpoint_slots"]
-    assert audit["authenticated_endpoint_slots"]["conversation"] is None
+    assert audit["authenticated_endpoint_slots"]["conversation"] == "https://chatgpt.com/backend-api/f/conversation"
     assert audit["endpoint_overrides"]["conversation"] == "https://chatgpt.com/backend-api/conversation"
     assert audit["extra_headers"] == ["x-test"]
 
 
-def test_authenticated_mode_preflight_passes_then_hits_placeholder(monkeypatch):
+def test_authenticated_mode_sends_backend_api_payload_without_history_disabled(monkeypatch):
     _patch_chatgpt_bootstrap(monkeypatch)
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return DummyResponse(
+            'data: {"o":"append","p":"/message/content/parts/0","v":"auth answer"}\n'
+            '"conversation_id":"conv-auth","message_id":"msg-auth"\n'
+        )
 
     client = chatgpt_mod.ChatGPT(
         transport_mode="authenticated",
         cookies={"session": "token"},
         authorization="Bearer abc",
     )
+    client.session.post = fake_post
 
-    with pytest.raises(NotImplementedError) as exc:
-        client.ask_question("hello")
+    response = client.ask_question("hello")
 
-    assert "authenticated request sequence has not been implemented yet" in str(exc.value).lower()
+    assert response == "auth answer"
+    assert captured["url"] == "https://chatgpt.com/backend-api/f/conversation"
+    assert captured["timeout"] == (30, 300)
+    assert captured["json"]["action"] == "next"
+    assert captured["json"]["parent_message_id"] == "client-created-root"
+    assert captured["json"]["messages"][0]["content"]["parts"] == ["hello"]
+    assert captured["json"]["thinking_effort"] == "instant"
+    assert "effort" not in captured["json"]
+    assert "history_and_training_disabled" not in captured["json"]
+    assert client.data["conversation_id"] == "conv-auth"
+    assert client.data["parent_message_id"] == "msg-auth"
+
     diagnostics = client.get_debug_summary()["request_diagnostics"]
     assert diagnostics["effective_transport_mode"] == "authenticated"
     assert diagnostics["endpoint_family"] == "authenticated-web"
     assert diagnostics["fallback_occurred"] is False
+    assert diagnostics["remote_conversation_id"] == "conv-auth"
+    assert client.get_debug_summary()["last_request_summary"]["history_and_training_disabled_sent"] is False
 
 
 def test_authenticated_mode_can_explicitly_fallback_to_anon(monkeypatch):
