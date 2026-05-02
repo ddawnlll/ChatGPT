@@ -419,38 +419,80 @@ class ChatGPT:
         except Exception:
             return None
 
+    def _extract_stream_chunks(self, line: str) -> list[str]:
+        if not line.startswith('data:'):
+            return []
+
+        data_str: str = line[5:].strip()
+        if data_str == '[DONE]':
+            return []
+
+        try:
+            data: dict = loads(data_str)
+        except Exception:
+            return []
+
+        chunks: list[str] = []
+        if isinstance(data, dict):
+            if data.get('o') == 'append' and data.get('p') == '/message/content/parts/0' and isinstance(data.get('v'), str):
+                chunks.append(data.get('v'))
+            elif data.get('o') == 'patch' and isinstance(data.get('v'), list):
+                for op in data.get('v'):
+                    if op.get('o') == 'append' and op.get('p') == '/message/content/parts/0' and isinstance(op.get('v'), str):
+                        chunks.append(op.get('v'))
+            elif 'v' in data and isinstance(data['v'], str):
+                chunks.append(data['v'])
+        return chunks
+
     def _parse_event_stream(self, stream_data: str) -> str:
         result: list = []
         lines: list = stream_data.strip().split('\n')
         
         for line in lines:
-            if line.startswith('data:'):
-                
-                data_str: str = line[5:].strip()
-                
-                if data_str == '[DONE]':
-                    break
-                
-                data: dict = loads(data_str)
-                
-                if isinstance(data, dict):
-                    
-                    if data.get('o') == 'append' and data.get('p') == '/message/content/parts/0':
-                        
-                        result.append(data.get('v'))
-                        
-                    elif data.get('o') == 'patch' and isinstance(data.get('v'), list):
-                        
-                        for op in data.get('v'):
-                            
-                            if op.get('o') == 'append' and op.get('p') == '/message/content/parts/0':
-                                
-                                result.append(op.get('v'))
-                                
-                    elif 'v' in data and isinstance(data['v'], str):
-                        result.append(data['v'])
+            result.extend(self._extract_stream_chunks(line))
 
         return ''.join(result)
+
+    def _consume_stream_response(self, conversation_request: Any):
+        raw_lines: list[str] = []
+        response_parts: list[str] = []
+
+        for line in conversation_request.iter_lines():
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='ignore')
+            if line is None:
+                continue
+            raw_lines.append(line)
+            chunks = self._extract_stream_chunks(line)
+            for chunk in chunks:
+                response_parts.append(chunk)
+                yield chunk
+
+        raw_text = '\n'.join(raw_lines)
+        self.session.cookies.update(conversation_request.cookies)
+        self.last_response_summary = {
+            'response_received': True,
+            'status_code': getattr(conversation_request, 'status_code', None),
+            'text_preview': raw_text[:300],
+            'unusual_activity': 'Unusual activity' in raw_text,
+            'conversation_id_found': '"conversation_id": "' in raw_text,
+            'message_id_found': '"message_id": "' in raw_text,
+        }
+
+        if 'Unusual activity' in raw_text:
+            Log.Error("Your IP got flagged by chatgpt, retry with a new IP")
+            exit(conversation_request.status_code)
+
+        conversation_id = self._safe_extract(raw_text, '"conversation_id": "', '"')
+        parent_message_id = self._safe_extract(raw_text, '"message_id": "', '"')
+        if conversation_id:
+            self.data['conversation_id'] = conversation_id
+        if parent_message_id:
+            self.data['parent_message_id'] = parent_message_id
+
+        self.response = ''.join(response_parts)
+        if not self.response and not conversation_id:
+            raise RuntimeError(f"Conversation response did not contain a usable answer or conversation id. Preview: {raw_text[:300]}")
         
     def _fetch_cookies(self) -> None:
         
@@ -734,7 +776,87 @@ class ChatGPT:
             self.data["parent_message_id"] = parent_message_id
         
         self.response = self._parse_event_stream(conversation_request.text)
+
+    def hold_conversation_stream(self, message: str):
+        conduit_token: str = self.get_conduit(next=True)
+        self._get_tokens(randint(2000, 3000))
+        time_1: int = randint(3000, 6000)
+        proof_token: str = Challenges.solve_pow(self.data["proofofwork"]["seed"], self.data["proofofwork"]["difficulty"], self.data["config"])
+        turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
+
+        self.session.headers = Headers.CONVERSATION
+        self.session.headers.update({
+            'oai-client-version': self.data["prod"],
+            'oai-device-id': self.data["device-id"],
+            'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
+            'openai-sentinel-chat-requirements-token': self.data["token"],
+            'openai-sentinel-proof-token': proof_token,
+            'openai-sentinel-turnstile-token': turnstile_token,
+            'x-conduit-token': conduit_token,
+            'Authorization': self.authorization
+        })
+
+        conversation_data = {
+            'action': 'next',
+            'messages': [{
+                'id': str(uuid4()),
+                'author': {'role': 'user'},
+                'create_time': round(time(), 3),
+                'content': {'content_type': 'text', 'parts': [message]},
+                'metadata': {
+                    'selected_github_repos': [],
+                    'selected_all_github_repos': False,
+                    'serialization_metadata': {'custom_symbol_offsets': []},
+                },
+            }],
+            'conversation_id': self.data["conversation_id"],
+            'parent_message_id': self.data["parent_message_id"],
+            'model': self.model_name,
+            'timezone_offset_min': self.timezone_offset,
+            'timezone': self.ip_info[5],
+            'history_and_training_disabled': True,
+            'conversation_mode': {'kind': 'primary_assistant'},
+            'enable_message_followups': True,
+            'system_hints': [],
+            'supports_buffering': True,
+            'supported_encodings': ['v1'],
+            'client_contextual_info': {
+                'is_dark_mode': True,
+                'time_since_loaded': 17,
+                'page_height': 1219,
+                'page_width': 3440,
+                'pixel_ratio': 1,
+                'screen_height': 1440,
+                'screen_width': 3440,
+            },
+            'paragen_cot_summary_display_override': 'allow',
+            'force_parallel_switch': 'auto',
+        }
+
+        self.last_request_summary = {
+            'request_sent': True,
+            'url': 'https://chatgpt.com/backend-anon/f/conversation',
+            'model': self.model_name,
+            'thinking_mode': self.thinking_mode,
+            'message_length': len(message),
+            'has_image': False,
+            'authorization_supplied': bool(self.authorization),
+            'cookies_supplied': bool(self._supplied_cookies),
+            'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
+        }
+
+        conversation_request: requests.models.Response = self.session.post(
+            'https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300), stream=True
+        )
+        yield from self._consume_stream_response(conversation_request)
     
+    def stream_question(self, message: str, image: str = None):
+        if not image:
+            yield from self.ask_question_with_file_stream(message)
+        else:
+            file_name = f"{str(uuid4())}.png"
+            yield from self.ask_question_with_file_stream(message, file_name=file_name, file_b64=image, is_image=True)
+
     def ask_question(self, message: str, image: str = None) -> str:
         
         if not image:
@@ -744,6 +866,113 @@ class ChatGPT:
             self.ask_question_with_file(message, file_name=file_name, file_b64=image, is_image=True)
         
         return self.response
+
+    def ask_question_with_file_stream(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False):
+        model = model or self.model_name
+        self._get_tokens()
+        conduit_token: str = self.get_conduit()
+
+        time_1: int = randint(6000, 9000)
+        proof_token: str = Challenges.solve_pow(self.data["proofofwork"]["seed"], self.data["proofofwork"]["difficulty"], self.data["config"])
+        turnstile_token: str = VM.get_turnstile(self.data["bytecode"], self.data["vm_token"], str(self.ip_info[:-1]))
+
+        self.session.headers = Headers.CONVERSATION
+        self.session.headers.update({
+            'oai-client-version': self.data["prod"],
+            'oai-device-id': self.data["device-id"],
+            'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
+            'openai-sentinel-chat-requirements-token': self.data["token"],
+            'openai-sentinel-proof-token': proof_token,
+            'openai-sentinel-turnstile-token': turnstile_token,
+            'x-conduit-token': conduit_token,
+            'Authorization': self.authorization
+        })
+
+        msg = {
+            'id': str(uuid4()),
+            'author': {'role': 'user'},
+            'create_time': round(time(), 3),
+            'metadata': {
+                'selected_github_repos': [],
+                'selected_all_github_repos': False,
+                'selected_sources': [],
+                'serialization_metadata': {'custom_symbol_offsets': []},
+            },
+        }
+
+        is_image = False
+        is_zip = False
+        if file_name and file_b64:
+            mime_type = guess_type(file_name)[0]
+            is_zip = file_name.endswith('.zip')
+            is_image = file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'))
+            mime_type = "application/zip" if is_zip else "image/png" if is_image else mime_type
+            file_id, file_size, width, height = self.upload_file(file_name, file_b64, is_image=is_image, is_zip=is_zip)
+            attachment = {'id': file_id, 'size': file_size, 'name': file_name, 'mime_type': mime_type, 'source': 'local'}
+            if is_image:
+                attachment.update({'width': width, 'height': height})
+            msg['metadata']['attachments'] = [attachment]
+
+        if is_image:
+            msg['content'] = {
+                'content_type': 'multimodal_text',
+                'parts': [
+                    {
+                        'content_type': 'image_asset_pointer',
+                        'asset_pointer': f'file-service://{file_id}',
+                        'size_bytes': file_size,
+                        'width': width,
+                        'height': height,
+                    },
+                    message,
+                ],
+            }
+        else:
+            msg['content'] = {'content_type': 'text', 'parts': [message]}
+
+        conversation_data = {
+            'action': 'next',
+            'messages': [msg],
+            'parent_message_id': 'client-created-root',
+            'model': model,
+            'effort': self.thinking_mode,
+            'timezone_offset_min': self.timezone_offset,
+            'timezone': self.ip_info[5],
+            'history_and_training_disabled': True,
+            'conversation_mode': {'kind': 'primary_assistant'},
+            'enable_message_followups': True,
+            'system_hints': [],
+            'supports_buffering': True,
+            'supported_encodings': ['v1'],
+            'client_contextual_info': {
+                'is_dark_mode': True,
+                'time_since_loaded': randint(3, 6),
+                'page_height': 1219,
+                'page_width': 3440,
+                'pixel_ratio': 1,
+                'screen_height': 1440,
+                'screen_width': 3440,
+            },
+            'paragen_cot_summary_display_override': 'allow',
+            'force_parallel_switch': 'auto',
+        }
+
+        self.last_request_summary = {
+            'request_sent': True,
+            'url': 'https://chatgpt.com/backend-anon/f/conversation',
+            'model': model,
+            'thinking_mode': self.thinking_mode,
+            'message_length': len(message),
+            'has_image': is_image,
+            'authorization_supplied': bool(self.authorization),
+            'cookies_supplied': bool(self._supplied_cookies),
+            'conversation_id_present_before_send': bool(self.data.get('conversation_id')),
+        }
+
+        conversation_request: requests.models.Response = self.session.post(
+            'https://chatgpt.com/backend-anon/f/conversation', json=conversation_data, timeout=(30, 300), stream=True
+        )
+        yield from self._consume_stream_response(conversation_request)
 
     def ask_question_with_file(self, message: str, model: str | None = None, file_name: str = None, file_b64: str = None, is_image: bool = False) -> str:
         model = model or self.model_name

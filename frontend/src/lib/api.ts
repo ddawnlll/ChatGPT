@@ -82,3 +82,49 @@ export function deleteChat(chatId: string) {
     method: 'DELETE',
   })
 }
+
+export async function streamMessage(
+  chatId: string,
+  payload: { message: string; image?: string | null },
+  onEvent: (event: { type: string; content?: string; chat?: ChatDetail; error?: string; message?: ChatMessage }) => void,
+) {
+  const response = await fetch(`${API_BASE}/chats/${chatId}/messages/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+
+  if (!response.ok || !response.body) {
+    const text = await response.text()
+    throw new Error(`${response.status}: ${text || `Request failed with ${response.status}`}`)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const parts = buffer.split('\n\n')
+    buffer = parts.pop() ?? ''
+
+    for (const part of parts) {
+      const line = part
+        .split('\n')
+        .find((entry) => entry.startsWith('data:'))
+      if (!line) continue
+      const payload = JSON.parse(line.slice(5).trim())
+      onEvent(payload)
+      if (payload.type === 'error') {
+        throw new Error(payload.error || 'Streaming request failed')
+      }
+      if (payload.type === 'done') {
+        return payload.chat as ChatDetail
+      }
+    }
+  }
+
+  throw new Error('Streaming response ended without a completion event')
+}

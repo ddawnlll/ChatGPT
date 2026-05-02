@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uvicorn import run
 
@@ -508,6 +509,73 @@ async def delete_chat(chat_id: str) -> dict[str, str]:
     CHAT_CLIENTS.pop(chat_id, None)
     delete_chat_from_db(chat_id)
     return {"status": "success"}
+
+
+@app.post("/chats/{chat_id}/messages/stream")
+async def stream_chat_message(chat_id: str, request: SendMessageRequest) -> StreamingResponse:
+    if not request.message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    chat = ensure_chat(chat_id)
+    client = get_chat_client(chat_id, chat)
+
+    user_message = {
+        "id": str(uuid4()),
+        "role": "user",
+        "content": request.message,
+        "created_at": utc_now_iso(),
+        "image": bool(request.image),
+    }
+    chat["messages"].append(user_message)
+    update_chat_title(chat, request.message)
+    persist_chat(chat)
+
+    def sse_event(payload: dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def event_stream():
+        assistant_parts: list[str] = []
+        try:
+            yield sse_event({"type": "user", "message": user_message})
+            if request.image or not chat.get("remote_conversation_started", False):
+                chunk_iter = client.stream_question(request.message, request.image)
+                chat["remote_conversation_started"] = True
+            else:
+                chunk_iter = client.hold_conversation_stream(request.message)
+
+            for chunk in chunk_iter:
+                assistant_parts.append(chunk)
+                yield sse_event({"type": "chunk", "content": chunk})
+
+            chat["remote_conversation_id"] = client.data.get("conversation_id")
+            chat["remote_parent_message_id"] = client.data.get("parent_message_id")
+            assistant_message = {
+                "id": str(uuid4()),
+                "role": "assistant",
+                "content": "".join(assistant_parts),
+                "created_at": utc_now_iso(),
+                "image": False,
+            }
+            chat["messages"].append(assistant_message)
+            chat["updated_at"] = utc_now_iso()
+            persist_chat(chat)
+            yield sse_event({
+                "type": "done",
+                "chat": {
+                    **chat_summary(chat),
+                    "messages": chat["messages"],
+                    "session_id": chat["session_id"],
+                    "thinking_mode": chat["thinking_mode"],
+                    "model_name": chat["model_name"],
+                },
+            })
+        except Exception as exc:
+            if chat["messages"] and chat["messages"][-1]["id"] == user_message["id"]:
+                chat["messages"].pop()
+                persist_chat(chat)
+            yield sse_event({"type": "error", "error": str(exc)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/chats/{chat_id}/messages", response_model=ChatDetail)

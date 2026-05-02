@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useParams, useRouterState } from '@tanstack/react-router'
 import clsx from 'clsx'
-import { createChat, deleteChat, getChat, listChats, renameChat, sendMessage, type SessionConfig } from '../lib/api'
+import { createChat, deleteChat, getChat, listChats, renameChat, streamMessage, type ChatMessage, type SessionConfig } from '../lib/api'
 
 const SESSION_STORAGE_KEY = 'gpt-fork-session-config'
 
@@ -35,6 +35,10 @@ export function ChatShell() {
   const [message, setMessage] = useState('')
   const [titleInput, setTitleInput] = useState('')
   const [renameInput, setRenameInput] = useState('')
+  const [streamingAssistant, setStreamingAssistant] = useState('')
+  const [pendingUserMessage, setPendingUserMessage] = useState<ChatMessage | null>(null)
+  const [streamError, setStreamError] = useState<string | null>(null)
+  const [isStreaming, setIsStreaming] = useState(false)
 
   const chatsQuery = useQuery({ queryKey: ['chats'], queryFn: listChats, retry: false })
   const activeChatId = params.chatId
@@ -84,12 +88,39 @@ export function ChatShell() {
         queryClient.invalidateQueries({ queryKey: ['chats'] })
         navigate({ to: '/chat/$chatId', params: { chatId } })
       }
-      return sendMessage(chatId!, { message })
+
+      const optimisticUser: ChatMessage = {
+        id: `pending-${Date.now()}`,
+        role: 'user',
+        content: message,
+        created_at: new Date().toISOString(),
+      }
+      setPendingUserMessage(optimisticUser)
+      setStreamingAssistant('')
+      setStreamError(null)
+      setIsStreaming(true)
+
+      const finalChat = await streamMessage(chatId!, { message }, (event) => {
+        if (event.type === 'chunk') {
+          setStreamingAssistant((prev) => prev + (event.content ?? ''))
+        }
+      })
+      return finalChat
     },
     onSuccess: (chat) => {
       queryClient.setQueryData(['chat', chat.id], chat)
       queryClient.invalidateQueries({ queryKey: ['chats'] })
       setMessage('')
+      setPendingUserMessage(null)
+      setStreamingAssistant('')
+      setStreamError(null)
+      setIsStreaming(false)
+    },
+    onError: (error) => {
+      setStreamError(String((error as Error).message))
+      setPendingUserMessage(null)
+      setStreamingAssistant('')
+      setIsStreaming(false)
     },
   })
 
@@ -97,7 +128,21 @@ export function ChatShell() {
     window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionConfig))
   }
 
-  const messages = useMemo(() => chatQuery.data?.messages ?? [], [chatQuery.data])
+  const messages = useMemo(() => {
+    const base = [...(chatQuery.data?.messages ?? [])]
+    if (pendingUserMessage) {
+      base.push(pendingUserMessage)
+    }
+    if (streamingAssistant) {
+      base.push({
+        id: 'streaming-assistant',
+        role: 'assistant',
+        content: streamingAssistant,
+        created_at: new Date().toISOString(),
+      })
+    }
+    return base
+  }, [chatQuery.data, pendingUserMessage, streamingAssistant])
 
   useEffect(() => {
     if (!activeChatId || !chatQuery.error) return
@@ -241,14 +286,15 @@ export function ChatShell() {
               />
               <button
                 className="rounded-xl bg-accent px-4 py-3 font-medium text-white hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!message.trim() || sendMessageMutation.isPending}
+                disabled={!message.trim() || sendMessageMutation.isPending || isStreaming}
                 onClick={() => sendMessageMutation.mutate()}
               >
-                {sendMessageMutation.isPending ? 'Sending…' : 'Send'}
+                {sendMessageMutation.isPending || isStreaming ? 'Streaming…' : 'Send'}
               </button>
             </div>
           </div>
           {chatQuery.error ? <div className="mx-auto mt-3 max-w-3xl text-sm text-amber-400">Active chat was not found. You were redirected to a new chat view.</div> : null}
+          {streamError ? <div className="mx-auto mt-3 max-w-3xl text-sm text-red-400">{streamError}</div> : null}
           {sendMessageMutation.error ? <div className="mx-auto mt-3 max-w-3xl text-sm text-red-400">{String(sendMessageMutation.error.message)}</div> : null}
           {createChatMutation.error ? <div className="mx-auto mt-3 max-w-3xl text-sm text-red-400">{String(createChatMutation.error.message)}</div> : null}
           {renameChatMutation.error ? <div className="mx-auto mt-3 max-w-3xl text-sm text-red-400">{String(renameChatMutation.error.message)}</div> : null}
