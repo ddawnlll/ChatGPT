@@ -253,33 +253,82 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
     })
   }
 
-  await activateComposer(composer.locator)
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
-  await page.keyboard.press('Backspace').catch(() => {})
+  // Loop to type and send, retrying if the message doesn't send or type correctly
+  let promptSent = false
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await activateComposer(composer.locator)
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
+    await page.keyboard.press('Backspace').catch(() => {})
 
-  if (composer.selector.includes('textarea')) {
-    await composer.locator.fill('').catch(() => {})
-    await composer.locator.fill(message).catch(async () => {
+    if (composer.selector.includes('textarea')) {
+      await composer.locator.fill('').catch(() => {})
+      await composer.locator.fill(message).catch(async () => {
+        await page.keyboard.insertText(message)
+      })
+    } else {
       await page.keyboard.insertText(message)
-    })
-  } else {
-    await page.keyboard.insertText(message)
-  }
+    }
 
-  let enteredText = ''
-  try {
-    enteredText = await composer.locator.inputValue()
-  } catch {
-    enteredText = await composer.locator.innerText().catch(() => '')
+    let enteredText = ''
+    try {
+      enteredText = await composer.locator.inputValue()
+    } catch {
+      enteredText = await composer.locator.innerText().catch(() => '')
+    }
+    emit({ type: 'status', stage: 'prompt_entered', attempt, prompt_length: enteredText.length })
+    
+    // If it completely failed to type, retry the whole typing block
+    if (enteredText.trim().length === 0 && message.trim().length > 0) {
+      await delay(500)
+      continue
+    }
+
+    // Wait a tiny bit for React state to register the input
+    await delay(100)
+    
+    const sendButton = page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first()
+    
+    if (await sendButton.isVisible().catch(() => false)) {
+      // Ensure the button isn't disabled before clicking
+      const isDisabled = await sendButton.isDisabled().catch(() => false)
+      if (!isDisabled) {
+        await sendButton.click({ force: true, timeout: 1000 }).catch(async () => page.keyboard.press('Enter'))
+      } else {
+        await page.keyboard.press('Enter')
+      }
+    } else {
+      await page.keyboard.press('Enter')
+    }
+    
+    // Wait up to 1.5 seconds for the composer to clear (indicating successful send)
+    let cleared = false
+    for (let i = 0; i < 10; i++) {
+      await delay(150)
+      let currentText = ''
+      try {
+        currentText = await composer.locator.inputValue()
+      } catch {
+        currentText = await composer.locator.innerText().catch(() => '')
+      }
+      if (currentText.trim().length === 0 || currentText.trim() === 'Message ChatGPT') {
+        cleared = true
+        break
+      }
+    }
+    
+    if (cleared) {
+      promptSent = true
+      break
+    } else {
+      emit({ type: 'status', stage: 'send_retry', attempt })
+    }
   }
-  emit({ type: 'status', stage: 'prompt_entered', prompt_length: enteredText.length })
-  const sendButton = page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first()
-  if (await sendButton.isVisible().catch(() => false)) {
-    await sendButton.click().catch(async () => page.keyboard.press('Enter'))
+  
+  if (!promptSent) {
+    emit({ type: 'status', stage: 'send_failed_but_continuing' })
   } else {
-    await page.keyboard.press('Enter')
+    emit({ type: 'status', stage: 'send_triggered' })
   }
-  emit({ type: 'status', stage: 'send_triggered' })
 }
 
 const ASSISTANT_SELECTORS = [
