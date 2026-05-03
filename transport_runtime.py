@@ -97,6 +97,9 @@ class ChatGPTTransport:
 
 
 class PlaywrightTransport:
+    _shared_process: Popen | None = None
+    _shared_process_key: tuple[Any, ...] | None = None
+
     def __init__(self, session_material: dict[str, Any]):
         self.session_material = dict(session_material)
         self.data: dict[str, Any] = {"conversation_id": None, "parent_message_id": None}
@@ -158,9 +161,21 @@ class PlaywrightTransport:
         )
         return self._last_result
 
+    def _process_key(self) -> tuple[Any, ...]:
+        return (
+            self.session_material.get("browser_executable_path") or self.session_material.get("executable_path"),
+            self.session_material.get("browser_user_data_dir") or self.session_material.get("user_data_dir"),
+            self.session_material.get("browser_profile_directory") or self.session_material.get("profile_directory"),
+            self.session_material.get("browser_type"),
+            bool(self.session_material.get("browser_headless", False)),
+            self.session_material.get("browser_chat_url") or "https://chatgpt.com/",
+        )
+
     def _get_node_process(self) -> Popen:
-        if hasattr(self, "_process") and self._process.poll() is None:
-            return self._process
+        process = self.__class__._shared_process
+        key = self._process_key()
+        if process is not None and process.poll() is None and self.__class__._shared_process_key == key:
+            return process
 
         project_root = Path(__file__).resolve().parent
         browser_cache = project_root / "bin" / "browsers"
@@ -168,7 +183,7 @@ class PlaywrightTransport:
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_cache)
         env["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
-        self._process = Popen(
+        process = Popen(
             ["bun", self._script_path()],
             stdin=PIPE,
             stdout=PIPE,
@@ -177,8 +192,10 @@ class PlaywrightTransport:
             bufsize=1,
             env=env,
         )
-        logger.info(f"[playwright-transport] spawned persistent node daemon pid={self._process.pid}")
-        return self._process
+        self.__class__._shared_process = process
+        self.__class__._shared_process_key = key
+        logger.info(f"[playwright-transport] spawned persistent node daemon pid={process.pid}")
+        return process
 
     def _run(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[dict[str, Any]]:
         process = self._get_node_process()
@@ -218,9 +235,15 @@ class PlaywrightTransport:
     def send_message(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> TransportResult:
         final_payload: dict[str, Any] | None = None
         for event in self._run(message, image, new_conversation=new_conversation):
-            if event.get("type") == "status":
+            event_type = event.get("type")
+            if event_type == "status":
                 self.request_diagnostics.update({"last_stage": event.get("stage")})
-            elif event.get("type") == "result":
+            elif event_type == "error":
+                if event.get("stage"):
+                    self.request_diagnostics["last_stage"] = event.get("stage")
+                if event.get("message"):
+                    self.request_diagnostics["playwright_error"] = str(event.get("message"))[:1000]
+            elif event_type == "result":
                 final_payload = event
         if not final_payload:
             raise RuntimeError("Playwright transport did not emit a final result event")
@@ -231,13 +254,19 @@ class PlaywrightTransport:
     def stream_message(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[str]:
         final_payload: dict[str, Any] | None = None
         for event in self._run(message, image, new_conversation=new_conversation):
-            if event.get("type") == "status":
+            event_type = event.get("type")
+            if event_type == "status":
                 self.request_diagnostics.update({"last_stage": event.get("stage")})
-            elif event.get("type") == "chunk":
+            elif event_type == "error":
+                if event.get("stage"):
+                    self.request_diagnostics["last_stage"] = event.get("stage")
+                if event.get("message"):
+                    self.request_diagnostics["playwright_error"] = str(event.get("message"))[:1000]
+            elif event_type == "chunk":
                 chunk = event.get("content") or ""
                 if chunk:
                     yield chunk
-            elif event.get("type") == "result":
+            elif event_type == "result":
                 final_payload = event
         if not final_payload:
             raise RuntimeError("Playwright transport did not emit a final result event")

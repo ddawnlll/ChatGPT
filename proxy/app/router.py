@@ -130,6 +130,10 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                     yield sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_messages"}})
                     yield done_sse()
                     return
+                except Exception as exc:
+                    yield sse({"error": {"message": str(exc), "type": "server_error", "code": "transport_error"}})
+                    yield done_sse()
+                    return
                 if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
                     chunk = StreamChunk(
                         id=req_id,
@@ -164,14 +168,23 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
             return StreamingResponse(agent_event_stream(), media_type="text/event-stream", headers=STREAM_HEADERS)
 
         async def event_stream():
-            upstream = stream_chat_completion(
-                model=request.model,
-                messages=dumped_messages,
-                conversation_id=conversation_id,
-                prompt_override=prompt_override,
-            )
-            async for item in chat_completions_stream(upstream, request.model):
-                yield item
+            try:
+                upstream = stream_chat_completion(
+                    model=request.model,
+                    messages=dumped_messages,
+                    conversation_id=conversation_id,
+                    prompt_override=prompt_override,
+                )
+                async for item in chat_completions_stream(upstream, request.model):
+                    yield item
+            except ValueError as exc:
+                yield sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_messages"}})
+                yield done_sse()
+                return
+            except Exception as exc:
+                yield sse({"error": {"message": str(exc), "type": "server_error", "code": "transport_error"}})
+                yield done_sse()
+                return
 
         return StreamingResponse(event_stream(), media_type="text/event-stream", headers=STREAM_HEADERS)
 

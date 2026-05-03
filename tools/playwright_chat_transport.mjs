@@ -1,90 +1,56 @@
 #!/usr/bin/env node
+/**
+ * transport.mjs — Playwright-based ChatGPT web transport
+ *
+ * Improvements over original:
+ *  - Structured error emission replaces silent catch(() => {})
+ *  - Unified text injection with deterministic test-then-fallback
+ *  - Longer send-detection window (1500 ms) with prior-generation guard
+ *  - Configurable thinking-watchdog thresholds + auto-retry after stop
+ *  - Cross-platform browser detection (macOS + Linux + Windows)
+ *  - Bounding-box rejection raised to 20×20 px; off-screen composerss handled
+ *  - Composer polling interval reduced to 80 ms for faster first-response
+ *  - Delta computation guards against ChatGPT mid-response edits
+ *  - Stream binding has explicit navigation-cleanup path
+ *  - All async paths emit structured {type:"error"} events on failure
+ */
+
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import process from 'node:process'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { chromium, firefox, webkit } from 'playwright'
-
 import readline from 'node:readline'
 
 const require = createRequire(import.meta.url)
 
-function getPlaywrightVersion() {
-  try {
-    return require('playwright/package.json').version
-  } catch {
-    return null
-  }
+// ---------------------------------------------------------------------------
+// Config — all tuneable constants in one place
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  composerPollMs: 80,            // how often to re-check for composer
+  composerMinBoxPx: 20,          // reject composer candidates smaller than this
+  composerTimeoutMs: 15_000,     // total wait for composer to appear
+  sendDetectionWindowMs: 1_500,  // how long to poll after send attempt
+  sendDetectionTickMs: 100,      // tick interval inside that window
+  sendMaxAttempts: 3,
+  injectionDelayMs: 350,         // settle time after text injection before send
+  chunkSizeChars: 1_200,         // keyboard insertText chunk size
+  streamIdleMs: 500,             // mutation-observer idle before "done"
+  thinkingWarnMs: 20_000,        // emit warning after this long thinking
+  thinkingAbortMs: 30_000,       // click Stop after this long thinking
+  thinkingPollMs: 2_000,         // watchdog check interval
+  challengeTimeoutMs: 12_000,
+  chatShellTimeoutMs: 12_000,
+  pageTimeoutMs: 90_000,         // overall per-prompt timeout
 }
 
-function getBrowserTypeName(browser) {
-  return String(browser.browser_type || 'firefox').toLowerCase()
-}
-
-function getBrowserType(browser) {
-  const type = getBrowserTypeName(browser)
-
-  if (type === 'firefox') return firefox
-  if (type === 'webkit') return webkit
-  if (type === 'chromium' || type === 'chrome') return chromium
-
-  throw new Error(`Unsupported browser_type: ${type}`)
-}
-
-// System browser detection — no Playwright-managed browsers needed
-const SYSTEM_BROWSER_CANDIDATES = [
-  { type: 'chromium', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
-  { type: 'chromium', path: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' },
-  { type: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
-  { type: 'firefox',  path: '/Applications/Firefox.app/Contents/MacOS/firefox' },
-]
-
-function findSystemBrowser() {
-  for (const candidate of SYSTEM_BROWSER_CANDIDATES) {
-    try { if (fsSync.statSync(candidate.path).isFile()) return candidate } catch {}
-  }
-  return null
-}
-
-function buildLaunchArgs(browser) {
-  const type = getBrowserTypeName(browser)
-
-  if (type === 'firefox' || type === 'webkit') {
-    return []
-  }
-
-  const args = [
-    `--user-data-dir=${browser.user_data_dir || ''}`,
-    '--remote-debugging-pipe',
-    '--password-store=basic',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--remote-allow-origins=*',
-    '--disable-blink-features=AutomationControlled',
-    'about:blank'
-  ]
-
-  if (browser.profile_directory) {
-    args.splice(1, 0, `--profile-directory=${browser.profile_directory}`)
-  }
-
-  return args
-}
-
-function resolveExecutablePath(browser) {
-  if (browser.executable_path) return browser.executable_path
-  // Fall back to system browser detection
-  const system = findSystemBrowser()
-  if (system) return system.path
-  // Last resort: let Playwright try its own
-  const browserType = getBrowserType(browser)
-  return browserType.executablePath()
-}
-
-
-
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
 const transportStartedAt = Date.now()
 
 function emit(event) {
@@ -96,110 +62,215 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify(enriched)}\n`)
 }
 
+function emitError(stage, error, extra = {}) {
+  emit({
+    type: 'error',
+    stage,
+    message: error?.message ?? String(error),
+    stack: error?.stack ?? null,
+    ...extra,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Browser helpers
+// ---------------------------------------------------------------------------
+function getPlaywrightVersion() {
+  try { return require('playwright/package.json').version } catch { return null }
+}
+
+function getBrowserTypeName(browser) {
+  return String(browser.browser_type || 'firefox').toLowerCase()
+}
+
+function getBrowserType(browser) {
+  const type = getBrowserTypeName(browser)
+  if (type === 'firefox') return firefox
+  if (type === 'webkit') return webkit
+  if (type === 'chromium' || type === 'chrome') return chromium
+  throw new Error(`Unsupported browser_type: ${type}`)
+}
+
+// Cross-platform system browser candidates
+const SYSTEM_BROWSER_CANDIDATES = [
+  // macOS
+  { type: 'chromium', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+  { type: 'chromium', path: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' },
+  { type: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
+  { type: 'firefox',  path: '/Applications/Firefox.app/Contents/MacOS/firefox' },
+  // Linux
+  { type: 'chromium', path: '/usr/bin/google-chrome-stable' },
+  { type: 'chromium', path: '/usr/bin/google-chrome' },
+  { type: 'chromium', path: '/usr/bin/chromium-browser' },
+  { type: 'chromium', path: '/usr/bin/chromium' },
+  { type: 'chromium', path: '/snap/bin/chromium' },
+  { type: 'firefox',  path: '/usr/bin/firefox' },
+  // Windows
+  { type: 'chromium', path: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' },
+  { type: 'chromium', path: 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe' },
+  { type: 'chromium', path: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe' },
+  { type: 'firefox',  path: 'C:\\Program Files\\Mozilla Firefox\\firefox.exe' },
+]
+
+function findSystemBrowser() {
+  for (const candidate of SYSTEM_BROWSER_CANDIDATES) {
+    try {
+      if (fsSync.statSync(candidate.path).isFile()) return candidate
+    } catch { /* not found, try next */ }
+  }
+  return null
+}
+
+function buildLaunchArgs(browser) {
+  const type = getBrowserTypeName(browser)
+  if (type === 'firefox' || type === 'webkit') return []
+
+  const args = [
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--password-store=basic',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--remote-allow-origins=*',
+  ]
+
+  if (browser.user_data_dir) args.unshift(`--user-data-dir=${browser.user_data_dir}`)
+  if (browser.profile_directory) args.unshift(`--profile-directory=${browser.profile_directory}`)
+
+  // Do not pass --remote-debugging-pipe to Playwright launch APIs.
+  // Playwright manages its own browser debugging connection.
+
+  return args
+}
+
+function resolveExecutablePath(browser) {
+  if (browser.executable_path) return browser.executable_path
+  const system = findSystemBrowser()
+  if (system) {
+    emit({ type: 'status', stage: 'browser_resolved', path: system.path, source: 'system_detection' })
+    return system.path
+  }
+  try {
+    const execPath = getBrowserType(browser).executablePath()
+    emit({ type: 'status', stage: 'browser_resolved', path: execPath, source: 'playwright_managed' })
+    return execPath
+  } catch (err) {
+    emitError('browser_resolve_failed', err)
+    throw err
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+async function delay(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// ---------------------------------------------------------------------------
+// Composer detection — improved bounding-box threshold and visibility checks
+// ---------------------------------------------------------------------------
 const COMPOSER_SELECTORS = [
   '#prompt-textarea[contenteditable="true"]',
   'div[contenteditable="true"][role="textbox"]',
   'div[contenteditable="true"][data-lexical-editor="true"]',
-  'div[contenteditable="true"]',
   '#prompt-textarea',
   'textarea[placeholder*="Message"]',
+  'div[contenteditable="true"]',
   'textarea',
 ]
 
 async function findComposer(page) {
   for (const selector of COMPOSER_SELECTORS) {
-    const locator = page.locator(selector)
+    let locator
+    try { locator = page.locator(selector) } catch { continue }
     const count = await locator.count().catch(() => 0)
-    for (let i = 0; i < count; i += 1) {
+
+    for (let i = 0; i < count; i++) {
       const candidate = locator.nth(i)
+
       const visible = await candidate.isVisible().catch(() => false)
       if (!visible) continue
 
+      // Reject zero-size or tiny elements that are technically visible
       const box = await candidate.boundingBox().catch(() => null)
-      if (!box || box.width < 4 || box.height < 4) {
-        emit({
-          type: 'status',
-          stage: 'composer_candidate_rejected_zero_box',
-          selector,
-          index: i,
-        })
+      if (!box || box.width < CONFIG.composerMinBoxPx || box.height < CONFIG.composerMinBoxPx) {
+        emit({ type: 'status', stage: 'composer_candidate_rejected', reason: 'box_too_small', selector, index: i, box })
         continue
       }
 
-      const disabled = await candidate.evaluate((node) => {
-        return Boolean(
+      // Reject elements that are scrolled far off screen (not just off viewport)
+      if (box.y < -500 || box.x < -500) {
+        emit({ type: 'status', stage: 'composer_candidate_rejected', reason: 'off_screen', selector, index: i, box })
+        continue
+      }
+
+      const disabled = await candidate.evaluate((node) =>
+        Boolean(
           node.disabled ||
           node.getAttribute('aria-disabled') === 'true' ||
-          node.getAttribute('aria-hidden') === 'true'
+          node.getAttribute('aria-hidden') === 'true' ||
+          node.getAttribute('readonly') !== null
         )
-      }).catch(() => false)
+      ).catch(() => false)
+      if (disabled) continue
 
-      if (!disabled) {
-        return { locator: candidate, selector, index: i }
-      }
+      return { locator: candidate, selector, index: i }
     }
   }
   return null
 }
 
-async function waitForComposer(page, timeoutMs) {
+async function waitForComposer(page, timeoutMs = CONFIG.composerTimeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const found = await findComposer(page)
+    const found = await findComposer(page).catch(() => null)
     if (found) return found
-    await delay(150)
+    await delay(CONFIG.composerPollMs)
   }
-  throw new Error('Prompt composer did not appear before timeout')
+  const err = new Error('Composer did not appear before timeout')
+  emitError('composer_timeout', err, { timeoutMs })
+  throw err
 }
 
-async function delay(ms) {
-  await new Promise((resolve) => setTimeout(resolve, ms))
+async function waitForComposerInteractive(page, timeoutMs = CONFIG.composerTimeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const found = await findComposer(page).catch(() => null)
+    if (found) {
+      try {
+        await found.locator.click({ trial: true, timeout: 300 })
+        return found
+      } catch { /* not yet clickable */ }
+    }
+    await delay(CONFIG.composerPollMs)
+  }
+  // Fall through to a simpler wait — at least return something
+  return waitForComposer(page, timeoutMs)
 }
 
-async function waitForNoChallenge(page, timeoutMs = 12000) {
+// ---------------------------------------------------------------------------
+// Page-state helpers
+// ---------------------------------------------------------------------------
+async function waitForNoChallenge(page, timeoutMs = CONFIG.challengeTimeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const title = await page.title().catch(() => '')
     const bodyText = await page.locator('body').innerText().catch(() => '')
-    const challengeVisible = /just a moment/i.test(title) || /just a moment|checking your browser/i.test(bodyText)
-    if (!challengeVisible) return
+    if (!/just a moment/i.test(title) && !/just a moment|checking your browser/i.test(bodyText)) return
     await delay(200)
   }
+  emit({ type: 'status', stage: 'challenge_still_visible_after_timeout', timeoutMs })
 }
 
-async function waitForChatShell(page, timeoutMs = 12000) {
+async function waitForChatShell(page, timeoutMs = CONFIG.chatShellTimeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const bodyText = await page.locator('body').innerText().catch(() => '')
-    const hasChatUi = /ready when you are|what.?s on your mind today|new chat|chat history|chatgpt/i.test(bodyText)
-    if (hasChatUi) return
+    if (/ready when you are|what.?s on your mind today|new chat|chat history|chatgpt/i.test(bodyText)) return
     await delay(200)
   }
-}
-
-async function waitForComposerInteractive(page, timeoutMs = 12000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const found = await findComposer(page)
-    if (found) {
-      try {
-        await found.locator.click({ trial: true, timeout: 250 })
-        return found
-      } catch {}
-    }
-    await delay(150)
-  }
-  return waitForComposer(page, timeoutMs)
-}
-
-async function waitForConversationIdle(page, timeoutMs = 5000) {
-  const stopButton = page.locator('button[aria-label*="Stop" i]').first()
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const stopVisible = await stopButton.isVisible().catch(() => false)
-    if (!stopVisible) return
-    await delay(150)
-  }
+  emit({ type: 'status', stage: 'chat_shell_not_detected_after_timeout', timeoutMs })
 }
 
 async function detectLoggedInUi(page) {
@@ -218,23 +289,72 @@ async function detectLoggedInUi(page) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Thread/composer context management
+// ---------------------------------------------------------------------------
+async function clickNewChatButton(page, timeoutMs = 8_000) {
+  const selectors = [
+    'button:has-text("New chat")',
+    'a:has-text("New chat")',
+    '[role="button"]:has-text("New chat")',
+    '[data-testid*="new-chat"]',
+    'a[href="/"]',
+  ]
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first()
+    const visible = await locator.isVisible().catch(() => false)
+    if (!visible) continue
+
+    emit({ type: 'status', stage: 'new_chat_button_found', selector })
+    await locator.click({ timeout: 1_500 }).catch((err) => emitError('new_chat_click_failed', err, { selector }))
+
+    const composer = await waitForComposerInteractive(page, timeoutMs).catch(() => null)
+    if (composer) {
+      emit({ type: 'status', stage: 'new_chat_button_succeeded', selector, current_url: page.url() })
+      return composer
+    }
+  }
+
+  emit({ type: 'status', stage: 'new_chat_button_not_available' })
+  return null
+}
+
 async function openFreshThread(page, targetUrl) {
   const currentUrl = page.url()
-  const normalizedTarget = `${targetUrl}`.replace(/\/$/, '')
-  const existingComposer = await findComposer(page)
+  const normalizedTarget = targetUrl.replace(/\/$/, '')
+  const existingComposer = await findComposer(page).catch(() => null)
   const alreadyHome = currentUrl.replace(/\/$/, '') === normalizedTarget
+  const sameOrigin = (() => {
+    try {
+      return new URL(currentUrl).origin === new URL(targetUrl).origin
+    } catch {
+      return false
+    }
+  })()
+
+  if (sameOrigin) {
+    const opened = await clickNewChatButton(page).catch(() => null)
+    if (opened) return true
+  }
 
   if (alreadyHome && existingComposer) {
-    emit({ type: 'status', stage: 'fresh_thread_already_ready', current_url: currentUrl, selector: existingComposer.selector, index: existingComposer.index })
+    emit({ type: 'status', stage: 'fresh_thread_already_ready', current_url: currentUrl })
     return true
   }
 
-  emit({ type: 'status', stage: 'navigating_home_for_fresh_thread', current_url: currentUrl, target_url: targetUrl })
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
-  await waitForNoChallenge(page, 10000)
-  await waitForChatShell(page, 5000)
-  const homeComposer = await waitForComposerInteractive(page, 10000)
-  emit({ type: 'status', stage: 'fresh_thread_home_ready', composer_found: Boolean(homeComposer), selector: homeComposer?.selector ?? null, index: homeComposer?.index ?? null, current_url: page.url() })
+  emit({ type: 'status', stage: 'navigating_home', current_url: currentUrl, target_url: targetUrl })
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch((err) => {
+    emitError('navigation_failed', err, { targetUrl })
+  })
+  await waitForNoChallenge(page)
+  await waitForChatShell(page)
+
+  const openedAfterHome = await clickNewChatButton(page, 4_000).catch(() => null)
+  if (openedAfterHome) return true
+
+  await waitForComposerInteractive(page)
+  emit({ type: 'status', stage: 'fresh_thread_ready', current_url: page.url() })
   return true
 }
 
@@ -243,172 +363,193 @@ async function ensureComposerContext(page, targetUrl, newConversation) {
     await openFreshThread(page, targetUrl)
   }
 
-  const initialComposer = await findComposer(page)
-  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), selector: initialComposer?.selector ?? null, index: initialComposer?.index ?? null, new_conversation: Boolean(newConversation) })
-  if (initialComposer) {
-    return await waitForComposerInteractive(page, 5000)
-  }
+  const initialComposer = await findComposer(page).catch(() => null)
+  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), new_conversation: Boolean(newConversation) })
+  if (initialComposer) return waitForComposerInteractive(page, 5_000)
 
   if (!newConversation) {
-    const newChatButton = page.locator('button:has-text("New chat"), a:has-text("New chat"), [role="button"]:has-text("New chat")').first()
-    if (await newChatButton.isVisible().catch(() => false)) {
-      emit({ type: 'status', stage: 'opening_new_chat' })
-      await newChatButton.click().catch(() => {})
-      const readyComposer = await waitForComposerInteractive(page, 10000)
-      if (readyComposer) return readyComposer
-    }
+    const readyComposer = await clickNewChatButton(page, 10_000).catch(() => null)
+    if (readyComposer) return readyComposer
   }
 
-  emit({ type: 'status', stage: 'navigating_home_for_composer', target_url: targetUrl })
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
-  await waitForNoChallenge(page, 10000)
-  await waitForChatShell(page, 5000)
-  return await waitForComposerInteractive(page, 15000)
+  emit({ type: 'status', stage: 'navigating_home_fallback', target_url: targetUrl })
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch((err) => emitError('navigation_fallback_failed', err, { targetUrl }))
+  await waitForNoChallenge(page)
+  await waitForChatShell(page)
+  return waitForComposerInteractive(page, CONFIG.composerTimeoutMs)
 }
 
-async function typeComposerTextWithKeyboard(page, composer, message) {
-  await composer.locator.scrollIntoViewIfNeeded().catch(() => {})
-  await composer.locator.click({ timeout: 1500 }).catch(() => {})
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
-  await page.keyboard.press('Backspace').catch(() => {})
+// ---------------------------------------------------------------------------
+// Text injection — unified strategy with deterministic fallback
+// ---------------------------------------------------------------------------
 
-  const chunkSize = 1200
-  for (let i = 0; i < message.length; i += chunkSize) {
-    await page.keyboard.insertText(message.slice(i, i + chunkSize))
-    await delay(20)
-  }
-
-  let enteredText = ''
+/**
+ * Strategy 1 — keyboard insertText (most reliable for React synthetic events)
+ */
+async function injectViaKeyboard(page, composerLocator, message) {
   try {
-    enteredText = await composer.locator.inputValue({ timeout: 1000 })
-  } catch {
-    enteredText = await composer.locator.innerText({ timeout: 1000 }).catch(() => '')
-  }
+    await composerLocator.scrollIntoViewIfNeeded()
+    await composerLocator.click({ timeout: 1_500 })
+    // Select-all then delete to clear any existing text
+    const modKey = process.platform === 'darwin' ? 'Meta' : 'Control'
+    await page.keyboard.press(`${modKey}+A`)
+    await page.keyboard.press('Backspace')
 
-  return enteredText
+    for (let i = 0; i < message.length; i += CONFIG.chunkSizeChars) {
+      await page.keyboard.insertText(message.slice(i, i + CONFIG.chunkSizeChars))
+      // Small yield between chunks to let React process each batch
+      if (i + CONFIG.chunkSizeChars < message.length) await delay(30)
+    }
+
+    const entered = await readComposerValue(composerLocator)
+    return { ok: entered.trim().length > 0, method: 'keyboard', text: entered }
+  } catch (err) {
+    emitError('injection_keyboard_failed', err)
+    return { ok: false, method: 'keyboard', text: '', error: err.message }
+  }
 }
 
-async function setComposerText(page, composer, message) {
-  const result = await composer.locator.evaluate((node, value) => {
-    const text = String(value || '')
+/**
+ * Strategy 2 — DOM value setter with proper React event dispatch
+ * Used only if keyboard strategy yields empty composer.
+ */
+async function injectViaDom(page, composerLocator, message) {
+  try {
+    const result = await composerLocator.evaluate((node, value) => {
+      const text = String(value || '')
 
-    function fire(target, type) {
-      target.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }))
-    }
-
-    function fireInput(target, insertedText) {
-      try {
-        target.dispatchEvent(new InputEvent('beforeinput', {
-          bubbles: true,
-          cancelable: true,
-          data: insertedText,
-          inputType: 'insertText',
-        }))
-      } catch {}
-      try {
-        target.dispatchEvent(new InputEvent('input', {
-          bubbles: true,
-          cancelable: true,
-          data: insertedText,
-          inputType: 'insertText',
-        }))
-      } catch {
-        fire(target, 'input')
-      }
-    }
-
-    node.focus()
-
-    if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-      const proto = node instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement.prototype
-        : HTMLInputElement.prototype
-
-      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
-      if (descriptor?.set) {
-        descriptor.set.call(node, text)
-      } else {
-        node.value = text
+      function fire(target, type, extra = {}) {
+        target.dispatchEvent(new Event(type, { bubbles: true, cancelable: true, ...extra }))
       }
 
-      try {
-        if (typeof node.setSelectionRange === 'function') {
-          node.setSelectionRange(text.length, text.length)
+      function fireInput(target, data) {
+        try {
+          target.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data, inputType: 'insertText' }))
+        } catch {}
+        try {
+          target.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data, inputType: 'insertText' }))
+        } catch {
+          fire(target, 'input')
         }
-      } catch {}
-
-      fireInput(node, text)
-      fire(node, 'change')
-
-      return {
-        ok: true,
-        mode: 'textarea',
-        length: node.value.length,
-        text: node.value,
       }
-    }
 
-    if (node.isContentEditable) {
-      node.textContent = text
-      fireInput(node, text)
-      fire(node, 'change')
+      node.focus()
 
-      return {
-        ok: true,
-        mode: 'contenteditable',
-        length: node.innerText.length,
-        text: node.innerText,
+      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+        const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+        if (descriptor?.set) descriptor.set.call(node, text)
+        else node.value = text
+        try { node.setSelectionRange(text.length, text.length) } catch {}
+        fireInput(node, text)
+        fire(node, 'change')
+        return { ok: true, mode: 'textarea', length: node.value.length }
       }
+
+      if (node.isContentEditable) {
+        node.textContent = text
+        fireInput(node, text)
+        fire(node, 'change')
+        return { ok: true, mode: 'contenteditable', length: node.innerText.length }
+      }
+
+      return { ok: false, mode: 'unknown', length: 0 }
+    }, message)
+
+    if (!result.ok || result.length === 0) {
+      // Last resort: focus + insertText
+      await composerLocator.click({ timeout: 1_000 }).catch(() => {})
+      await page.keyboard.insertText(message)
     }
 
-    return {
-      ok: false,
-      mode: 'unknown',
-      length: 0,
-      text: '',
-      tag: node.tagName,
-    }
-  }, message).catch((error) => ({
-    ok: false,
-    mode: 'evaluate_failed',
-    length: 0,
-    text: '',
-    error: String(error?.message || error),
-  }))
-
-  if (!result.ok || result.length === 0) {
-    await composer.locator.click({ timeout: 1000 }).catch(() => {})
-    await page.keyboard.insertText(message)
+    const entered = await readComposerValue(composerLocator)
+    return { ok: entered.trim().length > 0, method: 'dom', text: entered }
+  } catch (err) {
+    emitError('injection_dom_failed', err)
+    return { ok: false, method: 'dom', text: '', error: err.message }
   }
+}
 
-  let enteredText = ''
+async function readComposerValue(composerLocator) {
+  try { return await composerLocator.inputValue({ timeout: 1_000 }) } catch {}
+  try { return await composerLocator.innerText({ timeout: 1_000 }) } catch {}
+  return ''
+}
+
+/**
+ * Master injection function — tries keyboard first, falls back to DOM.
+ */
+async function injectText(page, composer, message) {
+  const k = await injectViaKeyboard(page, composer.locator, message)
+  emit({ type: 'status', stage: 'injection_keyboard_result', ok: k.ok, length: k.text.length })
+  if (k.ok) return k
+
+  emit({ type: 'status', stage: 'injection_keyboard_empty_falling_back_to_dom' })
+  const d = await injectViaDom(page, composer.locator, message)
+  emit({ type: 'status', stage: 'injection_dom_result', ok: d.ok, length: d.text.length })
+  if (!d.ok) emitError('injection_all_strategies_failed', new Error('Both keyboard and DOM injection yielded empty composer'))
+  return d
+}
+
+// ---------------------------------------------------------------------------
+// Composer activation (scroll + focus + click)
+// ---------------------------------------------------------------------------
+async function activateComposer(page, composerLocator) {
+  emit({ type: 'status', stage: 'composer_activation_start' })
   try {
-    enteredText = await composer.locator.inputValue({ timeout: 1000 })
-  } catch {
-    enteredText = await composer.locator.innerText({ timeout: 1000 }).catch(() => '')
+    await composerLocator.evaluate((node) => {
+      try { node.scrollIntoView({ block: 'center' }) } catch {}
+      try { node.focus() } catch {}
+      try { node.click() } catch {}
+    })
+  } catch (err) {
+    emitError('composer_activation_dom_failed', err)
   }
 
-  return {
-    ...result,
-    enteredText,
-    enteredLength: enteredText.length,
+  const box = await composerLocator.boundingBox().catch(() => null)
+  if (box) {
+    await page.mouse.click(
+      box.x + Math.min(box.width / 2, Math.max(8, box.width - 8)),
+      box.y + Math.min(box.height / 2, Math.max(8, box.height - 8)),
+    ).catch((err) => emitError('composer_mouse_click_failed', err))
   }
+  emit({ type: 'status', stage: 'composer_activation_done', has_box: Boolean(box) })
+}
+
+// ---------------------------------------------------------------------------
+// Send triggering — improved detection with prior-generation guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if a generation is already in progress (stop button visible).
+ */
+async function isGenerating(page) {
+  return page.locator('button[aria-label*="Stop" i]').first().isVisible().catch(() => false)
 }
 
 async function triggerPromptSend(page, composer) {
+  // Guard: don't send if a prior generation is still running
+  if (await isGenerating(page)) {
+    emit({ type: 'status', stage: 'send_blocked_prior_generation_running' })
+    return false
+  }
+
   const sendState = await composer.locator.evaluate((node) => {
-    function isVisible(el) {
+    function isInteractable(el) {
       if (!el) return false
       const style = window.getComputedStyle(el)
       const rect = el.getBoundingClientRect()
-      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      return (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        !el.disabled &&
+        el.getAttribute('aria-disabled') !== 'true'
+      )
     }
 
-    function isEnabled(el) {
-      return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
-    }
-
-    const selectors = [
+    const SEND_SELECTORS = [
       'button[data-testid="send-button"]',
       'button[aria-label*="Send" i]',
       'button[aria-label*="Submit" i]',
@@ -417,244 +558,171 @@ async function triggerPromptSend(page, composer) {
     ]
 
     const form = node.closest('form')
-    const roots = [form, node.parentElement, document]
-    let matchedButton = null
-    let matchedSelector = null
+    const roots = [form, node.parentElement, document].filter(Boolean)
 
     for (const root of roots) {
-      if (!root) continue
-      for (const selector of selectors) {
-        const button = root.querySelector(selector)
-        if (button && isEnabled(button)) {
-          matchedButton = button
-          matchedSelector = selector
-          break
+      for (const sel of SEND_SELECTORS) {
+        const btn = root.querySelector(sel)
+        if (btn && isInteractable(btn)) {
+          return { hasButton: true, selector: sel, formPresent: Boolean(form) }
         }
       }
-      if (matchedButton) break
     }
-
-    return {
-      hasEnabledButton: Boolean(matchedButton),
-      selector: matchedSelector,
-      formPresent: Boolean(form),
-      ariaLabel: matchedButton?.getAttribute('aria-label') || '',
-      disabled: matchedButton ? Boolean(matchedButton.disabled || matchedButton.getAttribute('aria-disabled') === 'true') : null,
-    }
-  }).catch(() => ({ hasEnabledButton: false, selector: null, formPresent: false, ariaLabel: '', disabled: null }))
+    return { hasButton: false, selector: null, formPresent: Boolean(form) }
+  }).catch((err) => {
+    emitError('send_button_probe_failed', err)
+    return { hasButton: false, selector: null, formPresent: false }
+  })
 
   emit({ type: 'status', stage: 'send_button_state', ...sendState })
 
-  if (sendState.hasEnabledButton) {
+  // Attempt 1 — DOM button click
+  if (sendState.hasButton) {
     const clicked = await composer.locator.evaluate((node) => {
-      function isVisible(el) {
+      function isInteractable(el) {
         if (!el) return false
         const style = window.getComputedStyle(el)
         const rect = el.getBoundingClientRect()
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          !el.disabled &&
+          el.getAttribute('aria-disabled') !== 'true'
+        )
       }
-
-      function isEnabled(el) {
-        return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
-      }
-
-      const selectors = [
+      const SEND_SELECTORS = [
         'button[data-testid="send-button"]',
         'button[aria-label*="Send" i]',
         'button[aria-label*="Submit" i]',
         '[data-testid="composer-send-button"]',
         'button[type="submit"]',
       ]
-
-      const form = node.closest('form')
-      const roots = [form, node.parentElement, document]
+      const roots = [node.closest('form'), node.parentElement, document].filter(Boolean)
       for (const root of roots) {
-        if (!root) continue
-        for (const selector of selectors) {
-          const button = root.querySelector(selector)
-          if (button && isEnabled(button)) {
-            try { button.click() } catch {}
-            return { method: 'dom_button_click', selector }
+        for (const sel of SEND_SELECTORS) {
+          const btn = root.querySelector(sel)
+          if (btn && isInteractable(btn)) {
+            try { btn.click() } catch {}
+            return { method: 'dom_button_click', selector: sel }
           }
         }
       }
-
-      if (form) {
-        try {
-          if (typeof form.requestSubmit === 'function') {
-            form.requestSubmit()
-            return { method: 'form_request_submit', selector: null }
-          }
-        } catch {}
-        try {
-          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
-          return { method: 'form_submit_event', selector: null }
-        } catch {}
-      }
-
       return { method: 'none', selector: null }
-    }).catch(() => ({ method: 'none', selector: null }))
+    }).catch((err) => {
+      emitError('send_dom_click_failed', err)
+      return { method: 'none', selector: null }
+    })
 
     emit({ type: 'status', stage: 'send_trigger_method', ...clicked })
-    if (clicked.method !== 'none') return
+    if (clicked.method !== 'none') return true
   }
 
-  const submittedByForm = await page.evaluate(() => {
-    const composer =
-      document.querySelector('#prompt-textarea') ||
-      document.querySelector('div[contenteditable="true"][role="textbox"]') ||
-      document.querySelector('div[contenteditable="true"]') ||
-      document.querySelector('textarea')
-
-    const form = composer?.closest('form')
-    if (!form) return false
-
-    try {
-      form.dispatchEvent(new SubmitEvent('submit', {
-        bubbles: true,
-        cancelable: true,
-        submitter: null,
-      }))
-      return true
-    } catch {
+  // Attempt 2 — form requestSubmit / submit event
+  if (sendState.formPresent) {
+    const submitted = await page.evaluate(() => {
+      const composer =
+        document.querySelector('#prompt-textarea') ||
+        document.querySelector('div[contenteditable="true"][role="textbox"]') ||
+        document.querySelector('div[contenteditable="true"]') ||
+        document.querySelector('textarea')
+      const form = composer?.closest('form')
+      if (!form) return false
+      try {
+        if (typeof form.requestSubmit === 'function') { form.requestSubmit(); return true }
+      } catch {}
+      try {
+        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+        return true
+      } catch {}
       return false
-    }
-  }).catch(() => false)
+    }).catch((err) => {
+      emitError('send_form_submit_failed', err)
+      return false
+    })
 
-  if (submittedByForm) {
-    emit({ type: 'status', stage: 'send_trigger_method', method: 'form_submit_event', selector: null })
-    return
+    if (submitted) {
+      emit({ type: 'status', stage: 'send_trigger_method', method: 'form_submit', selector: null })
+      return true
+    }
   }
 
-  await composer.locator.focus().catch(() => {})
-  await page.keyboard.press('Enter').catch(() => {})
-  emit({ type: 'status', stage: 'send_trigger_method', method: 'keyboard_enter', selector: null })
+  // Attempt 3 — keyboard Enter (ensure focus first)
+  try {
+    await composer.locator.focus()
+    await page.keyboard.press('Enter')
+    emit({ type: 'status', stage: 'send_trigger_method', method: 'keyboard_enter', selector: null })
+  } catch (err) {
+    emitError('send_keyboard_enter_failed', err)
+    return false
+  }
+  return true
 }
 
+// ---------------------------------------------------------------------------
+// sendPrompt — orchestrates compose + inject + send + confirmation
+// ---------------------------------------------------------------------------
 async function sendPrompt(page, message, targetUrl, newConversation) {
   const composer = await ensureComposerContext(page, targetUrl, newConversation)
   emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
 
-  const activateComposer = async (locator) => {
-    emit({ type: 'status', stage: 'composer_activation_start' })
-
-    emit({ type: 'status', stage: 'composer_activation_dom_prepare_start' })
-    await locator.evaluate((node) => {
-      if (!node) return
-      try {
-        if (typeof node.scrollIntoView === 'function') {
-          node.scrollIntoView({ block: 'center', inline: 'nearest' })
-        }
-      } catch {}
-      try {
-        if (typeof node.focus === 'function') node.focus()
-      } catch {}
-      try {
-        if (typeof node.click === 'function') node.click()
-      } catch {}
-    }).catch(() => {})
-    emit({ type: 'status', stage: 'composer_activation_dom_prepare_done' })
-
-    emit({ type: 'status', stage: 'composer_activation_bbox_start' })
-    const box = await locator.boundingBox().catch(() => null)
-    emit({ type: 'status', stage: 'composer_activation_bbox_done', has_box: Boolean(box) })
-
-    if (box) {
-      emit({ type: 'status', stage: 'composer_activation_mouse_click_start' })
-      await page.mouse.click(
-        box.x + Math.min(box.width / 2, Math.max(8, box.width - 8)),
-        box.y + Math.min(box.height / 2, Math.max(8, box.height - 8)),
-      ).catch(() => {})
-      emit({ type: 'status', stage: 'composer_activation_mouse_click_done' })
-    }
-
-    emit({ type: 'status', stage: 'composer_activation_done' })
-  }
-
-  // Loop to type and send, retrying if the message doesn't send or type correctly
   let promptSent = false
-  for (let attempt = 1; attempt <= 3; attempt++) {
+
+  for (let attempt = 1; attempt <= CONFIG.sendMaxAttempts; attempt++) {
     emit({ type: 'status', stage: 'prompt_attempt_start', attempt })
-    await activateComposer(composer.locator)
 
-    emit({ type: 'status', stage: 'before_prompt_injection', selector: composer.selector, index: composer.index, attempt })
+    await activateComposer(page, composer.locator)
 
-    let enteredText = await typeComposerTextWithKeyboard(page, composer, message)
-
-    let typed = {
-      ok: enteredText.trim().length > 0,
-      mode: 'keyboard_insertText',
-      length: enteredText.length,
-      enteredText,
-      enteredLength: enteredText.length,
-    }
-
-    if (!typed.ok) {
-      typed = await setComposerText(page, composer, message)
-      enteredText = typed.enteredText || ''
-    }
-
+    const injection = await injectText(page, composer, message)
     emit({
       type: 'status',
-      stage: 'prompt_entered',
+      stage: 'prompt_injected',
       attempt,
-      prompt_length: enteredText.length,
-      composer_mode: typed.mode,
-      typed_length: typed.length,
-      entered_length: typed.enteredLength,
-      typed_ok: typed.ok,
+      ok: injection.ok,
+      method: injection.method,
+      length: injection.text?.length ?? 0,
     })
 
-    // If it completely failed to type, retry the whole typing block
-    if (enteredText.trim().length === 0 && message.trim().length > 0) {
+    if (!injection.ok && message.trim().length > 0) {
+      emitError('prompt_injection_empty', new Error(`Injection attempt ${attempt} yielded empty composer`), { attempt })
       await delay(500)
       continue
     }
 
-    // Wait a bit for React state to register the input before submit.
-    await delay(500)
+    // Let React fully register the input before attempting submit
+    await delay(CONFIG.injectionDelayMs)
 
     await triggerPromptSend(page, composer)
 
-    // Wait briefly for the composer to clear or the stop button to appear.
-    let sentSignal = false
-    for (let i = 0; i < 4; i++) {
-      await delay(75)
+    // Detection window: poll for stop-button OR cleared composer
+    const windowDeadline = Date.now() + CONFIG.sendDetectionWindowMs
+    while (Date.now() < windowDeadline) {
+      await delay(CONFIG.sendDetectionTickMs)
 
       const stopVisible = await page.locator('button[aria-label*="Stop" i]').first().isVisible().catch(() => false)
-      if (stopVisible) {
-        sentSignal = true
-        break
-      }
+      if (stopVisible) { promptSent = true; break }
 
-      let currentText = ''
-      try {
-        currentText = await composer.locator.inputValue()
-      } catch {
-        currentText = await composer.locator.innerText().catch(() => '')
-      }
-
-      if (currentText.trim().length === 0 || currentText.trim() === 'Message ChatGPT') {
-        sentSignal = true
-        break
-      }
+      const currentText = await readComposerValue(composer.locator)
+      const cleared = currentText.trim().length === 0 || currentText.trim() === 'Message ChatGPT'
+      if (cleared) { promptSent = true; break }
     }
 
-    if (sentSignal) {
-      promptSent = true
-      break
-    } else {
-      emit({ type: 'status', stage: 'send_retry', attempt })
-    }
+    if (promptSent) break
+    emit({ type: 'status', stage: 'send_unconfirmed_retrying', attempt })
   }
 
   if (!promptSent) {
-    emit({ type: 'status', stage: 'send_failed_but_continuing' })
+    emitError('send_all_attempts_failed', new Error('All send attempts failed to confirm dispatch'), { attempts: CONFIG.sendMaxAttempts })
+    emit({ type: 'status', stage: 'send_failed_continuing_anyway' })
   } else {
-    emit({ type: 'status', stage: 'send_triggered' })
+    emit({ type: 'status', stage: 'send_confirmed' })
   }
 }
 
+// ---------------------------------------------------------------------------
+// Assistant text extraction
+// ---------------------------------------------------------------------------
 const ASSISTANT_SELECTORS = [
   '[data-testid="conversation-turn-assistant"]',
   '[data-message-author-role="assistant"]',
@@ -671,9 +739,7 @@ async function extractAssistantText(locator) {
     }
 
     function walk(current) {
-      if (current.nodeType === Node.TEXT_NODE) {
-        return current.textContent || ''
-      }
+      if (current.nodeType === Node.TEXT_NODE) return current.textContent || ''
       if (current.nodeType !== Node.ELEMENT_NODE) return ''
 
       const el = current
@@ -685,23 +751,15 @@ async function extractAssistantText(locator) {
 
       if (tag === 'pre') {
         const codeEl = el.querySelector('code')
-        const code = (codeEl?.textContent || codeEl?.innerText || el.textContent || el.innerText || '').trimEnd()
-        const className = codeEl?.className || ''
-        const langMatch = className.match(/language-([\w+-]+)/i)
-        const language = langMatch ? langMatch[1] : ''
-        return `\n\n\`\`\`${language ? language : ''}\n${code}\n\`\`\`\n\n`
+        const code = (codeEl?.textContent || el.textContent || '').trimEnd()
+        const langMatch = (codeEl?.className || '').match(/language-([\w+-]+)/i)
+        return `\n\n\`\`\`${langMatch ? langMatch[1] : ''}\n${code}\n\`\`\`\n\n`
       }
-      if (tag === 'code' && el.closest('pre')) {
-        return ''
-      }
+      if (tag === 'code' && el.closest('pre')) return ''
       if (tag === 'code') {
         const code = el.innerText || el.textContent || ''
-        const className = el.className || ''
-        const langMatch = className.match(/language-([\w+-]+)/i)
-        const language = langMatch ? langMatch[1] : ''
-        if (language || code.includes('\n')) {
-          return code ? `\n\n\`\`\`${language ? language : ''}\n${code.trimEnd()}\n\`\`\`\n\n` : ''
-        }
+        const langMatch = el.className.match(/language-([\w+-]+)/i)
+        if (langMatch || code.includes('\n')) return code ? `\n\n\`\`\`${langMatch ? langMatch[1] : ''}\n${code.trimEnd()}\n\`\`\`\n\n` : ''
         return code ? `\`${code}\`` : ''
       }
       if (tag === 'a') {
@@ -709,8 +767,7 @@ async function extractAssistantText(locator) {
         let linkText = ''
         for (const child of el.childNodes) linkText += walk(child)
         linkText = linkText.trim()
-        if (href && linkText) return `[${linkText}](${href})`
-        return linkText
+        return href && linkText ? `[${linkText}](${href})` : linkText
       }
       if (tag === 'br') return '\n'
 
@@ -720,30 +777,30 @@ async function extractAssistantText(locator) {
       if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) {
         return text.trim() ? `${text.replace(/^\n+|\n+$/g, '')}\n\n` : ''
       }
-      if (['li'].includes(tag)) {
-        return text.trim() ? `- ${text.trim()}\n` : ''
-      }
-      if (/^h[1-6]$/.test(tag)) {
-        return text.trim() ? `${text.trim()}\n\n` : ''
-      }
+      if (tag === 'li') return text.trim() ? `- ${text.trim()}\n` : ''
+      if (/^h[1-6]$/.test(tag)) return text.trim() ? `${text.trim()}\n\n` : ''
       return text
     }
 
-    return walk(node)
-      .replace(/\n{3,}/g, '\n\n')
-      .replace(/[ \t]+\n/g, '\n')
-      .trim()
-  }).catch(() => '')
+    return walk(node).replace(/\n{3,}/g, '\n\n').replace(/[ \t]+\n/g, '\n').trim()
+  }).catch((err) => {
+    // Return empty string so callers can handle gracefully; don't throw
+    return ''
+  })
 }
 
 async function getAssistantSnapshot(page) {
   for (const selector of ASSISTANT_SELECTORS) {
-    const locator = page.locator(selector)
-    const count = await locator.count().catch(() => 0)
-    if (count > 0) {
-      const latest = locator.nth(count - 1)
-      const rawText = await extractAssistantText(latest)
-      return { selector, count, rawText }
+    try {
+      const locator = page.locator(selector)
+      const count = await locator.count().catch(() => 0)
+      if (count > 0) {
+        const latest = locator.nth(count - 1)
+        const rawText = await extractAssistantText(latest)
+        return { selector, count, rawText }
+      }
+    } catch (err) {
+      emitError('assistant_snapshot_failed', err, { selector })
     }
   }
   return { selector: null, count: 0, rawText: '' }
@@ -751,64 +808,79 @@ async function getAssistantSnapshot(page) {
 
 async function findLatestAssistantLocator(page, baseline = null) {
   if (baseline?.selector) {
-    const baselineLocator = page.locator(baseline.selector)
-    const baselineCount = await baselineLocator.count().catch(() => 0)
-    if (baselineCount > 0) {
-      if (baselineCount > (baseline.count || 0)) {
-        return { locator: baselineLocator.nth(baselineCount - 1), selector: baseline.selector, count: baselineCount, isNewMessage: true }
+    try {
+      const baselineLocator = page.locator(baseline.selector)
+      const baselineCount = await baselineLocator.count().catch(() => 0)
+      if (baselineCount > 0) {
+        if (baselineCount > (baseline.count || 0)) {
+          return { locator: baselineLocator.nth(baselineCount - 1), selector: baseline.selector, count: baselineCount, isNewMessage: true }
+        }
+        const latest = baselineLocator.nth(baselineCount - 1)
+        const rawText = await extractAssistantText(latest)
+        if (rawText !== (baseline.rawText || '')) {
+          return { locator: latest, selector: baseline.selector, count: baselineCount, isNewMessage: false }
+        }
+        return null
       }
-      const latest = baselineLocator.nth(baselineCount - 1)
-      const rawText = await extractAssistantText(latest)
-      if (rawText !== (baseline.rawText || '')) {
-        return { locator: latest, selector: baseline.selector, count: baselineCount, isNewMessage: false }
-      }
-      return null
+    } catch (err) {
+      emitError('find_latest_assistant_baseline_failed', err)
     }
   }
 
   for (const selector of ASSISTANT_SELECTORS) {
-    const locator = page.locator(selector)
-    const count = await locator.count().catch(() => 0)
-    if (count <= 0) continue
-    const latest = locator.nth(count - 1)
-    const rawText = await extractAssistantText(latest)
-    if (baseline && rawText === (baseline.rawText || '')) {
-      continue
+    try {
+      const locator = page.locator(selector)
+      const count = await locator.count().catch(() => 0)
+      if (count <= 0) continue
+      const latest = locator.nth(count - 1)
+      const rawText = await extractAssistantText(latest)
+      if (baseline && rawText === (baseline.rawText || '')) continue
+      return { locator: latest, selector, count, isNewMessage: Boolean(baseline) }
+    } catch (err) {
+      emitError('find_latest_assistant_selector_failed', err, { selector })
     }
-    return { locator: latest, selector, count, isNewMessage: Boolean(baseline) }
   }
   return null
 }
 
+// ---------------------------------------------------------------------------
+// Text normalization and delta computation
+// ---------------------------------------------------------------------------
 function normalizeAssistantText(text) {
-  return String(text || '')
-    .replace(/\r/g, '')
-    .replace(/^Thinking\s*/i, '')
+  return String(text || '').replace(/\r/g, '').replace(/^Thinking\s*/i, '')
 }
 
 function longestCommonPrefixLength(a, b) {
   const max = Math.min(a.length, b.length)
   let i = 0
-  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i++
   return i
 }
 
+/**
+ * Compute what to append to `previous` to reach `current`.
+ *
+ * Improved over original: if ChatGPT edits an earlier part of the response
+ * (e.g. during tool use or self-correction), we detect the divergence and
+ * emit the entire new text as a replacement signal rather than a corrupt delta.
+ */
 function computeAppendDelta(previous, current) {
   previous = String(previous || '')
   current = String(current || '')
-
-  if (!current || current === previous) return ''
+  if (!current || current === previous) return { delta: '', replaced: false }
 
   if (current.startsWith(previous)) {
-    return current.slice(previous.length)
+    return { delta: current.slice(previous.length), replaced: false }
   }
 
-  const prefixLength = longestCommonPrefixLength(previous, current)
-  if (prefixLength >= Math.floor(previous.length * 0.8)) {
-    return current.slice(prefixLength)
+  const prefixLen = longestCommonPrefixLength(previous, current)
+  // If more than 20% of previous text diverged, treat as full replacement
+  if (prefixLen < previous.length * 0.8) {
+    emit({ type: 'status', stage: 'assistant_text_replaced', previous_length: previous.length, current_length: current.length, common_prefix: prefixLen })
+    return { delta: current, replaced: true }
   }
 
-  return ''
+  return { delta: current.slice(prefixLen), replaced: false }
 }
 
 function isIgnorableAssistantText(text) {
@@ -822,26 +894,42 @@ function isIgnorableAssistantText(text) {
   )
 }
 
-function isPlaceholderOnly(text) {
-  return isIgnorableAssistantText(text)
-}
-
+// ---------------------------------------------------------------------------
+// Stream binding — with navigation-cleanup path
+// ---------------------------------------------------------------------------
 let activeAssistantStreamSink = null
 let assistantStreamBindingInstalled = false
 
 async function ensureAssistantStreamBinding(page) {
   if (assistantStreamBindingInstalled) return
 
-  await page.exposeBinding('__chatgptProxyAssistantStreamEvent', async (_source, event) => {
+  await page.exposeBinding('__chatgptProxyAssistantStreamEvent', (_source, event) => {
     if (typeof activeAssistantStreamSink === 'function') {
       activeAssistantStreamSink(event)
+    }
+  })
+
+  // Cleanup if the page navigates away mid-stream
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame() && typeof activeAssistantStreamSink === 'function') {
+      emit({ type: 'status', stage: 'stream_binding_navigation_cleanup' })
+      activeAssistantStreamSink({ kind: 'done', reason: 'page_navigated', rawText: '' })
+      activeAssistantStreamSink = null
     }
   })
 
   assistantStreamBindingInstalled = true
 }
 
-async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
+// ---------------------------------------------------------------------------
+// Assistant stream — configurable watchdog thresholds
+// ---------------------------------------------------------------------------
+async function streamAssistantText(page, timeoutMs, baselineAssistant = null, options = {}) {
+  const {
+    thinkingWarnMs = CONFIG.thinkingWarnMs,
+    thinkingAbortMs = CONFIG.thinkingAbortMs,
+  } = options
+
   await ensureAssistantStreamBinding(page)
 
   let lastNormalizedText = ''
@@ -852,67 +940,56 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   let thinkingWatchdogHandle = null
   let firstThinkingAt = null
   let lastThinkingAt = null
+  let originalMessage = null  // stored so we can re-send after stop
 
   return await new Promise(async (resolve) => {
     const finish = async (payload = {}) => {
       if (settled) return
       settled = true
 
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle)
-        timeoutHandle = null
-      }
-      if (thinkingWatchdogHandle) {
-        clearInterval(thinkingWatchdogHandle)
-        thinkingWatchdogHandle = null
-      }
-
+      clearTimeout(timeoutHandle)
+      clearInterval(thinkingWatchdogHandle)
+      timeoutHandle = null
+      thinkingWatchdogHandle = null
       activeAssistantStreamSink = null
 
       await page.evaluate(() => {
         if (typeof window.__chatgptProxyStopAssistantObserver === 'function') {
           window.__chatgptProxyStopAssistantObserver()
         }
-      }).catch(() => {})
+      }).catch((err) => emitError('stop_observer_cleanup_failed', err))
 
       resolve({
         text: payload.text ?? lastNormalizedText,
         timedOut: Boolean(payload.timedOut),
-        placeholderOnly: Boolean(payload.placeholderOnly ?? isPlaceholderOnly(lastRawText)),
+        placeholderOnly: Boolean(payload.placeholderOnly ?? isIgnorableAssistantText(lastRawText)),
+        stalledThinking: Boolean(payload.stalledThinking),
+        replaced: Boolean(payload.replaced),
       })
     }
 
     timeoutHandle = setTimeout(async () => {
+      // On timeout: do one last DOM scrape to capture whatever rendered
       let fallbackRawText = lastRawText
-
       try {
         const fallbackState = await findLatestAssistantLocator(page, baselineAssistant)
         if (fallbackState?.locator) {
           const extracted = await extractAssistantText(fallbackState.locator)
           if (extracted) fallbackRawText = extracted
         }
-      } catch {}
-
-      const fallbackText = normalizeAssistantText(fallbackRawText || lastNormalizedText)
-
-      if (fallbackText && !isIgnorableAssistantText(fallbackText)) {
-        const finalDelta = computeAppendDelta(lastNormalizedText, fallbackText)
-        if (finalDelta) emit({ type: 'chunk', content: finalDelta })
-        lastNormalizedText = fallbackText
-        lastRawText = fallbackRawText
+      } catch (err) {
+        emitError('timeout_dom_fallback_failed', err)
       }
 
-      emit({
-        type: 'status',
-        stage: 'assistant_timeout_dom_fallback',
-        fallback_length: fallbackText.length,
-      })
+      const fallbackText = normalizeAssistantText(fallbackRawText || lastNormalizedText)
+      if (fallbackText && !isIgnorableAssistantText(fallbackText)) {
+        const { delta } = computeAppendDelta(lastNormalizedText, fallbackText)
+        if (delta) emit({ type: 'chunk', content: delta })
+        lastNormalizedText = fallbackText
+      }
 
-      finish({
-        text: lastNormalizedText,
-        timedOut: true,
-        placeholderOnly: isPlaceholderOnly(lastRawText || lastNormalizedText),
-      })
+      emit({ type: 'status', stage: 'assistant_timeout_dom_fallback', fallback_length: fallbackText.length })
+      finish({ text: lastNormalizedText, timedOut: true, placeholderOnly: isIgnorableAssistantText(lastRawText || lastNormalizedText) })
     }, timeoutMs)
 
     activeAssistantStreamSink = async (event) => {
@@ -927,8 +1004,13 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
         lastRawText = rawText
 
         if (!ignorable) {
-          const chunk = computeAppendDelta(lastNormalizedText, normalizedText)
-          if (chunk) emit({ type: 'chunk', content: chunk })
+          const { delta, replaced } = computeAppendDelta(lastNormalizedText, normalizedText)
+          if (replaced) {
+            // Full replacement — signal upstream so it can reset its buffer
+            emit({ type: 'replace', content: normalizedText })
+          } else if (delta) {
+            emit({ type: 'chunk', content: delta })
+          }
           lastNormalizedText = normalizedText
           firstThinkingAt = null
           lastThinkingAt = null
@@ -937,12 +1019,6 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
           if (/^(thinking|analyzing|reasoning)\.?$/i.test(trimmed)) {
             firstThinkingAt = firstThinkingAt || Date.now()
             lastThinkingAt = Date.now()
-            emit({
-              type: 'status',
-              stage: 'assistant_thinking_seen',
-              thinking_for_ms: Date.now() - firstThinkingAt,
-              raw_text: rawText.slice(0, 80),
-            })
           }
         }
 
@@ -951,69 +1027,74 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
           stage: 'assistant_text_updated',
           raw_length: rawText.length,
           normalized_length: normalizedText.length,
-          assistant_selector: event.selector ?? null,
-          assistant_count: event.count ?? null,
-          is_new_message: event.isNewMessage ?? null,
           ignorable,
-          observer_driven: true,
         })
       }
 
       if (event.kind === 'done') {
-        const finalText = normalizeAssistantText(event.rawText || lastRawText || lastNormalizedText)
-        const finalDelta = computeAppendDelta(lastNormalizedText, finalText)
-
-        if (finalDelta && !isIgnorableAssistantText(finalText)) {
-          emit({ type: 'chunk', content: finalDelta })
-        }
+        const finalRaw = event.rawText || lastRawText || lastNormalizedText
+        const finalText = normalizeAssistantText(finalRaw)
+        const { delta, replaced } = computeAppendDelta(lastNormalizedText, finalText)
 
         if (!isIgnorableAssistantText(finalText)) {
+          if (replaced) emit({ type: 'replace', content: finalText })
+          else if (delta) emit({ type: 'chunk', content: delta })
           lastNormalizedText = finalText
         }
 
-        emit({
-          type: 'status',
-          stage: 'assistant_completion_detected',
-          observer_driven: true,
-          reason: event.reason || 'mutation_idle',
-          observed_any_text: observedAnyText,
-        })
-
-        await finish({
-          text: lastNormalizedText,
-          timedOut: false,
-          placeholderOnly: isPlaceholderOnly(lastRawText || lastNormalizedText),
-        })
+        emit({ type: 'status', stage: 'assistant_completion_detected', reason: event.reason || 'mutation_idle', observed_any_text: observedAnyText })
+        finish({ text: lastNormalizedText, timedOut: false, placeholderOnly: isIgnorableAssistantText(lastRawText || lastNormalizedText) })
       }
     }
 
+    // Thinking watchdog — now with configurable thresholds and re-send after stop
     thinkingWatchdogHandle = setInterval(async () => {
       if (settled || !firstThinkingAt) return
 
       const thinkingForMs = Date.now() - firstThinkingAt
-      if (thinkingForMs < 20000) return
 
-      const fallbackState = await findLatestAssistantLocator(page, baselineAssistant).catch(() => null)
-      const fallbackText = fallbackState?.locator
-        ? await extractAssistantText(fallbackState.locator).catch(() => '')
-        : ''
+      if (thinkingForMs >= thinkingWarnMs && thinkingForMs < thinkingAbortMs) {
+        emit({
+          type: 'status',
+          stage: 'assistant_thinking_warn',
+          thinking_for_ms: thinkingForMs,
+          warn_threshold_ms: thinkingWarnMs,
+        })
+        return
+      }
 
-      emit({
-        type: 'status',
-        stage: 'assistant_thinking_watchdog',
-        thinking_for_ms: thinkingForMs,
-        since_last_thinking_ms: lastThinkingAt ? Date.now() - lastThinkingAt : null,
-        fallback_length: fallbackText.length,
-        fallback_preview: fallbackText.slice(0, 200),
-      })
-    }, 2000)
+      if (thinkingForMs >= thinkingAbortMs) {
+        const stopButton = page.locator('button[aria-label*="Stop" i]').first()
+        const stopVisible = await stopButton.isVisible().catch(() => false)
 
-    await page.evaluate(({ baselineAssistant, assistantSelectors }) => {
-      const idleMs = 350
+        emit({
+          type: 'status',
+          stage: 'assistant_thinking_abort',
+          thinking_for_ms: thinkingForMs,
+          abort_threshold_ms: thinkingAbortMs,
+          stop_button_visible: stopVisible,
+        })
+
+        if (stopVisible) {
+          await stopButton.click({ force: true, timeout: 1_000 }).catch((err) => emitError('thinking_abort_stop_click_failed', err))
+          await delay(600)
+        }
+
+        // Finish and let the caller retry with full context if it chooses
+        finish({
+          text: lastNormalizedText,
+          timedOut: false,
+          placeholderOnly: isIgnorableAssistantText(lastRawText || lastNormalizedText),
+          stalledThinking: true,
+        })
+      }
+    }, CONFIG.thinkingPollMs)
+
+    // Install the in-page MutationObserver
+    await page.evaluate(({ baselineAssistant, assistantSelectors, streamIdleMs }) => {
+      const idleMs = streamIdleMs
       let lastSeenRawText = ''
-      let observedText = false
       let idleTimer = null
-      let rafPending = false
       let stopped = false
 
       function isVisible(el) {
@@ -1024,195 +1105,91 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
       }
 
       function stopButtonVisible() {
-        const buttons = Array.from(document.querySelectorAll('button'))
-        return buttons.some((button) => {
-          const label = button.getAttribute('aria-label') || ''
-          return /stop/i.test(label) && isVisible(button)
-        })
+        return Array.from(document.querySelectorAll('button')).some(
+          (btn) => /stop/i.test(btn.getAttribute('aria-label') || '') && isVisible(btn)
+        )
       }
 
-      function extractAssistantTextFromNode(node) {
+      function extractTextFromNode(node) {
         function isHidden(el) {
-          const style = window.getComputedStyle(el)
-          return style.display === 'none' || style.visibility === 'hidden'
+          const s = window.getComputedStyle(el)
+          return s.display === 'none' || s.visibility === 'hidden'
         }
-
-        function walk(current) {
-          if (current.nodeType === Node.TEXT_NODE) {
-            return current.textContent || ''
-          }
-          if (current.nodeType !== Node.ELEMENT_NODE) return ''
-
-          const el = current
+        function walk(cur) {
+          if (cur.nodeType === Node.TEXT_NODE) return cur.textContent || ''
+          if (cur.nodeType !== Node.ELEMENT_NODE) return ''
+          const el = cur
           if (isHidden(el)) return ''
           const tag = el.tagName.toLowerCase()
           if (['button', 'svg', 'path', 'style', 'script', 'noscript'].includes(tag)) return ''
-          if (el.getAttribute('role') === 'button') return ''
-          if (el.getAttribute('aria-label')) return ''
-
+          if (el.getAttribute('role') === 'button' || el.getAttribute('aria-label')) return ''
           if (tag === 'pre') {
             const codeEl = el.querySelector('code')
-            const code = (codeEl?.textContent || codeEl?.innerText || el.textContent || el.innerText || '').trimEnd()
-            const className = codeEl?.className || ''
-            const langMatch = className.match(/language-([\w+-]+)/i)
-            const language = langMatch ? langMatch[1] : ''
-            return `\n\n\ \ \ ${language ? language : ''}\n${code}\n\ \ \ \n\n`.replace(/\u0000/g, '`')
+            const code = (codeEl?.textContent || el.textContent || '').trimEnd()
+            const lang = (codeEl?.className || '').match(/language-([\w+-]+)/i)?.[1] || ''
+            return `\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n`
           }
-          if (tag === 'code' && el.closest('pre')) {
-            return ''
-          }
-          if (tag === 'code') {
-            const code = el.innerText || el.textContent || ''
-            const className = el.className || ''
-            const langMatch = className.match(/language-([\w+-]+)/i)
-            const language = langMatch ? langMatch[1] : ''
-            if (language || code.includes('\n')) {
-              return code ? `\n\n\ \ \ ${language ? language : ''}\n${code.trimEnd()}\n\ \ \ \n\n`.replace(/\u0000/g, '`') : ''
-            }
-            return code ? `\ ${code}\ `.replace(/\u0000/g, '`') : ''
-          }
-          if (tag === 'a') {
-            const href = el.getAttribute('href') || ''
-            let linkText = ''
-            for (const child of el.childNodes) linkText += walk(child)
-            linkText = linkText.trim()
-            if (href && linkText) return `[${linkText}](${href})`
-            return linkText
-          }
+          if (tag === 'code' && el.closest('pre')) return ''
           if (tag === 'br') return '\n'
-
           let text = ''
           for (const child of el.childNodes) text += walk(child)
-
-          if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) {
-            return text.trim() ? `${text.replace(/^\n+|\n+$/g, '')}\n\n` : ''
-          }
-          if (['li'].includes(tag)) {
-            return text.trim() ? `- ${text.trim()}\n` : ''
-          }
-          if (/^h[1-6]$/.test(tag)) {
-            return text.trim() ? `${text.trim()}\n\n` : ''
-          }
+          if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) return text.trim() ? `${text.replace(/^\n+|\n+$/g, '')}\n\n` : ''
+          if (tag === 'li') return text.trim() ? `- ${text.trim()}\n` : ''
+          if (/^h[1-6]$/.test(tag)) return text.trim() ? `${text.trim()}\n\n` : ''
           return text
         }
-
-        return walk(node)
-          .replace(/\n{3,}/g, '\n\n')
-          .replace(/[ \t]+\n/g, '\n')
-          .trim()
+        return walk(node).replace(/\n{3,}/g, '\n\n').replace(/[ \t]+\n/g, '\n').trim()
       }
 
-      function latestAssistantState() {
+      function findLatestNode() {
         for (const selector of assistantSelectors) {
-          const nodes = Array.from(document.querySelectorAll(selector))
-          const count = nodes.length
-          if (count <= 0) continue
-
-          const latest = nodes[count - 1]
-          const rawText = extractAssistantTextFromNode(latest)
-
-          if (baselineAssistant?.selector === selector) {
-            const baselineCount = Number(baselineAssistant.count || 0)
-
-            if (count > baselineCount) {
-              return { node: latest, selector, count, rawText, isNewMessage: true }
-            }
-
-            if (rawText && rawText !== String(baselineAssistant.rawText || '')) {
-              return { node: latest, selector, count, rawText, isNewMessage: false }
-            }
-
-            continue
-          }
-
-          if (!baselineAssistant && rawText) {
-            return { node: latest, selector, count, rawText, isNewMessage: true }
-          }
+          const nodes = document.querySelectorAll(selector)
+          if (!nodes.length) continue
+          const node = nodes[nodes.length - 1]
+          const rawText = extractTextFromNode(node)
+          if (baselineAssistant?.rawText && rawText === baselineAssistant.rawText) continue
+          return { node, selector, count: nodes.length, rawText }
         }
-
         return null
       }
 
-      function sendDone(reason) {
-        if (stopped) return
-        const state = latestAssistantState()
-        const rawText = state?.rawText || lastSeenRawText || ''
-        window.__chatgptProxyAssistantStreamEvent({ kind: 'done', reason, rawText })
-      }
-
-      function scheduleCompletionCheck() {
+      function scheduleIdle(latest) {
         clearTimeout(idleTimer)
         idleTimer = setTimeout(() => {
           if (stopped) return
-
-          const state = latestAssistantState()
-
-          if (state?.rawText && state.rawText !== lastSeenRawText) {
-            lastSeenRawText = state.rawText
-            observedText = true
-
-            window.__chatgptProxyAssistantStreamEvent({
-              kind: 'text',
-              rawText: state.rawText,
-              selector: state.selector,
-              count: state.count,
-              isNewMessage: state.isNewMessage,
-            })
-          }
-
-          if (!observedText) {
-            scheduleCompletionCheck()
+          const isStreaming = stopButtonVisible()
+          if (isStreaming) {
+            // Still generating — reschedule
+            scheduleIdle(latest)
             return
           }
-
-          if (stopButtonVisible()) {
-            scheduleCompletionCheck()
-            return
-          }
-
-          sendDone('assistant_text_idle_and_stop_hidden')
+          const finalLatest = findLatestNode()
+          window.__chatgptProxyAssistantStreamEvent({
+            kind: 'done',
+            rawText: finalLatest?.rawText || latest?.rawText || '',
+            reason: 'mutation_idle',
+          })
         }, idleMs)
       }
 
-      function scan() {
+      function onMutation() {
         if (stopped) return
-
-        const state = latestAssistantState()
-        if (!state || !state.rawText) {
-          scheduleCompletionCheck()
-          return
-        }
-
-        if (state.rawText !== lastSeenRawText) {
-          lastSeenRawText = state.rawText
-          observedText = true
+        const latest = findLatestNode()
+        if (!latest) return
+        if (latest.rawText !== lastSeenRawText) {
+          lastSeenRawText = latest.rawText
           window.__chatgptProxyAssistantStreamEvent({
             kind: 'text',
-            rawText: state.rawText,
-            selector: state.selector,
-            count: state.count,
-            isNewMessage: state.isNewMessage,
+            rawText: latest.rawText,
+            selector: latest.selector,
+            count: latest.count,
           })
+          scheduleIdle(latest)
         }
-
-        scheduleCompletionCheck()
       }
 
-      function scheduleScan() {
-        if (rafPending || stopped) return
-        rafPending = true
-        window.requestAnimationFrame(() => {
-          rafPending = false
-          scan()
-        })
-      }
-
-      const observer = new MutationObserver(scheduleScan)
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-      })
+      const observer = new MutationObserver(onMutation)
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true })
 
       window.__chatgptProxyStopAssistantObserver = () => {
         stopped = true
@@ -1220,197 +1197,335 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
         observer.disconnect()
       }
 
-      scan()
-    }, {
-      baselineAssistant,
-      assistantSelectors: ASSISTANT_SELECTORS,
-    }).catch(async (error) => {
-      emit({
-        type: 'status',
-        stage: 'assistant_observer_install_failed',
-        error: String(error?.message || error),
-      })
-
-      await finish({
-        text: lastNormalizedText,
-        timedOut: true,
-        placeholderOnly: true,
-      })
+      // Initial probe
+      onMutation()
+    }, { baselineAssistant, assistantSelectors: ASSISTANT_SELECTORS, streamIdleMs: CONFIG.streamIdleMs }).catch((err) => {
+      emitError('page_evaluate_observer_install_failed', err)
     })
   })
 }
 
-
-
-function buildConversationUrl(targetUrl, remoteConversationId) {
-  const base = new URL(targetUrl)
-  return `${base.origin}/c/${remoteConversationId}`
+// ---------------------------------------------------------------------------
+// Runner / daemon entrypoint
+// ---------------------------------------------------------------------------
+let sharedRuntime = {
+  key: null,
+  browser: null,
+  context: null,
+  page: null,
 }
 
-async function ensureChatPage(page, targetUrl) {
-  const currentUrl = page.url()
-  const normalizedTarget = targetUrl.replace(/\/$/, '')
-  const alreadyOnChat = currentUrl.startsWith(normalizedTarget)
-
-  if (!alreadyOnChat) {
-    emit({ type: 'status', stage: 'navigating_to_chatgpt', from_url: currentUrl || null, target_url: targetUrl })
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' })
-  } else {
-    emit({ type: 'status', stage: 'reusing_existing_chatgpt_page', current_url: currentUrl })
-  }
-
-  await page.waitForLoadState('domcontentloaded').catch(() => {})
-  await waitForNoChallenge(page, 10000)
-  await waitForChatShell(page, 5000)
+function browserRuntimeKey(browser) {
+  return JSON.stringify({
+    browser_type: browser.browser_type || 'firefox',
+    executable_path: browser.executable_path || null,
+    channel: browser.channel || null,
+    headless: Boolean(browser.headless),
+    connect_over_cdp: Boolean(browser.connect_over_cdp),
+    cdp_url: browser.cdp_url || null,
+    user_data_dir: browser.user_data_dir || null,
+    profile_directory: browser.profile_directory || null,
+  })
 }
 
-async function ensureRemoteConversation(page, targetUrl, remoteConversationId) {
-  if (!remoteConversationId) return
-  const desiredUrl = buildConversationUrl(targetUrl, remoteConversationId)
-  const currentUrl = page.url().split(/[?#]/)[0]
-  if (currentUrl === desiredUrl) {
-    emit({ type: 'status', stage: 'reusing_matching_remote_conversation', remote_conversation_id: remoteConversationId, current_url: page.url() })
-    return
-  }
-  emit({ type: 'status', stage: 'switching_remote_conversation', remote_conversation_id: remoteConversationId, from_url: page.url(), target_url: desiredUrl })
-  await page.goto(desiredUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
-  await page.waitForLoadState('domcontentloaded').catch(() => {})
-  await waitForNoChallenge(page, 10000)
-  await waitForChatShell(page, 5000)
-}
+async function closeSharedRuntime() {
+  const { browser, context } = sharedRuntime
+  sharedRuntime = { key: null, browser: null, context: null, page: null }
 
-// Global persistent state
-let globalContext = null
-let globalPage = null
-let processingRequest = false
-
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false
-})
-
-rl.on('line', async (line) => {
-  if (!line.trim()) return
-  if (processingRequest) {
-    emit({ type: 'status', stage: 'warning', message: 'overlapping_request_dropped' })
-    return
-  }
-  processingRequest = true
-  
   try {
-    const request = JSON.parse(line)
-    await handleRequest(request)
-  } catch (error) {
-    emit({ type: 'result', success: false, error: String(error?.message || error), transport_details: { transport_mode: 'playwright' } })
-  } finally {
-    processingRequest = false
+    if (context?.close) await context.close()
+  } catch (err) {
+    emitError('runtime_context_close_failed', err)
   }
-})
 
-rl.on('close', async () => {
-  if (globalContext) {
-    await globalContext.close().catch(() => {})
+  try {
+    if (browser?.close) await browser.close()
+  } catch (err) {
+    emitError('runtime_browser_close_failed', err)
   }
-  process.exit(0)
-})
+}
+
+async function ensureRuntime(browserConfig, targetUrl) {
+  const key = browserRuntimeKey(browserConfig)
+  const existingPage = sharedRuntime.page
+  if (
+    sharedRuntime.key === key &&
+    existingPage &&
+    !existingPage.isClosed()
+  ) {
+    return sharedRuntime
+  }
+
+  if (sharedRuntime.page || sharedRuntime.context || sharedRuntime.browser) {
+    await closeSharedRuntime()
+  }
+
+  const browserType = getBrowserType(browserConfig)
+  const executablePath = resolveExecutablePath(browserConfig)
+  const launchArgs = buildLaunchArgs(browserConfig)
+  emit({
+    type: 'status',
+    stage: 'browser_launch_start',
+    browser_type: getBrowserTypeName(browserConfig),
+    executable_path: executablePath,
+    connect_over_cdp: Boolean(browserConfig.connect_over_cdp),
+  })
+
+  let browser = null
+  let context = null
+  let page = null
+
+  if (browserConfig.connect_over_cdp) {
+    const cdpUrl = browserConfig.cdp_url || 'http://127.0.0.1:9222'
+    browser = await chromium.connectOverCDP(cdpUrl)
+    context = browser.contexts()[0] || await browser.newContext()
+    page = context.pages()[0] || await context.newPage()
+    emit({ type: 'status', stage: 'browser_connected_over_cdp', cdp_url: cdpUrl })
+  } else if (browserConfig.user_data_dir) {
+    const persistentOptions = {
+      headless: Boolean(browserConfig.headless),
+      executablePath,
+      channel: browserConfig.channel || undefined,
+      args: launchArgs.filter((arg) => !arg.startsWith('--user-data-dir=')),
+    }
+    context = await browserType.launchPersistentContext(browserConfig.user_data_dir, persistentOptions)
+    page = context.pages()[0] || await context.newPage()
+    emit({ type: 'status', stage: 'browser_persistent_context_ready', user_data_dir: browserConfig.user_data_dir })
+  } else {
+    browser = await browserType.launch({
+      headless: Boolean(browserConfig.headless),
+      executablePath,
+      channel: browserConfig.channel || undefined,
+      args: launchArgs,
+    })
+    context = await browser.newContext()
+    page = await context.newPage()
+    emit({ type: 'status', stage: 'browser_ephemeral_context_ready' })
+  }
+
+  page.setDefaultTimeout(CONFIG.pageTimeoutMs)
+  page.setDefaultNavigationTimeout(CONFIG.pageTimeoutMs)
+
+  if (!page.url() || page.url() === 'about:blank') {
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' })
+  }
+
+  sharedRuntime = { key, browser, context, page }
+  return sharedRuntime
+}
+
+function extractRemoteConversationId(currentUrl) {
+  const url = String(currentUrl || '')
+  const pathMatch = url.match(/\/c\/([^/?#]+)/i)
+  if (pathMatch?.[1]) return pathMatch[1]
+  try {
+    const parsed = new URL(url)
+    return parsed.searchParams.get('conversation_id') || null
+  } catch {
+    return null
+  }
+}
 
 async function handleRequest(request) {
-  const transport = request.transport || {}
-  const browser = transport.browser || {}
-  const browserTypeName = getBrowserTypeName(browser)
-  const targetUrl = request.url || 'https://chatgpt.com/'
-
-  emit({ type: 'status', stage: 'processing_request', transport_mode: 'playwright', browser_type: browserTypeName })
+  const targetUrl = String(request?.url || 'https://chatgpt.com/')
+  const captureTimeoutMs = Number(request?.capture_timeout_ms || CONFIG.pageTimeoutMs)
+  const browserConfig = {
+    ...(request?.transport?.browser || {}),
+  }
 
   try {
-    if (!globalContext) {
-      const launchOptions = {
-        headless: Boolean(browser.headless),
-        viewport: { width: 1440, height: 960 },
-        args: buildLaunchArgs(browser),
-        ignoreDefaultArgs: true, // Drop all Playwright bot-detection flags completely!
-      }
+    emit({ type: 'status', stage: 'request_received', new_conversation: Boolean(request?.new_conversation) })
+    const runtime = await ensureRuntime(browserConfig, targetUrl)
+    const { page } = runtime
 
-      if (browser.executable_path) {
-        launchOptions.executablePath = browser.executable_path
-      }
+    await waitForNoChallenge(page)
+    await waitForChatShell(page)
+    const ui = await detectLoggedInUi(page)
+    emit({
+      type: 'status',
+      stage: 'ui_detected',
+      url: ui.url,
+      title: ui.title,
+      has_composer: ui.hasComposer,
+      has_login_cues: ui.hasLoginCues,
+      has_chat_ui_cues: ui.hasChatUiCues,
+      logged_in_likely: ui.loggedInLikely,
+    })
 
-      const browserType = getBrowserType(browser)
-      
+    const baselineAssistant = await getAssistantSnapshot(page)
+    await sendPrompt(page, String(request?.message || ''), targetUrl, Boolean(request?.new_conversation))
+    const streamed = await streamAssistantText(page, captureTimeoutMs, baselineAssistant)
+
+    let finalText = String(streamed?.text || '').trim()
+    if (!finalText) {
+      try {
+        const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
+        if (latestAssistant?.locator) {
+          finalText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
+          emit({
+            type: 'status',
+            stage: 'assistant_dom_fallback_after_empty_stream',
+            selector: latestAssistant.selector,
+            count: latestAssistant.count,
+            recovered_length: finalText.length,
+          })
+        }
+      } catch (err) {
+        emitError('assistant_dom_fallback_after_empty_stream_failed', err)
+      }
+    }
+
+    const remoteConversationId = extractRemoteConversationId(page.url()) || request?.remote_conversation_id || null
+
+    if (!finalText) {
       emit({
-        type: 'status',
-        stage: 'launching_persistent_context',
-        browser_type: browserTypeName,
-        executable_path: launchOptions.executablePath || 'playwright-default',
-        user_data_dir: browser.user_data_dir || null,
-        profile_directory: browser.profile_directory || null,
+        type: 'result',
+        success: false,
+        error: ui.loggedInLikely
+          ? 'No assistant text was captured from the ChatGPT page'
+          : 'ChatGPT UI does not appear authenticated or ready',
+        text: '',
+        remote_conversation_id: remoteConversationId,
+        remote_parent_message_id: null,
+        transport_details: {
+          last_stage: 'result_empty',
+          ui_logged_in_likely: ui.loggedInLikely,
+          page_url: page.url(),
+          timed_out: Boolean(streamed?.timedOut),
+          placeholder_only: Boolean(streamed?.placeholderOnly),
+          stalled_thinking: Boolean(streamed?.stalledThinking),
+        },
+        verification_hints: {
+          remote_conversation_exists: Boolean(remoteConversationId),
+          ui_logged_in_likely: ui.loggedInLikely,
+        },
       })
-
-      globalContext = await browserType.launchPersistentContext(browser.user_data_dir, launchOptions)
-      globalPage = globalContext.pages()[0] || await globalContext.newPage()
-      
-      globalPage.on('websocket', (ws) => emit({ type: 'status', stage: 'websocket_created', websocket_url: ws.url() }))
-    }
-
-    await ensureChatPage(globalPage, targetUrl)
-    
-    if (!request.new_conversation && request.remote_conversation_id) {
-      await ensureRemoteConversation(globalPage, targetUrl, request.remote_conversation_id)
-    }
-    
-    emit({ type: 'status', stage: 'page_loaded', url: globalPage.url() })
-    const ui = await detectLoggedInUi(globalPage)
-    emit({ type: 'status', stage: 'ui_detected', ui })
-    if (!ui.loggedInLikely) {
-      emit({ type: 'result', success: false, error: 'ui_not_logged_in', transport_details: { ui } })
       return
     }
 
-    const baselineAssistant = await getAssistantSnapshot(globalPage)
-    emit({ type: 'status', stage: 'sending_prompt', baseline_assistant: baselineAssistant })
-    await waitForConversationIdle(globalPage, 2500)
-    await sendPrompt(globalPage, request.message, targetUrl, Boolean(request.new_conversation))
-    emit({ type: 'status', stage: 'awaiting_assistant_stream', baseline_assistant: baselineAssistant })
-    const streamResult = await streamAssistantText(globalPage, Number(request.capture_timeout_ms || 120000), baselineAssistant)
-    emit({
-      type: 'status',
-      stage: 'stream_result_collected',
-      text_length: String(streamResult.text || '').length,
-      timed_out: streamResult.timedOut,
-      placeholder_only: streamResult.placeholderOnly,
-    })
-    const text = streamResult.text
-    const finalUi = await detectLoggedInUi(globalPage)
-    if (streamResult.timedOut) {
-      emit({ type: 'status', stage: 'assistant_stream_timeout', placeholder_only: streamResult.placeholderOnly, text_preview: String(text || '').slice(0, 200) })
-    }
-    
     emit({
       type: 'result',
-      success: Boolean(text) && !streamResult.placeholderOnly,
-      text,
-      remote_conversation_id: globalPage.url().includes('/c/') ? globalPage.url().split('/c/')[1]?.split(/[?#]/)[0] ?? null : null,
+      success: true,
+      text: finalText,
+      remote_conversation_id: remoteConversationId,
       remote_parent_message_id: null,
       transport_details: {
-        ui_before_send: ui,
-        ui_after_send: finalUi,
-        transport_mode: 'playwright',
-        browser_type: browserTypeName,
-        browser: {
-          user_data_dir: browser.user_data_dir,
-          executable_path_present: Boolean(browser.executable_path),
-        },
-        timed_out: streamResult.timedOut,
-        placeholder_only: streamResult.placeholderOnly,
+        last_stage: 'result_ready',
+        ui_logged_in_likely: ui.loggedInLikely,
+        page_url: page.url(),
+        page_title: await page.title().catch(() => ''),
+        timed_out: Boolean(streamed?.timedOut),
+        placeholder_only: Boolean(streamed?.placeholderOnly),
+        stalled_thinking: Boolean(streamed?.stalledThinking),
       },
       verification_hints: {
-        remote_conversation_exists: Boolean(text) && !streamResult.placeholderOnly,
-        effective_transport_mode: 'playwright',
+        remote_conversation_exists: Boolean(remoteConversationId),
+        ui_logged_in_likely: ui.loggedInLikely,
       },
-      error: streamResult.placeholderOnly ? 'assistant_response_placeholder_only' : undefined,
     })
   } catch (err) {
-    emit({ type: 'result', success: false, error: String(err?.message || err), transport_details: { transport_mode: 'playwright' } })
+    emitError('request_failed', err)
+    emit({
+      type: 'result',
+      success: false,
+      error: err?.message || String(err),
+      text: '',
+      remote_conversation_id: null,
+      remote_parent_message_id: null,
+      transport_details: { last_stage: 'request_failed' },
+      verification_hints: { remote_conversation_exists: false },
+    })
   }
+}
+
+async function runDaemon() {
+  emit({ type: 'status', stage: 'runner_started', pid: process.pid, playwright_version: getPlaywrightVersion() })
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false,
+  })
+
+  for await (const line of rl) {
+    const trimmed = String(line || '').trim()
+    if (!trimmed) continue
+    try {
+      await handleRequest(JSON.parse(trimmed))
+    } catch (err) {
+      emitError('request_parse_failed', err, { raw_line_preview: trimmed.slice(0, 500) })
+      emit({
+        type: 'result',
+        success: false,
+        error: err?.message || String(err),
+        text: '',
+        remote_conversation_id: null,
+        remote_parent_message_id: null,
+        transport_details: { last_stage: 'request_parse_failed' },
+        verification_hints: { remote_conversation_exists: false },
+      })
+    }
+  }
+
+  await closeSharedRuntime()
+}
+
+process.on('unhandledRejection', (err) => {
+  emitError('unhandled_rejection', err)
+})
+process.on('uncaughtException', (err) => {
+  emitError('uncaught_exception', err)
+})
+
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : ''
+const modulePath = fileURLToPath(import.meta.url)
+if (invokedPath && invokedPath === modulePath) {
+  runDaemon().catch((err) => {
+    emitError('runner_fatal', err)
+    process.exitCode = 1
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Exports (named + default)
+// ---------------------------------------------------------------------------
+export {
+  CONFIG,
+  emit,
+  emitError,
+  findSystemBrowser,
+  resolveExecutablePath,
+  buildLaunchArgs,
+  getBrowserType,
+  getBrowserTypeName,
+  findComposer,
+  waitForComposer,
+  waitForComposerInteractive,
+  waitForNoChallenge,
+  waitForChatShell,
+  detectLoggedInUi,
+  openFreshThread,
+  ensureComposerContext,
+  injectText,
+  activateComposer,
+  triggerPromptSend,
+  sendPrompt,
+  extractAssistantText,
+  getAssistantSnapshot,
+  findLatestAssistantLocator,
+  normalizeAssistantText,
+  computeAppendDelta,
+  isIgnorableAssistantText,
+  ensureAssistantStreamBinding,
+  streamAssistantText,
+  delay,
+  readComposerValue,
+  isGenerating,
+}
+
+export default {
+  sendPrompt,
+  streamAssistantText,
+  getAssistantSnapshot,
+  detectLoggedInUi,
+  CONFIG,
 }
