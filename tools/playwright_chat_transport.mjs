@@ -305,23 +305,31 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
       await page.keyboard.press('Enter')
     }
     
-    // Wait up to 1.5 seconds for the composer to clear (indicating successful send)
-    let cleared = false
-    for (let i = 0; i < 10; i++) {
-      await delay(150)
+    // Wait briefly for the composer to clear or the stop button to appear.
+    let sentSignal = false
+    for (let i = 0; i < 4; i++) {
+      await delay(75)
+
+      const stopVisible = await page.locator('button[aria-label*="Stop" i]').first().isVisible().catch(() => false)
+      if (stopVisible) {
+        sentSignal = true
+        break
+      }
+
       let currentText = ''
       try {
         currentText = await composer.locator.inputValue()
       } catch {
         currentText = await composer.locator.innerText().catch(() => '')
       }
+
       if (currentText.trim().length === 0 || currentText.trim() === 'Message ChatGPT') {
-        cleared = true
+        sentSignal = true
         break
       }
     }
-    
-    if (cleared) {
+
+    if (sentSignal) {
       promptSent = true
       break
     } else {
@@ -465,17 +473,41 @@ function normalizeAssistantText(text) {
   return String(text || '')
     .replace(/\r/g, '')
     .replace(/^Thinking\s*/i, '')
-    .trim()
+}
+
+function longestCommonPrefixLength(a, b) {
+  const max = Math.min(a.length, b.length)
+  let i = 0
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1
+  return i
+}
+
+function computeAppendDelta(previous, current) {
+  previous = String(previous || '')
+  current = String(current || '')
+
+  if (!current || current === previous) return ''
+
+  if (current.startsWith(previous)) {
+    return current.slice(previous.length)
+  }
+
+  const prefixLength = longestCommonPrefixLength(previous, current)
+  if (prefixLength >= Math.floor(previous.length * 0.8)) {
+    return current.slice(prefixLength)
+  }
+
+  return ''
 }
 
 function isIgnorableAssistantText(text) {
-  const normalized = normalizeAssistantText(text)
+  const normalized = normalizeAssistantText(text).trim()
   return (
     !normalized ||
     /^(thinking|analyzing|reasoning)\.?$/i.test(normalized) ||
     /^hello!?\s+what.?s on your mind today\??$/i.test(normalized) ||
     /^ready when you are\.?$/i.test(normalized) ||
-    /^how can i help(?:,.*)?\\??$/i.test(normalized)
+    /^how can i help(?:,.*)?\??$/i.test(normalized)
   )
 }
 
@@ -483,55 +515,326 @@ function isPlaceholderOnly(text) {
   return isIgnorableAssistantText(text)
 }
 
-function looksLikeCompleteAssistantText(text) {
-  const normalized = normalizeAssistantText(text)
-  if (!normalized) return false
-  if (/```\s*$/.test(normalized)) return true
-  if (/[.!?"')\]]$/.test(normalized)) return true
-  if (/\n\n/.test(normalized)) return true
-  return false
+let activeAssistantStreamSink = null
+let assistantStreamBindingInstalled = false
+
+async function ensureAssistantStreamBinding(page) {
+  if (assistantStreamBindingInstalled) return
+
+  await page.exposeBinding('__chatgptProxyAssistantStreamEvent', async (_source, event) => {
+    if (typeof activeAssistantStreamSink === 'function') {
+      activeAssistantStreamSink(event)
+    }
+  })
+
+  assistantStreamBindingInstalled = true
 }
 
 async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
-  const deadline = Date.now() + timeoutMs
-  let lastRawText = ''
+  await ensureAssistantStreamBinding(page)
+
   let lastNormalizedText = ''
-  let stableTicks = 0
+  let lastRawText = ''
   let observedAnyText = false
-  while (Date.now() < deadline) {
-    const assistantState = await findLatestAssistantLocator(page, baselineAssistant)
-    const rawText = assistantState ? await extractAssistantText(assistantState.locator) : ''
-    const normalizedText = normalizeAssistantText(rawText)
-    if (rawText && rawText !== lastRawText) {
-      observedAnyText = true
-      const ignorable = isIgnorableAssistantText(rawText)
-      const chunk = ignorable ? '' : normalizedText.slice(lastNormalizedText.length)
-      if (chunk) emit({ type: 'chunk', content: chunk })
-      lastRawText = rawText
-      lastNormalizedText = ignorable ? '' : normalizedText
-      stableTicks = 0
-      emit({ type: 'status', stage: 'assistant_text_updated', raw_length: rawText.length, normalized_length: normalizedText.length, assistant_selector: assistantState?.selector ?? null, assistant_count: assistantState?.count ?? null, is_new_message: assistantState?.isNewMessage ?? null, ignorable })
-    } else if (rawText && rawText === lastRawText) {
-      stableTicks += 1
+  let settled = false
+  let timeoutHandle = null
+
+  return await new Promise(async (resolve) => {
+    const finish = async (payload = {}) => {
+      if (settled) return
+      settled = true
+
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle)
+        timeoutHandle = null
+      }
+
+      activeAssistantStreamSink = null
+
+      await page.evaluate(() => {
+        if (typeof window.__chatgptProxyStopAssistantObserver === 'function') {
+          window.__chatgptProxyStopAssistantObserver()
+        }
+      }).catch(() => {})
+
+      resolve({
+        text: payload.text ?? lastNormalizedText,
+        timedOut: Boolean(payload.timedOut),
+        placeholderOnly: Boolean(payload.placeholderOnly ?? isPlaceholderOnly(lastRawText)),
+      })
     }
 
-    const stopButtonVisible = await page.locator('button[aria-label*="Stop" i]').first().isVisible().catch(() => false)
-    const composerVisible = await page.locator(COMPOSER_SELECTORS.join(', ')).first().isVisible().catch(() => false)
-    const sendButtonVisible = await page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first().isVisible().catch(() => false)
-    if (observedAnyText && !isPlaceholderOnly(lastRawText)) {
-      const textLooksComplete = looksLikeCompleteAssistantText(lastRawText)
-      if (!stopButtonVisible && textLooksComplete && (composerVisible || sendButtonVisible) && stableTicks >= 1) {
-        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible, text_looks_complete: textLooksComplete })
-        return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
+    timeoutHandle = setTimeout(() => {
+      finish({
+        text: lastNormalizedText,
+        timedOut: true,
+        placeholderOnly: isPlaceholderOnly(lastRawText),
+      })
+    }, timeoutMs)
+
+    activeAssistantStreamSink = async (event) => {
+      if (!event || settled) return
+
+      if (event.kind === 'text') {
+        const rawText = String(event.rawText || '')
+        const normalizedText = normalizeAssistantText(rawText)
+        const ignorable = isIgnorableAssistantText(rawText)
+
+        observedAnyText = true
+        lastRawText = rawText
+
+        if (!ignorable) {
+          const chunk = computeAppendDelta(lastNormalizedText, normalizedText)
+          if (chunk) emit({ type: 'chunk', content: chunk })
+          lastNormalizedText = normalizedText
+        }
+
+        emit({
+          type: 'status',
+          stage: 'assistant_text_updated',
+          raw_length: rawText.length,
+          normalized_length: normalizedText.length,
+          assistant_selector: event.selector ?? null,
+          assistant_count: event.count ?? null,
+          is_new_message: event.isNewMessage ?? null,
+          ignorable,
+          observer_driven: true,
+        })
       }
-      if (!stopButtonVisible && stableTicks >= (textLooksComplete ? 2 : 4)) {
-        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible, text_looks_complete: textLooksComplete })
-        return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
+
+      if (event.kind === 'done') {
+        const finalText = normalizeAssistantText(event.rawText || lastRawText || lastNormalizedText)
+        const finalDelta = computeAppendDelta(lastNormalizedText, finalText)
+
+        if (finalDelta && !isIgnorableAssistantText(finalText)) {
+          emit({ type: 'chunk', content: finalDelta })
+        }
+
+        if (!isIgnorableAssistantText(finalText)) {
+          lastNormalizedText = finalText
+        }
+
+        emit({
+          type: 'status',
+          stage: 'assistant_completion_detected',
+          observer_driven: true,
+          reason: event.reason || 'mutation_idle',
+          observed_any_text: observedAnyText,
+        })
+
+        await finish({
+          text: lastNormalizedText,
+          timedOut: false,
+          placeholderOnly: isPlaceholderOnly(lastRawText || lastNormalizedText),
+        })
       }
     }
-    await page.waitForTimeout(250)
-  }
-  return { text: lastNormalizedText, timedOut: true, placeholderOnly: isPlaceholderOnly(lastRawText) }
+
+    await page.evaluate(({ baselineAssistant, assistantSelectors }) => {
+      const idleMs = 350
+      let lastSeenRawText = ''
+      let observedText = false
+      let idleTimer = null
+      let rafPending = false
+      let stopped = false
+
+      function isVisible(el) {
+        if (!el) return false
+        const style = window.getComputedStyle(el)
+        const rect = el.getBoundingClientRect()
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      }
+
+      function stopButtonVisible() {
+        const buttons = Array.from(document.querySelectorAll('button'))
+        return buttons.some((button) => {
+          const label = button.getAttribute('aria-label') || ''
+          return /stop/i.test(label) && isVisible(button)
+        })
+      }
+
+      function extractAssistantTextFromNode(node) {
+        function isHidden(el) {
+          const style = window.getComputedStyle(el)
+          return style.display === 'none' || style.visibility === 'hidden'
+        }
+
+        function walk(current) {
+          if (current.nodeType === Node.TEXT_NODE) {
+            return current.textContent || ''
+          }
+          if (current.nodeType !== Node.ELEMENT_NODE) return ''
+
+          const el = current
+          if (isHidden(el)) return ''
+          const tag = el.tagName.toLowerCase()
+          if (['button', 'svg', 'path', 'style', 'script', 'noscript'].includes(tag)) return ''
+          if (el.getAttribute('role') === 'button') return ''
+          if (el.getAttribute('aria-label')) return ''
+
+          if (tag === 'pre') {
+            const codeEl = el.querySelector('code')
+            const code = (codeEl?.textContent || codeEl?.innerText || el.textContent || el.innerText || '').trimEnd()
+            const className = codeEl?.className || ''
+            const langMatch = className.match(/language-([\w+-]+)/i)
+            const language = langMatch ? langMatch[1] : ''
+            return `\n\n\ \ \ ${language ? language : ''}\n${code}\n\ \ \ \n\n`.replace(/\u0000/g, '`')
+          }
+          if (tag === 'code' && el.closest('pre')) {
+            return ''
+          }
+          if (tag === 'code') {
+            const code = el.innerText || el.textContent || ''
+            const className = el.className || ''
+            const langMatch = className.match(/language-([\w+-]+)/i)
+            const language = langMatch ? langMatch[1] : ''
+            if (language || code.includes('\n')) {
+              return code ? `\n\n\ \ \ ${language ? language : ''}\n${code.trimEnd()}\n\ \ \ \n\n`.replace(/\u0000/g, '`') : ''
+            }
+            return code ? `\ ${code}\ `.replace(/\u0000/g, '`') : ''
+          }
+          if (tag === 'a') {
+            const href = el.getAttribute('href') || ''
+            let linkText = ''
+            for (const child of el.childNodes) linkText += walk(child)
+            linkText = linkText.trim()
+            if (href && linkText) return `[${linkText}](${href})`
+            return linkText
+          }
+          if (tag === 'br') return '\n'
+
+          let text = ''
+          for (const child of el.childNodes) text += walk(child)
+
+          if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) {
+            return text.trim() ? `${text.replace(/^\n+|\n+$/g, '')}\n\n` : ''
+          }
+          if (['li'].includes(tag)) {
+            return text.trim() ? `- ${text.trim()}\n` : ''
+          }
+          if (/^h[1-6]$/.test(tag)) {
+            return text.trim() ? `${text.trim()}\n\n` : ''
+          }
+          return text
+        }
+
+        return walk(node)
+          .replace(/\n{3,}/g, '\n\n')
+          .replace(/[ \t]+\n/g, '\n')
+          .trim()
+      }
+
+      function latestAssistantState() {
+        for (const selector of assistantSelectors) {
+          const nodes = Array.from(document.querySelectorAll(selector))
+          const count = nodes.length
+          if (count <= 0) continue
+
+          const latest = nodes[count - 1]
+          const rawText = extractAssistantTextFromNode(latest)
+
+          if (baselineAssistant?.selector === selector) {
+            const baselineCount = Number(baselineAssistant.count || 0)
+
+            if (count > baselineCount) {
+              return { node: latest, selector, count, rawText, isNewMessage: true }
+            }
+
+            if (rawText && rawText !== String(baselineAssistant.rawText || '')) {
+              return { node: latest, selector, count, rawText, isNewMessage: false }
+            }
+
+            continue
+          }
+
+          if (!baselineAssistant && rawText) {
+            return { node: latest, selector, count, rawText, isNewMessage: true }
+          }
+        }
+
+        return null
+      }
+
+      function sendDone(reason) {
+        if (stopped) return
+        const state = latestAssistantState()
+        const rawText = state?.rawText || lastSeenRawText || ''
+        window.__chatgptProxyAssistantStreamEvent({ kind: 'done', reason, rawText })
+      }
+
+      function scheduleCompletionCheck() {
+        clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => {
+          if (!observedText) return
+          if (stopButtonVisible()) return
+          sendDone('assistant_text_idle_and_stop_hidden')
+        }, idleMs)
+      }
+
+      function scan() {
+        if (stopped) return
+
+        const state = latestAssistantState()
+        if (!state || !state.rawText) {
+          scheduleCompletionCheck()
+          return
+        }
+
+        if (state.rawText !== lastSeenRawText) {
+          lastSeenRawText = state.rawText
+          observedText = true
+          window.__chatgptProxyAssistantStreamEvent({
+            kind: 'text',
+            rawText: state.rawText,
+            selector: state.selector,
+            count: state.count,
+            isNewMessage: state.isNewMessage,
+          })
+        }
+
+        scheduleCompletionCheck()
+      }
+
+      function scheduleScan() {
+        if (rafPending || stopped) return
+        rafPending = true
+        window.requestAnimationFrame(() => {
+          rafPending = false
+          scan()
+        })
+      }
+
+      const observer = new MutationObserver(scheduleScan)
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      })
+
+      window.__chatgptProxyStopAssistantObserver = () => {
+        stopped = true
+        clearTimeout(idleTimer)
+        observer.disconnect()
+      }
+
+      scan()
+    }, {
+      baselineAssistant,
+      assistantSelectors: ASSISTANT_SELECTORS,
+    }).catch(async (error) => {
+      emit({
+        type: 'status',
+        stage: 'assistant_observer_install_failed',
+        error: String(error?.message || error),
+      })
+
+      await finish({
+        text: lastNormalizedText,
+        timedOut: true,
+        placeholderOnly: true,
+      })
+    })
+  })
 }
 
 

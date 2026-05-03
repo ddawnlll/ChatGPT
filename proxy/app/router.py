@@ -24,6 +24,12 @@ from .tools_shim import (
 router = APIRouter()
 logger = logging.getLogger("chatgpt_proxy.router")
 
+STREAM_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
 
 def openai_error(message: str, status_code: int, code: str | None = None) -> HTTPException:
     return HTTPException(
@@ -155,7 +161,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                 yield sse(end_chunk.model_dump())
                 yield done_sse()
 
-            return StreamingResponse(agent_event_stream(), media_type="text/event-stream")
+            return StreamingResponse(agent_event_stream(), media_type="text/event-stream", headers=STREAM_HEADERS)
 
         async def event_stream():
             upstream = stream_chat_completion(
@@ -167,7 +173,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
             async for item in chat_completions_stream(upstream, request.model):
                 yield item
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=STREAM_HEADERS)
 
     try:
         if agent_mode:
