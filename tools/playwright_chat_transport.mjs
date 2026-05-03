@@ -611,8 +611,8 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
       continue
     }
 
-    // Wait a tiny bit for React state to register the input
-    await delay(150)
+    // Wait a bit for React state to register the input before submit.
+    await delay(500)
 
     await triggerPromptSend(page, composer)
 
@@ -656,11 +656,11 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
 }
 
 const ASSISTANT_SELECTORS = [
-  '[data-message-author-role="assistant"] .markdown',
-  '[data-message-author-role="assistant"] [class*="markdown"]',
+  '[data-testid="conversation-turn-assistant"]',
   '[data-message-author-role="assistant"]',
   '[data-testid="conversation-turn-assistant"] .markdown',
-  '[data-testid="conversation-turn-assistant"]',
+  '[data-message-author-role="assistant"] .markdown',
+  '[data-message-author-role="assistant"] [class*="markdown"]',
 ]
 
 async function extractAssistantText(locator) {
@@ -849,6 +849,9 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   let observedAnyText = false
   let settled = false
   let timeoutHandle = null
+  let thinkingWatchdogHandle = null
+  let firstThinkingAt = null
+  let lastThinkingAt = null
 
   return await new Promise(async (resolve) => {
     const finish = async (payload = {}) => {
@@ -858,6 +861,10 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
       if (timeoutHandle) {
         clearTimeout(timeoutHandle)
         timeoutHandle = null
+      }
+      if (thinkingWatchdogHandle) {
+        clearInterval(thinkingWatchdogHandle)
+        thinkingWatchdogHandle = null
       }
 
       activeAssistantStreamSink = null
@@ -923,6 +930,20 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
           const chunk = computeAppendDelta(lastNormalizedText, normalizedText)
           if (chunk) emit({ type: 'chunk', content: chunk })
           lastNormalizedText = normalizedText
+          firstThinkingAt = null
+          lastThinkingAt = null
+        } else {
+          const trimmed = normalizedText.trim() || rawText.trim()
+          if (/^(thinking|analyzing|reasoning)\.?$/i.test(trimmed)) {
+            firstThinkingAt = firstThinkingAt || Date.now()
+            lastThinkingAt = Date.now()
+            emit({
+              type: 'status',
+              stage: 'assistant_thinking_seen',
+              thinking_for_ms: Date.now() - firstThinkingAt,
+              raw_text: rawText.slice(0, 80),
+            })
+          }
         }
 
         emit({
@@ -965,6 +986,27 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
         })
       }
     }
+
+    thinkingWatchdogHandle = setInterval(async () => {
+      if (settled || !firstThinkingAt) return
+
+      const thinkingForMs = Date.now() - firstThinkingAt
+      if (thinkingForMs < 20000) return
+
+      const fallbackState = await findLatestAssistantLocator(page, baselineAssistant).catch(() => null)
+      const fallbackText = fallbackState?.locator
+        ? await extractAssistantText(fallbackState.locator).catch(() => '')
+        : ''
+
+      emit({
+        type: 'status',
+        stage: 'assistant_thinking_watchdog',
+        thinking_for_ms: thinkingForMs,
+        since_last_thinking_ms: lastThinkingAt ? Date.now() - lastThinkingAt : null,
+        fallback_length: fallbackText.length,
+        fallback_preview: fallbackText.slice(0, 200),
+      })
+    }, 2000)
 
     await page.evaluate(({ baselineAssistant, assistantSelectors }) => {
       const idleMs = 350
