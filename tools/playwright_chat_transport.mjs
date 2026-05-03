@@ -23,23 +23,36 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify(enriched)}\n`)
 }
 
-async function waitForComposer(page, timeoutMs) {
-  const selectors = [
-    '#prompt-textarea',
-    'textarea[placeholder*="Message"]',
-    'textarea',
-    'div[contenteditable="true"]',
-  ]
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    for (const selector of selectors) {
-      const locator = page.locator(selector).first()
-      if (await locator.count().catch(() => 0)) {
-        const visible = await locator.isVisible().catch(() => false)
-        if (visible) return locator
+const COMPOSER_SELECTORS = [
+  '#prompt-textarea',
+  'textarea[placeholder*="Message"]',
+  'textarea',
+  'div[contenteditable="true"][role="textbox"]',
+  'div[contenteditable="true"][data-lexical-editor="true"]',
+  'div[contenteditable="true"]',
+]
+
+async function findComposer(page) {
+  for (const selector of COMPOSER_SELECTORS) {
+    const locator = page.locator(selector)
+    const count = await locator.count().catch(() => 0)
+    for (let i = 0; i < count; i += 1) {
+      const candidate = locator.nth(i)
+      const visible = await candidate.isVisible().catch(() => false)
+      if (visible) {
+        return { locator: candidate, selector, index: i }
       }
     }
-    await page.waitForTimeout(500)
+  }
+  return null
+}
+
+async function waitForComposer(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const found = await findComposer(page)
+    if (found) return found
+    await delay(150)
   }
   throw new Error('Prompt composer did not appear before timeout')
 }
@@ -48,25 +61,49 @@ async function delay(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitForPageReady(page, timeoutMs = 12000) {
+async function waitForNoChallenge(page, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs
-  let stableTicks = 0
+  while (Date.now() < deadline) {
+    const title = await page.title().catch(() => '')
+    const bodyText = await page.locator('body').innerText().catch(() => '')
+    const challengeVisible = /just a moment/i.test(title) || /just a moment|checking your browser/i.test(bodyText)
+    if (!challengeVisible) return
+    await delay(200)
+  }
+}
+
+async function waitForChatShell(page, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const bodyText = await page.locator('body').innerText().catch(() => '')
-    const title = await page.title().catch(() => '')
-    const composerVisible = await page.locator('#prompt-textarea, textarea, div[contenteditable="true"]').first().isVisible().catch(() => false)
-    const challengeVisible = /just a moment/i.test(title) || /just a moment|checking your browser/i.test(bodyText)
-    const chatUiVisible = /ready when you are|what.?s on your mind today|new chat|chat history|chatgpt/i.test(bodyText)
+    const hasChatUi = /ready when you are|what.?s on your mind today|new chat|chat history|chatgpt/i.test(bodyText)
+    if (hasChatUi) return
+    await delay(200)
+  }
+}
 
-    if (challengeVisible) {
-      stableTicks = 0
-    } else if (composerVisible || chatUiVisible) {
-      stableTicks += 1
-      if (stableTicks >= 2) return
-    } else {
-      stableTicks = 0
+async function waitForComposerInteractive(page, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const found = await findComposer(page)
+    if (found) {
+      try {
+        await found.locator.click({ trial: true, timeout: 250 })
+        return found
+      } catch {}
     }
-    await delay(250)
+    await delay(150)
+  }
+  return waitForComposer(page, timeoutMs)
+}
+
+async function waitForConversationIdle(page, timeoutMs = 5000) {
+  const stopButton = page.locator('button[aria-label*="Stop" i]').first()
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const stopVisible = await stopButton.isVisible().catch(() => false)
+    if (!stopVisible) return
+    await delay(150)
   }
 }
 
@@ -86,18 +123,40 @@ async function detectLoggedInUi(page) {
   }
 }
 
-async function sendPrompt(page, message) {
-  const composer = await waitForComposer(page, 30_000)
-  emit({ type: 'status', stage: 'composer_ready' })
-  await composer.click()
+async function ensureComposerContext(page, targetUrl) {
+  const initialComposer = await findComposer(page)
+  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), selector: initialComposer?.selector ?? null, index: initialComposer?.index ?? null })
+  if (initialComposer) {
+    return await waitForComposerInteractive(page, 5000)
+  }
+
+  const newChatButton = page.locator('button:has-text("New chat"), a:has-text("New chat"), [role="button"]:has-text("New chat")').first()
+  if (await newChatButton.isVisible().catch(() => false)) {
+    emit({ type: 'status', stage: 'opening_new_chat' })
+    await newChatButton.click().catch(() => {})
+    const readyComposer = await waitForComposerInteractive(page, 10000)
+    if (readyComposer) return readyComposer
+  }
+
+  emit({ type: 'status', stage: 'navigating_home_for_composer', target_url: targetUrl })
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+  await waitForNoChallenge(page, 10000)
+  await waitForChatShell(page, 5000)
+  return await waitForComposerInteractive(page, 15000)
+}
+
+async function sendPrompt(page, message, targetUrl) {
+  const composer = await ensureComposerContext(page, targetUrl)
+  emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
+  await composer.locator.click()
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
   await page.keyboard.press('Backspace').catch(() => {})
   await page.keyboard.insertText(message)
   let enteredText = ''
   try {
-    enteredText = await composer.inputValue()
+    enteredText = await composer.locator.inputValue()
   } catch {
-    enteredText = await composer.innerText().catch(() => '')
+    enteredText = await composer.locator.innerText().catch(() => '')
   }
   emit({ type: 'status', stage: 'prompt_entered', prompt_length: enteredText.length })
   const sendButton = page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first()
@@ -238,8 +297,8 @@ async function ensureChatPage(page, targetUrl) {
   }
 
   await page.waitForLoadState('domcontentloaded').catch(() => {})
-  await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {})
-  await waitForPageReady(page, 3000)
+  await waitForNoChallenge(page, 10000)
+  await waitForChatShell(page, 5000)
 }
 
 async function main() {
@@ -260,8 +319,8 @@ async function main() {
     }
 
     emit({ type: 'status', stage: 'sending_prompt' })
-    await waitForPageReady(page, 2000)
-    await sendPrompt(page, request.message)
+    await waitForConversationIdle(page, 2500)
+    await sendPrompt(page, request.message, request.url || 'https://chatgpt.com/')
     emit({ type: 'status', stage: 'awaiting_assistant_stream' })
     const streamResult = await streamAssistantText(page, Number(request.capture_timeout_ms || 120000))
     const text = streamResult.text
