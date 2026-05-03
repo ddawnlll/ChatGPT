@@ -10,6 +10,7 @@ from proxy.app.config import settings
 from proxy.app.main import create_app
 from proxy.app.state import conversation_store
 from proxy.app.streaming import chat_completions_stream
+from proxy.app.tools_shim import parse_assistant_action
 
 
 def make_client() -> TestClient:
@@ -29,6 +30,7 @@ class FakeTransport:
     def __init__(self):
         self.calls: list[tuple[str, bool]] = []
         self.last_result = FakeResult("assistant reply")
+        self.data: dict[str, str] = {}
 
     def send_message(self, message: str, image: str | None = None, *, new_conversation: bool = True):
         self.calls.append((message, new_conversation))
@@ -189,6 +191,245 @@ def test_history_based_conversation_reuse_supports_pi_style_full_history(monkeyp
     assert second.status_code == 200
     assert len(stub.transports) == 1
     assert stub.transports[0].calls == [("first", True), ("second", False)]
+
+
+def test_persisted_history_alias_rehydrates_transport(monkeypatch):
+    stub = BuildTransportStub()
+    monkeypatch.setattr(proxy_client, "build_transport", stub)
+    client = make_client()
+
+    first = client.post("/v1/chat/completions", json={"model": "chatgpt-playwright", "messages": [{"role": "user", "content": "first"}]})
+    assert first.status_code == 200
+    assistant_reply = first.json()["choices"][0]["message"]["content"]
+
+    # Simulate process-local transport loss but persistent proxy memory retained.
+    state = conversation_store.count()
+    assert state == 1
+    only_state = next(iter(conversation_store._items.values()))
+    only_state.transport = None
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": assistant_reply},
+                {"role": "user", "content": "second"},
+            ],
+        },
+    )
+    assert second.status_code == 200
+    assert len(stub.transports) == 2
+    # New transport should still continue existing remote conversation, not start new one.
+    assert stub.transports[1].calls == [("second", False)]
+    assert stub.transports[1].data.get("conversation_id") == "remote-conv"
+
+
+def test_pi_tool_request_returns_tool_call_response(monkeypatch):
+    stub = BuildTransportStub()
+    monkeypatch.setattr(proxy_client, "build_transport", stub)
+    stub_transport = FakeTransport()
+    stub_transport.send_message = lambda message, image=None, new_conversation=True: FakeResult('<tool_call>{"name":"write","arguments":{"filename":"server.py","content":"print(1)"}}</tool_call>')
+    stub.transports = [stub_transport]
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [{"role": "user", "content": "write a python web server"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "write"
+
+
+def test_pi_tool_request_stream_returns_tool_call_chunk(monkeypatch):
+    stub_transport = FakeTransport()
+    stub_transport.send_message = lambda message, image=None, new_conversation=True: FakeResult('<tool_call>{"name":"bash","arguments":{"command":"python server.py"}}</tool_call>')
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": True,
+            "messages": [{"role": "user", "content": "run the server"}],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run shell command", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert response.status_code == 200
+    assert 'tool_calls' in response.text
+    assert 'python server.py' in response.text
+    assert '[DONE]' in response.text
+
+
+def test_parse_assistant_action_recovers_malformed_write_with_triple_quotes():
+    raw = (
+        '<tool_call>{"name":"write","arguments":{"path":"app/server.py","content":"#!/usr/bin/env python3\\n"""A small Python web server using only the standard library."""\\n\\nprint(\"ok\")\\n"}}</tool_call>'
+    )
+    action = parse_assistant_action(raw)
+    assert action.kind == "tool"
+    assert action.tool_name == "write"
+    assert action.tool_arguments == {
+        "path": "app/server.py",
+        "content": '#!/usr/bin/env python3\n"""A small Python web server using only the standard library."""\n\nprint("ok")\n',
+    }
+
+
+def test_parse_assistant_action_supports_safe_write_content_block():
+    raw = (
+        '<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>\n'
+        '<write_content>\n#!/usr/bin/env python3\n"""doc"""\nprint("ok")\n</write_content>'
+    )
+    action = parse_assistant_action(raw)
+    assert action.kind == "tool"
+    assert action.tool_arguments == {
+        "path": "app/server.py",
+        "content": '#!/usr/bin/env python3\n"""doc"""\nprint("ok")\n',
+    }
+
+
+def test_pi_tool_request_recovers_malformed_write_and_returns_tool_call(monkeypatch):
+    malformed = (
+        '<tool_call>{"name":"write","arguments":{"path":"app/server.py","content":"#!/usr/bin/env python3\\n"""A small Python web server using only the standard library."""\\n\\nprint(\"ok\")\\n"}}</tool_call>'
+    )
+    stub_transport = FakeTransport()
+    stub_transport.send_message = lambda message, image=None, new_conversation=True: FakeResult(malformed)
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [{"role": "user", "content": "write app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    call = payload["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "write"
+    arguments = json.loads(call["function"]["arguments"])
+    assert arguments["path"] == "app/server.py"
+    assert '"""A small Python web server using only the standard library."""' in arguments["content"]
+
+
+def test_pi_tool_request_invalid_tool_call_returns_error_instead_of_raw_text(monkeypatch):
+    stub_transport = FakeTransport()
+    stub_transport.send_message = lambda message, image=None, new_conversation=True: FakeResult('<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>')
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [{"role": "user", "content": "write app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "malformed_tool_call"
+
+
+def test_parse_assistant_action_rejects_invalid_python_write_content():
+    raw = (
+        '<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>\n'
+        '<write_content>\n#!/usr/bin/env python3\nclass RequestHandler:\ndef broken(self):\nprint("oops")\n</write_content>'
+    )
+    action = parse_assistant_action(raw)
+    assert action.kind == "invalid_tool"
+    assert "syntax validation" in (action.parse_error or "")
+
+
+def test_pi_tool_request_retries_malformed_python_write_once(monkeypatch):
+    bad = '<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>\n<write_content>\nclass Broken:\ndef x(self):\nprint("oops")\n</write_content>'
+    fixed = '<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>\n<write_content>\nclass Broken:\n    def x(self):\n        print("oops")\n</write_content>'
+    stub_transport = FakeTransport()
+
+    def send_message(message, image=None, new_conversation=True):
+        stub_transport.calls.append((message, new_conversation, message))
+        if len(stub_transport.calls) == 1:
+            stub_transport.last_result = FakeResult(bad)
+        else:
+            stub_transport.last_result = FakeResult(fixed)
+        return stub_transport.last_result
+
+    stub_transport.send_message = send_message
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [{"role": "user", "content": "write app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    call = payload["choices"][0]["message"]["tool_calls"][0]
+    arguments = json.loads(call["function"]["arguments"])
+    assert arguments["content"] == 'class Broken:\n    def x(self):\n        print("oops")\n'
+    assert len(stub_transport.calls) == 2
+    assert stub_transport.calls[0][1] is True
+    assert stub_transport.calls[1][1] is False
+    assert "Validation error:" in stub_transport.calls[1][2]
+
+
+def test_tool_call_follow_up_reuses_same_transport(monkeypatch):
+    tool_call_response = '<tool_call>{"name":"write","arguments":{"path":"app/server.py"}}</tool_call>\n<write_content>print("ok")\n</write_content>'
+    final_response = '<final_response>Created `app/server.py`.</final_response>'
+    stub_transport = FakeTransport()
+
+    def send_message(message, image=None, new_conversation=True):
+        stub_transport.calls.append((message, new_conversation))
+        if len(stub_transport.calls) == 1:
+            stub_transport.last_result = FakeResult(tool_call_response)
+        else:
+            stub_transport.last_result = FakeResult(final_response)
+        return stub_transport.last_result
+
+    stub_transport.send_message = send_message
+    monkeypatch.setattr(proxy_client, "build_transport", lambda session_material: stub_transport)
+    client = make_client()
+
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [{"role": "user", "content": "write app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert first.status_code == 200
+    tool_call = first.json()["choices"][0]["message"]["tool_calls"][0]
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [
+                {"role": "user", "content": "write app/server.py"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": tool_call["id"], "content": "Successfully wrote file"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write a file", "parameters": {"type": "object"}}}],
+        },
+    )
+    assert second.status_code == 200
+    assert stub_transport.calls[0][1] is True
+    assert stub_transport.calls[1][1] is False
 
 
 def test_streaming_formatter_emits_done():

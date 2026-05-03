@@ -12,6 +12,9 @@ class ProxyModel(BaseModel):
 class ChatMessage(ProxyModel):
     role: str
     content: str | list[Any] | None = None
+    tool_calls: list[Any] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatRequest(ProxyModel):
@@ -22,6 +25,9 @@ class ChatRequest(ProxyModel):
     max_tokens: int | None = None
     top_p: float | None = None
     user: str | None = None
+    tools: list[Any] | None = None
+    tool_choice: Any | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class ChatResponseMessage(ProxyModel):

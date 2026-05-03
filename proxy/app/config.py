@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -34,6 +35,12 @@ class Settings:
     browser_cdp_url: str = field(default_factory=lambda: os.environ.get("CHATGPT_PROXY_BROWSER_CDP_URL", "http://127.0.0.1:9222"))
     browser_auto_start_debug_browser: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_BROWSER_AUTO_START_DEBUG_BROWSER", True))
     browser_debugging_port: int = field(default_factory=lambda: int(os.environ.get("CHATGPT_PROXY_BROWSER_DEBUGGING_PORT", "9222")))
+    state_dir: str = field(default_factory=lambda: os.environ.get("CHATGPT_PROXY_STATE_DIR", str(Path("data/proxy").resolve())))
+
+    def state_path(self) -> Path:
+        path = Path(self.state_dir).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "conversation-store.json"
 
     def session_material(self) -> dict[str, Any]:
         return {

@@ -4,13 +4,21 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
-from .client import complete_chat, list_models, stream_chat_completion
+from .client import complete_chat, complete_chat_turn, list_models, stream_chat_completion
 from .config import settings
-from .models import ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, HealthResponse, ModelList
-from .streaming import chat_completions_stream
+from .models import ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, HealthResponse, ModelList, StreamChoice, StreamChunk, StreamDelta
+from .streaming import chat_completions_stream, done_sse, sse
+from .tools_shim import (
+    build_openai_tool_call,
+    build_pi_agent_prompt,
+    build_tool_repair_prompt,
+    is_pi_agent_request,
+    parse_assistant_action,
+    should_retry_malformed_tool_call,
+)
 
 router = APIRouter()
 
@@ -54,8 +62,34 @@ async def get_models() -> dict[str, Any]:
     }
 
 
+def tool_parse_error_message(parse_error: str | None) -> str:
+    detail = f": {parse_error}" if parse_error else ""
+    return f"Model emitted a malformed tool call{detail}"
+
+
+def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None) -> tuple[str, Any]:
+    text, effective_conversation_id = complete_chat_turn(
+        model=model,
+        messages=dumped_messages,
+        conversation_id=conversation_id,
+        prompt_override=prompt_override,
+    )
+    action = parse_assistant_action(text)
+    if should_retry_malformed_tool_call(action):
+        repair_prompt = build_tool_repair_prompt(text, action.parse_error)
+        repaired_text = complete_chat(
+            model=model,
+            messages=dumped_messages,
+            conversation_id=effective_conversation_id,
+            prompt_override=repair_prompt,
+        )
+        repaired_action = parse_assistant_action(repaired_text)
+        return repaired_text, repaired_action
+    return text, action
+
+
 @router.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+async def chat_completions(request: ChatRequest, raw_request: Request):
     if not request.messages:
         raise openai_error("messages must not be empty", 400, "invalid_messages")
 
@@ -65,13 +99,67 @@ async def chat_completions(request: ChatRequest):
 
     conversation_id = request.user.strip() if isinstance(request.user, str) and request.user.strip() else None
     dumped_messages = [message.model_dump() for message in request.messages]
+    agent_mode = is_pi_agent_request(request.tools)
+    prompt_override = None
+    if agent_mode:
+        decision = build_pi_agent_prompt(dumped_messages, request.tools)
+        prompt_override = decision.prompt
 
     if request.stream:
+        if agent_mode:
+            async def agent_event_stream():
+                req_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+                try:
+                    text, action = resolve_agent_action(
+                        model=request.model,
+                        dumped_messages=dumped_messages,
+                        conversation_id=conversation_id,
+                        prompt_override=prompt_override,
+                    )
+                except ValueError as exc:
+                    yield sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_messages"}})
+                    yield done_sse()
+                    return
+                if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
+                    chunk = StreamChunk(
+                        id=req_id,
+                        created=created,
+                        model=request.model,
+                        choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", tool_calls=[build_openai_tool_call(action.tool_name, action.tool_arguments)]), finish_reason="tool_calls")],
+                    )
+                    yield sse(chunk.model_dump())
+                    yield done_sse()
+                    return
+                if action.kind == "invalid_tool":
+                    yield sse({"error": {"message": tool_parse_error_message(action.parse_error), "type": "server_error", "code": "malformed_tool_call"}})
+                    yield done_sse()
+                    return
+                content = action.content or ""
+                first_chunk = StreamChunk(
+                    id=req_id,
+                    created=created,
+                    model=request.model,
+                    choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", content=content), finish_reason=None)],
+                )
+                yield sse(first_chunk.model_dump())
+                end_chunk = StreamChunk(
+                    id=req_id,
+                    created=created,
+                    model=request.model,
+                    choices=[StreamChoice(index=0, delta=StreamDelta(), finish_reason="stop")],
+                )
+                yield sse(end_chunk.model_dump())
+                yield done_sse()
+
+            return StreamingResponse(agent_event_stream(), media_type="text/event-stream")
+
         async def event_stream():
             upstream = stream_chat_completion(
                 model=request.model,
                 messages=dumped_messages,
                 conversation_id=conversation_id,
+                prompt_override=prompt_override,
             )
             async for item in chat_completions_stream(upstream, request.model):
                 yield item
@@ -79,9 +167,38 @@ async def chat_completions(request: ChatRequest):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     try:
-        text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id)
+        if agent_mode:
+            text, action = resolve_agent_action(
+                model=request.model,
+                dumped_messages=dumped_messages,
+                conversation_id=conversation_id,
+                prompt_override=prompt_override,
+            )
+        else:
+            text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id, prompt_override=prompt_override)
+            action = None
     except ValueError as exc:
         raise openai_error(str(exc), 400, "invalid_messages") from exc
+
+    if agent_mode:
+        if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
+            payload = ChatResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex}",
+                created=int(time.time()),
+                model=request.model,
+                choices=[
+                    ChatChoice(
+                        index=0,
+                        message=ChatResponseMessage(role="assistant", content=None, tool_calls=[build_openai_tool_call(action.tool_name, action.tool_arguments)]),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=ChatUsage(),
+            )
+            return payload.model_dump()
+        if action.kind == "invalid_tool":
+            raise openai_error(tool_parse_error_message(action.parse_error), 502, "malformed_tool_call")
+        text = action.content or ""
 
     payload = ChatResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
