@@ -7,6 +7,8 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { chromium, firefox, webkit } from 'playwright'
 
+import readline from 'node:readline'
+
 const require = createRequire(import.meta.url)
 
 function getPlaywrightVersion() {
@@ -53,12 +55,15 @@ function buildLaunchArgs(browser) {
     return []
   }
 
-  // Chromium args — disable automation detection flags
+  // Chromium args
   return [
     '--password-store=basic',
     '--no-first-run',
     '--no-default-browser-check',
-    '--disable-blink-features=AutomationControlled',
+    '--remote-allow-origins=*',
+    '--hide-crash-restore-bubble',
+    '--disable-session-crashed-bubble',
+    '--disable-infobars',
   ]
 }
 
@@ -72,13 +77,7 @@ function resolveExecutablePath(browser) {
   return browserType.executablePath()
 }
 
-async function readStdinJson() {
-  const chunks = []
-  for await (const chunk of process.stdin) chunks.push(chunk)
-  const raw = Buffer.concat(chunks).toString('utf8').trim()
-  if (!raw) throw new Error('No JSON request payload received on stdin')
-  return JSON.parse(raw)
-}
+
 
 const transportStartedAt = Date.now()
 
@@ -529,165 +528,7 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   return { text: lastNormalizedText, timedOut: true, placeholderOnly: isPlaceholderOnly(lastRawText) }
 }
 
-async function waitForCdp(url, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${url.replace(/\/$/, '')}/json/version`)
-      if (response.ok) return true
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 500))
-  }
-  return false
-}
 
-async function startDebugBrowser(browser, targetUrl) {
-  const browserTypeName = getBrowserTypeName(browser)
-
-  if (browserTypeName !== 'chromium') {
-    throw new Error('startDebugBrowser/CDP auto-start is only supported for Chromium')
-  }
-
-  const executable = resolveExecutablePath(browser)
-
-  emit({
-    type: 'status',
-    stage: 'starting_debug_browser_resolved',
-    executable,
-    browser_type: browserTypeName,
-    playwright_version: getPlaywrightVersion(),
-    playwright_browsers_path: process.env.PLAYWRIGHT_BROWSERS_PATH || null,
-  })
-
-  const args = [
-    `--remote-debugging-port=${browser.debugging_port || 9222}`,
-    '--password-store=basic',
-    '--no-first-run',
-    '--no-default-browser-check',
-  ]
-
-  if (browser.profile_directory) {
-    args.push(`--profile-directory=${browser.profile_directory}`)
-  }
-
-  if (browser.user_data_dir) {
-    args.push(`--user-data-dir=${browser.user_data_dir}`)
-  }
-
-  args.push(targetUrl || 'https://chatgpt.com/')
-
-  const child = spawn(executable, args, {
-    detached: true,
-    stdio: 'ignore',
-    env: {
-      ...process.env,
-      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: process.env.OBJC_DISABLE_INITIALIZE_FORK_SAFETY || 'YES',
-    },
-  })
-
-  child.unref()
-}
-
-async function pickBestExistingPage(contexts, targetUrl) {
-  const normalizedTarget = `${targetUrl}`.replace(/\/$/, '')
-  let fallbackPage = null
-  let fallbackContext = null
-  for (const context of contexts) {
-    for (const page of context.pages()) {
-      const url = page.url()
-      if (!fallbackPage) {
-        fallbackPage = page
-        fallbackContext = context
-      }
-      if (url.startsWith('https://chatgpt.com/c/')) {
-        return { page, context, reason: 'existing_conversation_page' }
-      }
-      if (url.replace(/\/$/, '') === normalizedTarget) {
-        return { page, context, reason: 'existing_home_page' }
-      }
-    }
-  }
-  if (fallbackPage) return { page: fallbackPage, context: fallbackContext, reason: 'fallback_existing_page' }
-  return null
-}
-
-async function openOrAttachBrowser(browser, targetUrl) {
-  const browserTypeName = getBrowserTypeName(browser)
-  const browserType = getBrowserType(browser)
-
-  // CDP is Chromium-only
-  if (browserTypeName !== 'chromium' && browser.connect_over_cdp) {
-    throw new Error('connect_over_cdp is only supported for Chromium. Disable CDP when using Firefox.')
-  }
-
-  if (browser.connect_over_cdp) {
-    const cdpUrl = browser.cdp_url || `http://127.0.0.1:${browser.debugging_port || 9222}`
-    emit({ type: 'status', stage: 'connecting_over_cdp', cdp_url: cdpUrl, browser_type: browserTypeName })
-    let ready = await waitForCdp(cdpUrl, 2000)
-    if (!ready && browser.auto_start_debug_browser) {
-      emit({ type: 'status', stage: 'starting_debug_browser', cdp_url: cdpUrl })
-      await startDebugBrowser(browser, targetUrl)
-      ready = await waitForCdp(cdpUrl, 30000)
-    }
-    if (!ready) throw new Error(`cdp_unavailable:${cdpUrl}`)
-    const attachedBrowser = await chromium.connectOverCDP(cdpUrl)
-    const contexts = attachedBrowser.contexts()
-    const picked = await pickBestExistingPage(contexts, targetUrl)
-    if (picked) {
-      emit({ type: 'status', stage: 'attached_existing_page', reason: picked.reason, current_url: picked.page.url() })
-      return { browserHandle: attachedBrowser, context: picked.context, page: picked.page, attachedViaCdp: true }
-    }
-    const context = contexts[0]
-    if (!context) throw new Error('No browser context was available after CDP attach')
-    const page = await context.newPage()
-    emit({ type: 'status', stage: 'attached_new_page_created', current_url: page.url() })
-    return { browserHandle: attachedBrowser, context, page, attachedViaCdp: true }
-  }
-
-  // Persistent context launch (works for all browser types)
-  const launchOptions = {
-    headless: Boolean(browser.headless),
-    viewport: { width: 1440, height: 960 },
-    args: buildLaunchArgs(browser),
-  }
-
-  if (browser.executable_path) {
-    launchOptions.executablePath = browser.executable_path
-  }
-
-  // `channel` is Chromium-only. Do not use channel for Firefox.
-  if (browserTypeName === 'chromium' && browser.channel) {
-    launchOptions.channel = browser.channel
-  }
-
-  // Firefox stealth prefs (only needed if using Playwright's patched Firefox)
-  if (browserTypeName === 'firefox' && !launchOptions.executablePath) {
-    launchOptions.firefoxUserPrefs = {
-      'dom.webdriver.enabled': false,
-      'marionette.enabled': false,
-    }
-  }
-
-  emit({
-    type: 'status',
-    stage: 'launching_persistent_context',
-    browser_type: browserTypeName,
-    executable_path: launchOptions.executablePath || 'playwright-default',
-    playwright_version: getPlaywrightVersion(),
-    user_data_dir: browser.user_data_dir || null,
-    args: launchOptions.args,
-  })
-
-  const context = await browserType.launchPersistentContext(browser.user_data_dir, launchOptions)
-  const page = context.pages()[0] || await context.newPage()
-
-  return {
-    browserHandle: null,
-    context,
-    page,
-    attachedViaCdp: false,
-  }
-}
 
 function buildConversationUrl(targetUrl, remoteConversationId) {
   const base = new URL(targetUrl)
@@ -696,7 +537,8 @@ function buildConversationUrl(targetUrl, remoteConversationId) {
 
 async function ensureChatPage(page, targetUrl) {
   const currentUrl = page.url()
-  const alreadyOnChat = currentUrl.startsWith('https://chatgpt.com/') || currentUrl === 'https://chatgpt.com'
+  const normalizedTarget = targetUrl.replace(/\/$/, '')
+  const alreadyOnChat = currentUrl.startsWith(normalizedTarget)
 
   if (!alreadyOnChat) {
     emit({ type: 'status', stage: 'navigating_to_chatgpt', from_url: currentUrl || null, target_url: targetUrl })
@@ -725,43 +567,108 @@ async function ensureRemoteConversation(page, targetUrl, remoteConversationId) {
   await waitForChatShell(page, 5000)
 }
 
-async function main() {
-  const request = await readStdinJson()
+// Global persistent state
+let globalContext = null
+let globalPage = null
+let processingRequest = false
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+})
+
+rl.on('line', async (line) => {
+  if (!line.trim()) return
+  if (processingRequest) {
+    emit({ type: 'status', stage: 'warning', message: 'overlapping_request_dropped' })
+    return
+  }
+  processingRequest = true
+  
+  try {
+    const request = JSON.parse(line)
+    await handleRequest(request)
+  } catch (error) {
+    emit({ type: 'result', success: false, error: String(error?.message || error), transport_details: { transport_mode: 'playwright' } })
+  } finally {
+    processingRequest = false
+  }
+})
+
+rl.on('close', async () => {
+  if (globalContext) {
+    await globalContext.close().catch(() => {})
+  }
+  process.exit(0)
+})
+
+async function handleRequest(request) {
   const transport = request.transport || {}
   const browser = transport.browser || {}
   const browserTypeName = getBrowserTypeName(browser)
-  emit({ type: 'status', stage: browser.connect_over_cdp ? 'opening_browser_via_cdp' : 'launching_browser', transport_mode: 'playwright', browser_type: browserTypeName })
-  const { browserHandle, context, page, attachedViaCdp } = await openOrAttachBrowser(browser, request.url || 'https://chatgpt.com/')
+  const targetUrl = request.url || 'https://chatgpt.com/'
+
+  emit({ type: 'status', stage: 'processing_request', transport_mode: 'playwright', browser_type: browserTypeName })
+
   try {
-    page.on('websocket', (ws) => emit({ type: 'status', stage: 'websocket_created', websocket_url: ws.url() }))
-    await ensureChatPage(page, request.url || 'https://chatgpt.com/')
-    if (!request.new_conversation && request.remote_conversation_id) {
-      await ensureRemoteConversation(page, request.url || 'https://chatgpt.com/', request.remote_conversation_id)
+    if (!globalContext) {
+      const launchOptions = {
+        headless: Boolean(browser.headless),
+        viewport: { width: 1440, height: 960 },
+        args: buildLaunchArgs(browser),
+      }
+
+      if (browser.executable_path) {
+        launchOptions.executablePath = browser.executable_path
+      }
+
+      const browserType = getBrowserType(browser)
+      
+      emit({
+        type: 'status',
+        stage: 'launching_persistent_context',
+        browser_type: browserTypeName,
+        executable_path: launchOptions.executablePath || 'playwright-default'
+      })
+
+      globalContext = await browserType.launchPersistentContext(browser.user_data_dir, launchOptions)
+      globalPage = globalContext.pages()[0] || await globalContext.newPage()
+      
+      globalPage.on('websocket', (ws) => emit({ type: 'status', stage: 'websocket_created', websocket_url: ws.url() }))
     }
-    emit({ type: 'status', stage: 'page_loaded', url: page.url() })
-    const ui = await detectLoggedInUi(page)
+
+    await ensureChatPage(globalPage, targetUrl)
+    
+    if (!request.new_conversation && request.remote_conversation_id) {
+      await ensureRemoteConversation(globalPage, targetUrl, request.remote_conversation_id)
+    }
+    
+    emit({ type: 'status', stage: 'page_loaded', url: globalPage.url() })
+    const ui = await detectLoggedInUi(globalPage)
     emit({ type: 'status', stage: 'ui_detected', ui })
     if (!ui.loggedInLikely) {
       emit({ type: 'result', success: false, error: 'ui_not_logged_in', transport_details: { ui } })
       return
     }
 
-    const baselineAssistant = await getAssistantSnapshot(page)
+    const baselineAssistant = await getAssistantSnapshot(globalPage)
     emit({ type: 'status', stage: 'sending_prompt', baseline_assistant: baselineAssistant })
-    await waitForConversationIdle(page, 2500)
-    await sendPrompt(page, request.message, request.url || 'https://chatgpt.com/', Boolean(request.new_conversation))
+    await waitForConversationIdle(globalPage, 2500)
+    await sendPrompt(globalPage, request.message, targetUrl, Boolean(request.new_conversation))
     emit({ type: 'status', stage: 'awaiting_assistant_stream', baseline_assistant: baselineAssistant })
-    const streamResult = await streamAssistantText(page, Number(request.capture_timeout_ms || 120000), baselineAssistant)
+    const streamResult = await streamAssistantText(globalPage, Number(request.capture_timeout_ms || 120000), baselineAssistant)
     const text = streamResult.text
-    const finalUi = await detectLoggedInUi(page)
+    const finalUi = await detectLoggedInUi(globalPage)
     if (streamResult.timedOut) {
       emit({ type: 'status', stage: 'assistant_stream_timeout', placeholder_only: streamResult.placeholderOnly, text_preview: String(text || '').slice(0, 200) })
     }
+    
     emit({
       type: 'result',
       success: Boolean(text) && !streamResult.placeholderOnly,
       text,
-      remote_conversation_id: page.url().includes('/c/') ? page.url().split('/c/')[1]?.split(/[?#]/)[0] ?? null : null,
+      remote_conversation_id: globalPage.url().includes('/c/') ? globalPage.url().split('/c/')[1]?.split(/[?#]/)[0] ?? null : null,
       remote_parent_message_id: null,
       transport_details: {
         ui_before_send: ui,
@@ -770,7 +677,6 @@ async function main() {
         browser_type: browserTypeName,
         browser: {
           user_data_dir: browser.user_data_dir,
-          profile_directory: browser.profile_directory || null,
           executable_path_present: Boolean(browser.executable_path),
         },
         timed_out: streamResult.timedOut,
@@ -779,20 +685,10 @@ async function main() {
       verification_hints: {
         remote_conversation_exists: Boolean(text) && !streamResult.placeholderOnly,
         effective_transport_mode: 'playwright',
-        endpoint_family: 'browser-playwright',
       },
       error: streamResult.placeholderOnly ? 'assistant_response_placeholder_only' : undefined,
     })
-  } finally {
-    if (attachedViaCdp) {
-      await browserHandle.close().catch(() => {})
-    } else {
-      await context.close().catch(() => {})
-    }
+  } catch (err) {
+    emit({ type: 'result', success: false, error: String(err?.message || err), transport_details: { transport_mode: 'playwright' } })
   }
 }
-
-main().catch((error) => {
-  emit({ type: 'result', success: false, error: String(error?.message || error), transport_details: { transport_mode: 'playwright' } })
-  process.exit(1)
-})

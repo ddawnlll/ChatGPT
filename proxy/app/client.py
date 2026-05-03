@@ -104,6 +104,9 @@ def _normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]] | None:
 def fingerprint_messages(messages: list[dict[str, Any]]) -> str:
     normalized: list[dict[str, Any]] = []
     for message in messages:
+        # Ignore system messages because they often contain dynamic timestamps or context
+        if str(message.get("role", "")).strip().lower() == "system":
+            continue
         tool_call_id = message.get("tool_call_id")
         normalized.append({
             "role": str(message.get("role", "")).strip(),

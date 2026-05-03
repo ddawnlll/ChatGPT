@@ -158,15 +158,17 @@ class PlaywrightTransport:
         )
         return self._last_result
 
-    def _run(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[dict[str, Any]]:
+    def _get_node_process(self) -> Popen:
+        if hasattr(self, "_process") and self._process.poll() is None:
+            return self._process
+
         project_root = Path(__file__).resolve().parent
         browser_cache = project_root / "bin" / "browsers"
-
         env = os.environ.copy()
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_cache)
         env["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
-        process = Popen(
+        self._process = Popen(
             ["bun", self._script_path()],
             stdin=PIPE,
             stdout=PIPE,
@@ -175,16 +177,20 @@ class PlaywrightTransport:
             bufsize=1,
             env=env,
         )
-        payload = dumps(self._request_payload(message, image, new_conversation=new_conversation))
-        assert process.stdin is not None
-        process.stdin.write(payload)
-        process.stdin.close()
+        logger.info(f"[playwright-transport] spawned persistent node daemon pid={self._process.pid}")
+        return self._process
 
-        logger.info(f"[playwright-transport] spawned node process pid={process.pid}")
+    def _run(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[dict[str, Any]]:
+        process = self._get_node_process()
+        payload = dumps(self._request_payload(message, image, new_conversation=new_conversation))
+        
+        assert process.stdin is not None
+        process.stdin.write(payload + "\n")
+        process.stdin.flush()
         
         saw_output = False
         assert process.stdout is not None
-        for line in process.stdout:
+        for line in iter(process.stdout.readline, ""):
             line = line.strip()
             if not line:
                 continue
@@ -197,19 +203,17 @@ class PlaywrightTransport:
                 except Exception:
                     pass
             yield event
+            if event.get("type") == "result":
+                break
 
-        stderr = process.stderr.read().strip() if process.stderr is not None else ""
-        if stderr:
-            logger.error(f"[playwright-transport] node_stderr: {stderr}")
-
-        return_code = process.wait()
-        logger.info(f"[playwright-transport] node_process_exited return_code={return_code}")
-
-        if return_code not in {0, None}:
+        if process.poll() is not None:
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            logger.info(f"[playwright-transport] node_process_exited return_code={process.poll()}")
             if stderr:
+                logger.error(f"[playwright-transport] node_stderr: {stderr}")
                 self.request_diagnostics["playwright_stderr"] = stderr[:1000]
             if not saw_output:
-                raise RuntimeError(f"Playwright transport failed before emitting events: {stderr or 'unknown error'}")
+                raise RuntimeError(f"Playwright transport failed: {stderr or 'unknown error'}")
 
     def send_message(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> TransportResult:
         final_payload: dict[str, Any] | None = None
