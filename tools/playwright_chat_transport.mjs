@@ -123,19 +123,45 @@ async function detectLoggedInUi(page) {
   }
 }
 
-async function ensureComposerContext(page, targetUrl) {
+async function openFreshThread(page, targetUrl) {
+  const currentUrl = page.url()
+  const normalizedTarget = `${targetUrl}`.replace(/\/$/, '')
+  const existingComposer = await findComposer(page)
+  const alreadyHome = currentUrl.replace(/\/$/, '') === normalizedTarget
+
+  if (alreadyHome && existingComposer) {
+    emit({ type: 'status', stage: 'fresh_thread_already_ready', current_url: currentUrl, selector: existingComposer.selector, index: existingComposer.index })
+    return true
+  }
+
+  emit({ type: 'status', stage: 'navigating_home_for_fresh_thread', current_url: currentUrl, target_url: targetUrl })
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+  await waitForNoChallenge(page, 10000)
+  await waitForChatShell(page, 5000)
+  const homeComposer = await waitForComposerInteractive(page, 10000)
+  emit({ type: 'status', stage: 'fresh_thread_home_ready', composer_found: Boolean(homeComposer), selector: homeComposer?.selector ?? null, index: homeComposer?.index ?? null, current_url: page.url() })
+  return true
+}
+
+async function ensureComposerContext(page, targetUrl, newConversation) {
+  if (newConversation) {
+    await openFreshThread(page, targetUrl)
+  }
+
   const initialComposer = await findComposer(page)
-  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), selector: initialComposer?.selector ?? null, index: initialComposer?.index ?? null })
+  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), selector: initialComposer?.selector ?? null, index: initialComposer?.index ?? null, new_conversation: Boolean(newConversation) })
   if (initialComposer) {
     return await waitForComposerInteractive(page, 5000)
   }
 
-  const newChatButton = page.locator('button:has-text("New chat"), a:has-text("New chat"), [role="button"]:has-text("New chat")').first()
-  if (await newChatButton.isVisible().catch(() => false)) {
-    emit({ type: 'status', stage: 'opening_new_chat' })
-    await newChatButton.click().catch(() => {})
-    const readyComposer = await waitForComposerInteractive(page, 10000)
-    if (readyComposer) return readyComposer
+  if (!newConversation) {
+    const newChatButton = page.locator('button:has-text("New chat"), a:has-text("New chat"), [role="button"]:has-text("New chat")').first()
+    if (await newChatButton.isVisible().catch(() => false)) {
+      emit({ type: 'status', stage: 'opening_new_chat' })
+      await newChatButton.click().catch(() => {})
+      const readyComposer = await waitForComposerInteractive(page, 10000)
+      if (readyComposer) return readyComposer
+    }
   }
 
   emit({ type: 'status', stage: 'navigating_home_for_composer', target_url: targetUrl })
@@ -145,8 +171,8 @@ async function ensureComposerContext(page, targetUrl) {
   return await waitForComposerInteractive(page, 15000)
 }
 
-async function sendPrompt(page, message, targetUrl) {
-  const composer = await ensureComposerContext(page, targetUrl)
+async function sendPrompt(page, message, targetUrl, newConversation) {
+  const composer = await ensureComposerContext(page, targetUrl, newConversation)
   emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
   await composer.locator.click()
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
@@ -176,13 +202,80 @@ const ASSISTANT_SELECTORS = [
   '[data-testid="conversation-turn-assistant"]',
 ]
 
+async function extractAssistantText(locator) {
+  return locator.evaluate((node) => {
+    function isHidden(el) {
+      const style = window.getComputedStyle(el)
+      return style.display === 'none' || style.visibility === 'hidden'
+    }
+
+    function walk(current) {
+      if (current.nodeType === Node.TEXT_NODE) {
+        return current.textContent || ''
+      }
+      if (current.nodeType !== Node.ELEMENT_NODE) return ''
+
+      const el = current
+      if (isHidden(el)) return ''
+      const tag = el.tagName.toLowerCase()
+      if (['button', 'svg', 'path', 'style', 'script', 'noscript'].includes(tag)) return ''
+      if (el.getAttribute('role') === 'button') return ''
+      if (el.getAttribute('aria-label')) return ''
+
+      if (tag === 'pre') {
+        const codeEl = el.querySelector('code')
+        const code = (codeEl?.textContent || codeEl?.innerText || el.textContent || el.innerText || '').trimEnd()
+        const className = codeEl?.className || ''
+        const langMatch = className.match(/language-([\w+-]+)/i)
+        const language = langMatch ? langMatch[1] : ''
+        return `\n\n\`\`\`${language ? language : ''}\n${code}\n\`\`\`\n\n`
+      }
+      if (tag === 'code' && el.closest('pre')) {
+        return ''
+      }
+      if (tag === 'code') {
+        const code = el.innerText || el.textContent || ''
+        return code ? `\`${code}\`` : ''
+      }
+      if (tag === 'a') {
+        const href = el.getAttribute('href') || ''
+        let linkText = ''
+        for (const child of el.childNodes) linkText += walk(child)
+        linkText = linkText.trim()
+        if (href && linkText) return `[${linkText}](${href})`
+        return linkText
+      }
+      if (tag === 'br') return '\n'
+
+      let text = ''
+      for (const child of el.childNodes) text += walk(child)
+
+      if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) {
+        return text.trim() ? `${text.trim()}\n\n` : ''
+      }
+      if (['li'].includes(tag)) {
+        return text.trim() ? `- ${text.trim()}\n` : ''
+      }
+      if (/^h[1-6]$/.test(tag)) {
+        return text.trim() ? `${text.trim()}\n\n` : ''
+      }
+      return text
+    }
+
+    return walk(node)
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .trim()
+  }).catch(() => '')
+}
+
 async function getAssistantSnapshot(page) {
   for (const selector of ASSISTANT_SELECTORS) {
     const locator = page.locator(selector)
     const count = await locator.count().catch(() => 0)
     if (count > 0) {
       const latest = locator.nth(count - 1)
-      const rawText = await latest.innerText().catch(() => '')
+      const rawText = await extractAssistantText(latest)
       return { selector, count, rawText }
     }
   }
@@ -198,7 +291,7 @@ async function findLatestAssistantLocator(page, baseline = null) {
         return { locator: baselineLocator.nth(baselineCount - 1), selector: baseline.selector, count: baselineCount, isNewMessage: true }
       }
       const latest = baselineLocator.nth(baselineCount - 1)
-      const rawText = await latest.innerText().catch(() => '')
+      const rawText = await extractAssistantText(latest)
       if (rawText !== (baseline.rawText || '')) {
         return { locator: latest, selector: baseline.selector, count: baselineCount, isNewMessage: false }
       }
@@ -211,7 +304,7 @@ async function findLatestAssistantLocator(page, baseline = null) {
     const count = await locator.count().catch(() => 0)
     if (count <= 0) continue
     const latest = locator.nth(count - 1)
-    const rawText = await latest.innerText().catch(() => '')
+    const rawText = await extractAssistantText(latest)
     if (baseline && rawText === (baseline.rawText || '')) {
       continue
     }
@@ -242,6 +335,15 @@ function isPlaceholderOnly(text) {
   return isIgnorableAssistantText(text)
 }
 
+function looksLikeCompleteAssistantText(text) {
+  const normalized = normalizeAssistantText(text)
+  if (!normalized) return false
+  if (/```\s*$/.test(normalized)) return true
+  if (/[.!?"')\]]$/.test(normalized)) return true
+  if (/\n\n/.test(normalized)) return true
+  return false
+}
+
 async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   const deadline = Date.now() + timeoutMs
   let lastRawText = ''
@@ -250,7 +352,7 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   let observedAnyText = false
   while (Date.now() < deadline) {
     const assistantState = await findLatestAssistantLocator(page, baselineAssistant)
-    const rawText = assistantState ? await assistantState.locator.innerText().catch(() => '') : ''
+    const rawText = assistantState ? await extractAssistantText(assistantState.locator) : ''
     const normalizedText = normalizeAssistantText(rawText)
     if (rawText && rawText !== lastRawText) {
       observedAnyText = true
@@ -269,12 +371,13 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
     const composerVisible = await page.locator(COMPOSER_SELECTORS.join(', ')).first().isVisible().catch(() => false)
     const sendButtonVisible = await page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first().isVisible().catch(() => false)
     if (observedAnyText && !isPlaceholderOnly(lastRawText)) {
-      if (!stopButtonVisible && (composerVisible || sendButtonVisible) && stableTicks >= 1) {
-        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible })
+      const textLooksComplete = looksLikeCompleteAssistantText(lastRawText)
+      if (!stopButtonVisible && textLooksComplete && (composerVisible || sendButtonVisible) && stableTicks >= 1) {
+        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible, text_looks_complete: textLooksComplete })
         return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
       }
-      if (!stopButtonVisible && stableTicks >= 2) {
-        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible })
+      if (!stopButtonVisible && stableTicks >= (textLooksComplete ? 2 : 4)) {
+        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible, text_looks_complete: textLooksComplete })
         return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
       }
     }
@@ -311,6 +414,29 @@ async function startDebugBrowser(browser, targetUrl) {
   child.unref()
 }
 
+async function pickBestExistingPage(contexts, targetUrl) {
+  const normalizedTarget = `${targetUrl}`.replace(/\/$/, '')
+  let fallbackPage = null
+  let fallbackContext = null
+  for (const context of contexts) {
+    for (const page of context.pages()) {
+      const url = page.url()
+      if (!fallbackPage) {
+        fallbackPage = page
+        fallbackContext = context
+      }
+      if (url.startsWith('https://chatgpt.com/c/')) {
+        return { page, context, reason: 'existing_conversation_page' }
+      }
+      if (url.replace(/\/$/, '') === normalizedTarget) {
+        return { page, context, reason: 'existing_home_page' }
+      }
+    }
+  }
+  if (fallbackPage) return { page: fallbackPage, context: fallbackContext, reason: 'fallback_existing_page' }
+  return null
+}
+
 async function openOrAttachBrowser(browser, targetUrl) {
   if (browser.connect_over_cdp) {
     const cdpUrl = browser.cdp_url || `http://127.0.0.1:${browser.debugging_port || 9222}`
@@ -323,9 +449,16 @@ async function openOrAttachBrowser(browser, targetUrl) {
     }
     if (!ready) throw new Error(`cdp_unavailable:${cdpUrl}`)
     const attachedBrowser = await chromium.connectOverCDP(cdpUrl)
-    const context = attachedBrowser.contexts()[0]
+    const contexts = attachedBrowser.contexts()
+    const picked = await pickBestExistingPage(contexts, targetUrl)
+    if (picked) {
+      emit({ type: 'status', stage: 'attached_existing_page', reason: picked.reason, current_url: picked.page.url() })
+      return { browserHandle: attachedBrowser, context: picked.context, page: picked.page, attachedViaCdp: true }
+    }
+    const context = contexts[0]
     if (!context) throw new Error('No browser context was available after CDP attach')
-    const page = context.pages()[0] || await context.newPage()
+    const page = await context.newPage()
+    emit({ type: 'status', stage: 'attached_new_page_created', current_url: page.url() })
     return { browserHandle: attachedBrowser, context, page, attachedViaCdp: true }
   }
 
@@ -377,7 +510,7 @@ async function main() {
     const baselineAssistant = await getAssistantSnapshot(page)
     emit({ type: 'status', stage: 'sending_prompt', baseline_assistant: baselineAssistant })
     await waitForConversationIdle(page, 2500)
-    await sendPrompt(page, request.message, request.url || 'https://chatgpt.com/')
+    await sendPrompt(page, request.message, request.url || 'https://chatgpt.com/', Boolean(request.new_conversation))
     emit({ type: 'status', stage: 'awaiting_assistant_stream', baseline_assistant: baselineAssistant })
     const streamResult = await streamAssistantText(page, Number(request.capture_timeout_ms || 120000), baselineAssistant)
     const text = streamResult.text
@@ -389,7 +522,7 @@ async function main() {
       type: 'result',
       success: Boolean(text) && !streamResult.placeholderOnly,
       text,
-      remote_conversation_id: null,
+      remote_conversation_id: page.url().includes('/c/') ? page.url().split('/c/')[1]?.split(/[?#]/)[0] ?? null : null,
       remote_parent_message_id: null,
       transport_details: {
         ui_before_send: ui,

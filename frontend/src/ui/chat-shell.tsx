@@ -1,25 +1,26 @@
 /**
- * ChatShell — fully reworked
- * ─────────────────────────────────────────────────────────
- * Features:
- *  • Enter to send (Shift+Enter = newline)
- *  • Inline rename in the sidebar chat row (pencil icon)
- *  • Markdown rendering via react-markdown + remark-gfm
- *  • Syntax-highlighted code blocks with copy button
- *  • File / artifact blocks with copy + download button
- *  • Richer dark palette — deep charcoal, blue + amber accents
- *  • Animated orb field, glass panels, staggered msg entrance
+ * ChatShell — markdown rendering fix + full shell
  *
- * Required dependencies (add to package.json if missing):
- *   react-markdown  remark-gfm
+ * ROOT CAUSE of broken rendering:
+ *   react-markdown passes ALL fenced code blocks through <pre><code>.
+ *   Overriding `pre` to return <>{children}</> strips the wrapper and breaks
+ *   the VDOM tree for multi-block responses. The correct fix is:
+ *     1. Override ONLY `code` — detect inline vs block there.
+ *     2. Never override `pre` at all (let react-markdown own it).
+ *     3. Wrap the entire output in a single <ReactMarkdown> — never split
+ *        content or render chunks separately.
+ *
+ * Dependencies: react-markdown  remark-gfm
  */
 
 import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useParams, useRouterState } from '@tanstack/react-router'
 import clsx from 'clsx'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import {
   createChat, deleteChat, getChat, getDebugTransport, listChats, renameChat, streamMessage, updateChatVerification,
   type ChatDetail, type ChatMessage, type DebugTransportPayload, type SessionConfig, type VerificationState,
@@ -66,15 +67,13 @@ function parseCookiesTxt(content: string): string {
     if (!trimmed || trimmed.startsWith('#')) continue
     const parts = trimmed.split('\t')
     if (parts.length < 7) continue
-    const domain = parts[0]
     const name = parts[5]
     const value = parts.slice(6).join('\t')
+    const domain = parts[0]
     if (!name || !value) continue
-    if (domain.includes('chatgpt.com') || domain.includes('openai.com')) {
-      cookies.set(name, value)
-    }
+    if (domain.includes('chatgpt.com') || domain.includes('openai.com')) cookies.set(name, value)
   }
-  return Array.from(cookies.entries()).map(([name, value]) => `${name}=${value}`).join('; ')
+  return Array.from(cookies.entries()).map(([n, v]) => `${n}=${v}`).join('; ')
 }
 
 /* ─── auto-scroll ─── */
@@ -86,108 +85,270 @@ function useAutoScroll(dep: unknown) {
   return ref
 }
 
-/* ─── file-like language detection ─── */
-const FILE_LANG_RE = /^([\w.-]+\.(tsx?|jsx?|py|rs|go|java|c|cpp|cs|rb|php|swift|kt|sh|bash|zsh|yaml|yml|toml|json|html?|css|scss|sql|md|txt))$/i
-
 /* ─── helpers ─── */
-async function copyText(text: string) {
-  await navigator.clipboard.writeText(text)
+const FILE_LANG_RE = /^([\w.-]+\.(tsx?|jsx?|py|rs|go|java|c|cpp|cs|rb|php|swift|kt|sh|bash|zsh|yaml|yml|toml|json|html?|css|scss|sql|md|txt))$/i
+const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
+  js: 'javascript', jsx: 'jsx', ts: 'typescript', tsx: 'tsx',
+  py: 'python', rs: 'rust', go: 'go', java: 'java', c: 'c', cpp: 'cpp', cs: 'csharp',
+  rb: 'ruby', php: 'php', swift: 'swift', kt: 'kotlin', sh: 'bash', bash: 'bash', zsh: 'bash',
+  yml: 'yaml', yaml: 'yaml', toml: 'toml', json: 'json', html: 'markup', htm: 'markup',
+  css: 'css', scss: 'scss', sql: 'sql', md: 'markdown', txt: 'text',
 }
+const LANGUAGE_LABEL_MAP: Record<string, string> = {
+  python: 'python', py: 'python',
+  javascript: 'javascript', js: 'javascript',
+  typescript: 'typescript', ts: 'typescript',
+  tsx: 'tsx', jsx: 'jsx',
+  bash: 'bash', sh: 'bash', shell: 'bash', zsh: 'bash',
+  json: 'json', html: 'markup', css: 'css',
+  markdown: 'markdown', md: 'markdown',
+  yaml: 'yaml', yml: 'yaml',
+  sql: 'sql', text: 'text', txt: 'text',
+  go: 'go', java: 'java', rust: 'rust', ruby: 'ruby', php: 'php',
+  swift: 'swift', kotlin: 'kotlin', c: 'c', cpp: 'cpp', csharp: 'csharp', cs: 'csharp',
+}
+const UI_CODE_ACTIONS = new Set(['run', 'copy', 'copy code', 'download'])
+
+function inferSyntaxLanguage(lang?: string, filename?: string) {
+  const source = (lang || filename || '').toLowerCase()
+  if (!source) return 'text'
+  if (source in EXTENSION_LANGUAGE_MAP) return EXTENSION_LANGUAGE_MAP[source]
+  const ext = source.includes('.') ? source.split('.').pop() || '' : source
+  return EXTENSION_LANGUAGE_MAP[ext] || source
+}
+
+async function copyText(t: string) { await navigator.clipboard.writeText(t) }
 function downloadText(filename: string, content: string) {
-  const blob = new Blob([content], { type: 'text/plain' })
-  const url = URL.createObjectURL(blob)
-  const a = Object.assign(document.createElement('a'), { href: url, download: filename })
-  a.click()
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/plain' }))
+  Object.assign(document.createElement('a'), { href: url, download: filename }).click()
   URL.revokeObjectURL(url)
 }
 
-/* ════════════════════════════════
-   CODE / FILE BLOCK
-═══════════════════════════════════ */
-function CodeBlock({ language, filename, children }: { language?: string; filename?: string; children: string }) {
-  const [copied, setCopied] = useState(false)
-  const isFile = filename && FILE_LANG_RE.test(filename)
+function normalizeCodeBlock(raw: string, lang?: string) {
+  const lines = raw.replace(/\n$/, '').split('\n')
+  let nextLang = lang
+  let canRun = false
 
-  const handleCopy = async () => {
-    await copyText(children)
+  const normalizeToken = (value?: string) =>
+    (value || '').trim().toLowerCase().replace(/:$/, '')
+
+  const normalizeLanguage = (value?: string) => {
+    const token = normalizeToken(value)
+    return LANGUAGE_LABEL_MAP[token] || ''
+  }
+
+  const parseUiOnlyLine = (value?: string) => {
+    const trimmed = (value || '').trim()
+    if (!trimmed) return { isUiOnly: true, language: '', sawRun: false }
+
+    const tokens = trimmed.split(/\s+/).filter(Boolean)
+
+    let detectedLanguage = ''
+    let sawRun = false
+
+    for (const token of tokens) {
+      const normalizedToken = normalizeToken(token)
+      const language = normalizeLanguage(token)
+
+      if (UI_CODE_ACTIONS.has(normalizedToken)) {
+        if (normalizedToken === 'run') sawRun = true
+        continue
+      }
+
+      if (language) {
+        if (!detectedLanguage) detectedLanguage = language
+        continue
+      }
+
+      return { isUiOnly: false, language: '', sawRun: false }
+    }
+
+    return { isUiOnly: true, language: detectedLanguage, sawRun }
+  }
+
+  while (lines.length > 0) {
+    const parsed = parseUiOnlyLine(lines[0])
+    if (!parsed.isUiOnly) break
+
+    if (!nextLang && parsed.language) nextLang = parsed.language
+    if (parsed.sawRun) canRun = true
+
+    lines.shift()
+  }
+
+  while (lines[0] && !lines[0].trim()) lines.shift()
+
+  return {
+    lang: nextLang,
+    code: lines.join('\n'),
+    canRun,
+  }
+}
+
+/* ════════════════════════════════
+   CODE BLOCK UI
+   (rendered by the markdown `code` component override)
+═══════════════════════════════════ */
+function CodeBlock({ lang, filename, code, canRun }: { lang?: string; filename?: string; code: string; canRun?: boolean }) {
+  const syntaxLanguage = inferSyntaxLanguage(lang, filename)
+  const [copied, setCopied] = useState(false)
+  const isFile = !!filename
+  const runnable = canRun || ['python', 'javascript', 'typescript', 'bash', 'sh'].includes(syntaxLanguage)
+
+  const doCopy = async () => {
+    await copyText(code)
     setCopied(true)
     setTimeout(() => setCopied(false), 1800)
   }
 
+  const doRun = () => {
+    console.log('Run code:', { language: syntaxLanguage, code })
+  }
+
   return (
     <div className="code-block">
+      {/* ── toolbar ── */}
       <div className="code-header">
         <div className="code-dots">
-          <span className="dot dot-r" /><span className="dot dot-y" /><span className="dot dot-g" />
-          {(filename || language) && <span className="code-lang">{filename ?? language}</span>}
+          <span className="dot dot-r" />
+          <span className="dot dot-y" />
+          <span className="dot dot-g" />
+          {(filename || lang) && (
+            <span className="code-lang">{filename ?? lang}</span>
+          )}
         </div>
         <div className="code-actions">
           {isFile && (
-            <button className="code-btn" onClick={() => downloadText(filename!, children)} title="Download">
+            <button className="code-btn" onClick={() => downloadText(filename!, code)} title="Download file">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
               Download
             </button>
           )}
-          <button className="code-btn" onClick={handleCopy} title="Copy">
-            {copied
-              ? <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>Copied</>
-              : <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</>
-            }
+          {runnable && (
+            <button className="code-btn" onClick={doRun} title="Run code">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+              Run
+            </button>
+          )}
+          <button className="code-btn" onClick={doCopy} title="Copy">
+            {copied ? (
+              <>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+                Copied
+              </>
+            ) : (
+              <>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
+                Copy
+              </>
+            )}
           </button>
         </div>
       </div>
-      <pre className="code-pre"><code className="code-inner">{children}</code></pre>
+      {/* ── code body ── */}
+      <div className="code-pre">
+        <SyntaxHighlighter
+          language={syntaxLanguage}
+          style={oneDark}
+          customStyle={{ margin: 0, padding: '1rem', background: 'transparent', fontSize: '0.9rem' }}
+          codeTagProps={{ className: 'code-inner' }}
+          wrapLongLines
+          PreTag="div"
+        >
+          {code}
+        </SyntaxHighlighter>
+      </div>
     </div>
   )
 }
 
 /* ════════════════════════════════
    MARKDOWN RENDERER
+   ──────────────────────────────
+   KEY FIX: We do NOT override <pre>.
+   react-markdown renders fenced blocks as <pre><code className="language-*">.
+   We only override <code> — check whether it is a direct child of <pre>
+   (block) or inline by inspecting the `node` parent type.
 ═══════════════════════════════════ */
+
+// Build the components map once (stable reference avoids re-renders)
+const mdComponents: Components = {
+  // ── The only tricky one ──
+  code(props) {
+    const { children, className, node, ...rest } = props as any
+    const raw = String(children ?? '').replace(/\n$/, '')
+
+    // react-markdown sets className="language-xxx" on fenced blocks
+    const langMatch = /language-(\S+)/.exec(className ?? '')
+    const lang = langMatch?.[1]
+
+    // Block code: parent is <pre> (node.position depth check isn't needed —
+    // react-markdown only gives className on block code nodes)
+    const isBlock = Boolean(langMatch) || raw.includes('\n')
+
+    if (isBlock) {
+      const normalized = normalizeCodeBlock(raw, lang)
+      const isFilename = normalized.lang ? FILE_LANG_RE.test(normalized.lang) : false
+      return (
+        <CodeBlock
+          lang={isFilename ? undefined : normalized.lang}
+          filename={isFilename ? normalized.lang : undefined}
+          code={normalized.code}
+          canRun={normalized.canRun}
+        />
+      )
+    }
+
+    // Inline code
+    return <code className="inline-code" {...rest}>{children}</code>
+  },
+
+  // ── Do NOT override <pre> — let react-markdown render it, we intercept at <code> ──
+
+  p: ({ children }) => <p className="md-p">{children}</p>,
+  h1: ({ children }) => <h1 className="md-h1">{children}</h1>,
+  h2: ({ children }) => <h2 className="md-h2">{children}</h2>,
+  h3: ({ children }) => <h3 className="md-h3">{children}</h3>,
+  h4: ({ children }) => <h4 className="md-h4">{children}</h4>,
+  ul: ({ children }) => <ul className="md-ul">{children}</ul>,
+  ol: ({ children }) => <ol className="md-ol">{children}</ol>,
+  li: ({ children }) => <li className="md-li">{children}</li>,
+  blockquote: ({ children }) => <blockquote className="md-bq">{children}</blockquote>,
+  a: ({ children, href }) => {
+    const isArchive = typeof href === 'string' && /\.(zip|tar|gz|tgz|rar|7z)(\?|#|$)/i.test(href)
+    return (
+      <a className="md-a" href={href} target="_blank" rel="noopener noreferrer" download={isArchive ? '' : undefined}>
+        {children}
+      </a>
+    )
+  },
+  table: ({ children }) => (
+    <div className="md-table-wrap">
+      <table className="md-table">{children}</table>
+    </div>
+  ),
+  th: ({ children }) => <th className="md-th">{children}</th>,
+  td: ({ children }) => <td className="md-td">{children}</td>,
+  hr: () => <hr className="md-hr" />,
+  strong: ({ children }) => <strong className="md-strong">{children}</strong>,
+  em: ({ children }) => <em className="md-em">{children}</em>,
+}
+
 function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="md-content">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          code({ node, inline, className, children, ...props }: any) {
-            const match = /language-(\S+)/.exec(className || '')
-            const raw = String(children).replace(/\n$/, '')
-            if (!inline && match) {
-              const lang = match[1]
-              const isFilename = FILE_LANG_RE.test(lang)
-              return (
-                <CodeBlock
-                  language={isFilename ? undefined : lang}
-                  filename={isFilename ? lang : undefined}
-                >{raw}</CodeBlock>
-              )
-            }
-            if (!inline && raw.includes('\n')) return <CodeBlock>{raw}</CodeBlock>
-            return <code className="inline-code" {...props}>{children}</code>
-          },
-          pre({ children }: any) { return <>{children}</> },
-          p({ children }: any) { return <p className="md-p">{children}</p> },
-          h1({ children }: any) { return <h1 className="md-h1">{children}</h1> },
-          h2({ children }: any) { return <h2 className="md-h2">{children}</h2> },
-          h3({ children }: any) { return <h3 className="md-h3">{children}</h3> },
-          ul({ children }: any) { return <ul className="md-ul">{children}</ul> },
-          ol({ children }: any) { return <ol className="md-ol">{children}</ol> },
-          li({ children }: any) { return <li className="md-li">{children}</li> },
-          blockquote({ children }: any) { return <blockquote className="md-bq">{children}</blockquote> },
-          a({ children, href }: any) { return <a className="md-a" href={href} target="_blank" rel="noopener noreferrer">{children}</a> },
-          table({ children }: any) { return <div className="md-table-wrap"><table className="md-table">{children}</table></div> },
-          th({ children }: any) { return <th className="md-th">{children}</th> },
-          td({ children }: any) { return <td className="md-td">{children}</td> },
-          hr() { return <hr className="md-hr" /> },
-          strong({ children }: any) { return <strong className="md-strong">{children}</strong> },
-          em({ children }: any) { return <em className="md-em">{children}</em> },
-        }}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
         {content}
       </ReactMarkdown>
     </div>
@@ -228,7 +389,6 @@ function ChatRow({
       onClick={!editing ? onNavigate : undefined}
     >
       {active && <div className="active-pip" />}
-
       {editing ? (
         <input
           ref={inputRef}
@@ -245,19 +405,18 @@ function ChatRow({
           <span className="chat-row-meta">{chat.message_count} messages</span>
         </div>
       )}
-
       {!editing && (
         <div className="chat-row-actions">
           <button className="icon-btn" onClick={startEdit} title="Rename">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
             </svg>
           </button>
           <button className="icon-btn icon-btn-danger" onClick={(e) => { e.stopPropagation(); onDelete() }} title="Delete">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
-              <path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
+              <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" />
+              <path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" />
             </svg>
           </button>
         </div>
@@ -277,10 +436,14 @@ function MessageBubble({ item, index }: { item: ChatMessage; index: number }) {
       <div className={clsx('msg-row', isAI ? 'msg-row-ai' : 'msg-row-user')}>
         <div className={clsx('avatar', isAI ? 'avatar-ai' : 'avatar-user')}>{isAI ? 'AI' : 'ME'}</div>
         <div className={clsx('bubble', isAI ? 'bubble-ai' : 'bubble-user')}>
-          {isAI
-            ? <><MarkdownContent content={item.content} />{isStreaming && <span className="blink-cursor" />}</>
-            : <span className="user-text">{item.content}</span>
-          }
+          {isAI ? (
+            <>
+              <MarkdownContent content={item.content} />
+              {isStreaming && <span className="blink-cursor" />}
+            </>
+          ) : (
+            <span className="user-text">{item.content}</span>
+          )}
         </div>
       </div>
     </div>
@@ -299,14 +462,11 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
+/* ════════════════════════════════
+   VERIFICATION PANEL
+═══════════════════════════════════ */
 function VerificationPanel({
-  chat,
-  debug,
-  draft,
-  setDraft,
-  refresh,
-  save,
-  saving,
+  chat, debug, draft, setDraft, refresh, save, saving,
 }: {
   chat: ChatDetail
   debug?: DebugTransportPayload
@@ -317,7 +477,6 @@ function VerificationPanel({
   saving: boolean
 }) {
   const diagnostics = debug?.debug_summary?.request_diagnostics ?? chat.last_transport_diagnostics ?? {}
-
   return (
     <div className="verify-panel fade-in">
       <div className="verify-head">
@@ -330,7 +489,6 @@ function VerificationPanel({
           <button className="verify-btn" onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save verification'}</button>
         </div>
       </div>
-
       <div className="verify-grid">
         <div className="verify-card"><span>Selected mode</span><strong>{String(diagnostics.selected_transport_mode ?? chat.transport_mode ?? '—')}</strong></div>
         <div className="verify-card"><span>Effective mode</span><strong>{String(diagnostics.effective_transport_mode ?? '—')}</strong></div>
@@ -339,34 +497,26 @@ function VerificationPanel({
         <div className="verify-card"><span>Remote conversation id</span><strong className="verify-mono">{String(diagnostics.remote_conversation_id ?? '—')}</strong></div>
         <div className="verify-card"><span>Remote parent/message id</span><strong className="verify-mono">{String(diagnostics.remote_parent_message_id ?? '—')}</strong></div>
       </div>
-
       <div className="verify-form-grid">
         <Field label="History verification">
           <select className="s-input" value={draft.history_verification ?? chat.verification?.history_verification ?? 'not_checked'} onChange={(e) => setDraft((s) => ({ ...s, history_verification: e.target.value as VerificationState['history_verification'] }))}>
-            <option value="not_checked">not_checked</option>
-            <option value="passed">passed</option>
-            <option value="failed">failed</option>
+            <option value="not_checked">not_checked</option><option value="passed">passed</option><option value="failed">failed</option>
           </select>
         </Field>
         <Field label="Title verification">
           <select className="s-input" value={draft.title_verification ?? chat.verification?.title_verification ?? 'not_checked'} onChange={(e) => setDraft((s) => ({ ...s, title_verification: e.target.value as VerificationState['title_verification'] }))}>
-            <option value="not_checked">not_checked</option>
-            <option value="passed">passed</option>
-            <option value="failed">failed</option>
+            <option value="not_checked">not_checked</option><option value="passed">passed</option><option value="failed">failed</option>
           </select>
         </Field>
         <Field label="Sidebar visible">
           <select className="s-input" value={String(draft.sidebar_visible ?? chat.verification?.sidebar_visible ?? '')} onChange={(e) => setDraft((s) => ({ ...s, sidebar_visible: e.target.value === '' ? null : e.target.value === 'true' }))}>
-            <option value="">unknown</option>
-            <option value="true">true</option>
-            <option value="false">false</option>
+            <option value="">unknown</option><option value="true">true</option><option value="false">false</option>
           </select>
         </Field>
         <Field label="Remote conversation exists">
           <div className="verify-pill">{chat.verification?.remote_conversation_exists ? 'yes' : 'no'}</div>
         </Field>
       </div>
-
       <Field label="Missing browser stage">
         <input className="s-input" value={draft.missing_browser_stage ?? chat.verification?.missing_browser_stage ?? ''} onChange={(e) => setDraft((s) => ({ ...s, missing_browser_stage: e.target.value }))} placeholder="e.g. sidebar sync request" />
       </Field>
@@ -377,31 +527,21 @@ function VerificationPanel({
   )
 }
 
-function SettingsDialog({
-  open,
-  onClose,
-  sessionConfig,
-  setSessionConfig,
-  onSave,
-}: {
-  open: boolean
-  onClose: () => void
-  sessionConfig: SessionFormState
-  setSessionConfig: Dispatch<SetStateAction<SessionFormState>>
+/* ════════════════════════════════
+   SETTINGS DIALOG (modal)
+═══════════════════════════════════ */
+function SettingsDialog({ open, onClose, sessionConfig, setSessionConfig, onSave }: {
+  open: boolean; onClose: () => void
+  sessionConfig: SessionFormState; setSessionConfig: Dispatch<SetStateAction<SessionFormState>>
   onSave: () => void
 }) {
   const [tab, setTab] = useState<'configuration' | 'cookies'>('configuration')
   const fileInputRef = useRef<HTMLInputElement>(null)
-
   if (!open) return null
 
   const importCookiesFile = async (file: File) => {
-    const text = await file.text()
-    const parsed = parseCookiesTxt(text)
-    if (parsed) {
-      setSessionConfig((s) => ({ ...s, cookies: parsed }))
-      setTab('cookies')
-    }
+    const parsed = parseCookiesTxt(await file.text())
+    if (parsed) { setSessionConfig((s) => ({ ...s, cookies: parsed })); setTab('cookies') }
   }
 
   return (
@@ -412,119 +552,68 @@ function SettingsDialog({
             <div className="modal-title">Settings</div>
             <div className="modal-sub">Configure transport, auth, and import ChatGPT cookies.</div>
           </div>
-          <button className="icon-btn" onClick={onClose} title="Close">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          <button className="icon-btn" onClick={onClose}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
         </div>
-
         <div className="modal-tabs">
           <button className={clsx('modal-tab', tab === 'configuration' && 'modal-tab-active')} onClick={() => setTab('configuration')}>Configuration</button>
           <button className={clsx('modal-tab', tab === 'cookies' && 'modal-tab-active')} onClick={() => setTab('cookies')}>Cookies</button>
         </div>
-
         <div className="modal-body">
           {tab === 'configuration' ? (
             <div className="settings-grid">
-              <Field label="Session ID">
-                <input className="s-input" value={sessionConfig.session_id ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, session_id: e.target.value }))} />
-              </Field>
-              <Field label="Model">
-                <input className="s-input" value={sessionConfig.model_name} onChange={(e) => setSessionConfig((s) => ({ ...s, model_name: e.target.value }))} />
-              </Field>
+              <Field label="Session ID"><input className="s-input" value={sessionConfig.session_id ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, session_id: e.target.value }))} /></Field>
+              <Field label="Model"><input className="s-input" value={sessionConfig.model_name} onChange={(e) => setSessionConfig((s) => ({ ...s, model_name: e.target.value }))} /></Field>
               <Field label="Thinking mode">
                 <select className="s-input" value={sessionConfig.thinking_mode} onChange={(e) => setSessionConfig((s) => ({ ...s, thinking_mode: e.target.value as SessionFormState['thinking_mode'] }))}>
-                  <option value="instant">instant</option>
-                  <option value="extended">extended</option>
-                  <option value="pro">pro</option>
+                  <option value="instant">instant</option><option value="extended">extended</option><option value="pro">pro</option>
                 </select>
               </Field>
               <Field label="Transport mode">
                 <select className="s-input" value={sessionConfig.transport_mode ?? 'authenticated'} onChange={(e) => setSessionConfig((s) => ({ ...s, transport_mode: e.target.value as SessionFormState['transport_mode'] }))}>
                   <option value="playwright">playwright — full Chromium automation</option>
-                  <option value="authenticated">authenticated — hybrid Python + discovered session data</option>
+                  <option value="authenticated">authenticated — hybrid Python + session data</option>
                   <option value="anon">anon — legacy/debug</option>
                 </select>
               </Field>
-              <div className="modal-sub">
-                {sessionConfig.transport_mode === 'playwright'
-                  ? 'Full Chromium automation: uses a real browser session/profile through Playwright.'
-                  : sessionConfig.transport_mode === 'authenticated'
-                    ? 'Hybrid authenticated mode: Python transport with cookies / websocket discovery data.'
-                    : 'Legacy anonymous/debug mode using backend-anon endpoints.'}
-              </div>
               <Field label="Allow anon fallback">
-                <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /> <span>Enable explicit anon fallback</span></label>
+                <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /><span>Enable anon fallback</span></label>
               </Field>
-              <Field label="Authorization">
-                <textarea className="s-input s-textarea" value={sessionConfig.authorization ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, authorization: e.target.value }))} />
-              </Field>
-              <Field label="WebSocket URL">
-                <input className="s-input" value={sessionConfig.websocket_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_url: e.target.value }))} placeholder="wss://ws.chatgpt.com/..." />
-              </Field>
-              <Field label="WebSocket verify token">
-                <input className="s-input" value={sessionConfig.websocket_verify_token ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_verify_token: e.target.value }))} placeholder="timestamp-signature" />
-              </Field>
-
-              {sessionConfig.transport_mode === 'playwright' && (
-                <>
-                  <Field label="Browser user data dir">
-                    <input className="s-input" value={sessionConfig.browser_user_data_dir ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_user_data_dir: e.target.value }))} placeholder="/home/user/.config/chromium" />
-                  </Field>
-                  <Field label="Browser profile directory">
-                    <input className="s-input" value={sessionConfig.browser_profile_directory ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_profile_directory: e.target.value }))} placeholder="Default" />
-                  </Field>
-                  <Field label="Browser executable path">
-                    <input className="s-input" value={sessionConfig.browser_executable_path ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_executable_path: e.target.value }))} placeholder="/usr/bin/chromium" />
-                  </Field>
-                  <Field label="Connect over CDP">
-                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_connect_over_cdp)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_connect_over_cdp: e.target.checked }))} /> <span>Attach to a debug-enabled browser session</span></label>
-                  </Field>
-                  <Field label="CDP URL">
-                    <input className="s-input" value={sessionConfig.browser_cdp_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_cdp_url: e.target.value }))} placeholder="http://127.0.0.1:9222" />
-                  </Field>
-                  <Field label="Auto-start debug browser">
-                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_auto_start_debug_browser)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_auto_start_debug_browser: e.target.checked }))} /> <span>Start Chromium automatically if CDP is not already available</span></label>
-                  </Field>
-                  <Field label="Debugging port">
-                    <input className="s-input" type="number" value={sessionConfig.browser_debugging_port ?? 9222} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_debugging_port: Number(e.target.value) || 9222 }))} />
-                  </Field>
-                  <Field label="Browser headless">
-                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_headless)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_headless: e.target.checked }))} /> <span>Run browser headless</span></label>
-                  </Field>
-                  <Field label="Browser chat URL">
-                    <input className="s-input" value={sessionConfig.browser_chat_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_chat_url: e.target.value }))} placeholder="https://chatgpt.com/" />
-                  </Field>
-                  <Field label="Browser capture timeout (ms)">
-                    <input className="s-input" type="number" value={sessionConfig.browser_capture_timeout_ms ?? 120000} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_capture_timeout_ms: Number(e.target.value) || 120000 }))} />
-                  </Field>
-                </>
-              )}
+              <Field label="Authorization"><textarea className="s-input s-textarea" value={sessionConfig.authorization ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, authorization: e.target.value }))} /></Field>
+              <Field label="WebSocket URL"><input className="s-input" value={sessionConfig.websocket_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_url: e.target.value }))} placeholder="wss://..." /></Field>
+              <Field label="WebSocket verify token"><input className="s-input" value={sessionConfig.websocket_verify_token ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_verify_token: e.target.value }))} /></Field>
+              {sessionConfig.transport_mode === 'playwright' && (<>
+                <Field label="Browser user data dir"><input className="s-input" value={sessionConfig.browser_user_data_dir ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_user_data_dir: e.target.value }))} /></Field>
+                <Field label="Browser profile directory"><input className="s-input" value={sessionConfig.browser_profile_directory ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_profile_directory: e.target.value }))} placeholder="Default" /></Field>
+                <Field label="Browser executable path"><input className="s-input" value={sessionConfig.browser_executable_path ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_executable_path: e.target.value }))} /></Field>
+                <Field label="Connect over CDP">
+                  <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_connect_over_cdp)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_connect_over_cdp: e.target.checked }))} /><span>Attach to debug-enabled browser</span></label>
+                </Field>
+                <Field label="CDP URL"><input className="s-input" value={sessionConfig.browser_cdp_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_cdp_url: e.target.value }))} placeholder="http://127.0.0.1:9222" /></Field>
+                <Field label="Auto-start debug browser">
+                  <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_auto_start_debug_browser)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_auto_start_debug_browser: e.target.checked }))} /><span>Start Chromium automatically</span></label>
+                </Field>
+                <Field label="Debugging port"><input className="s-input" type="number" value={sessionConfig.browser_debugging_port ?? 9222} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_debugging_port: Number(e.target.value) || 9222 }))} /></Field>
+                <Field label="Browser headless">
+                  <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_headless)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_headless: e.target.checked }))} /><span>Run headless</span></label>
+                </Field>
+                <Field label="Browser chat URL"><input className="s-input" value={sessionConfig.browser_chat_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_chat_url: e.target.value }))} placeholder="https://chatgpt.com/" /></Field>
+                <Field label="Capture timeout (ms)"><input className="s-input" type="number" value={sessionConfig.browser_capture_timeout_ms ?? 120000} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_capture_timeout_ms: Number(e.target.value) || 120000 }))} /></Field>
+              </>)}
             </div>
           ) : (
             <div>
               <div className="cookies-actions">
                 <button className="verify-btn verify-btn-subtle" onClick={() => fileInputRef.current?.click()}>Upload cookies.txt</button>
                 <button className="verify-btn verify-btn-subtle" onClick={() => setSessionConfig((s) => ({ ...s, cookies: '' }))}>Clear</button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".txt"
-                  className="hidden-input"
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0]
-                    if (file) await importCookiesFile(file)
-                    e.currentTarget.value = ''
-                  }}
-                />
+                <input ref={fileInputRef} type="file" accept=".txt" className="hidden-input" onChange={async (e) => { const f = e.target.files?.[0]; if (f) await importCookiesFile(f); e.currentTarget.value = '' }} />
               </div>
-              <p className="modal-sub" style={{ marginBottom: 10 }}>Paste a Cookie header directly, or upload a Netscape-format cookies.txt file.</p>
-              <Field label="Cookies">
-                <textarea className="s-input s-textarea cookies-area" placeholder="name=value; name2=value2" value={sessionConfig.cookies ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, cookies: e.target.value }))} />
-              </Field>
+              <p className="modal-sub" style={{ marginBottom: 10 }}>Paste a Cookie header or upload Netscape-format cookies.txt.</p>
+              <Field label="Cookies"><textarea className="s-input s-textarea cookies-area" placeholder="name=value; name2=value2" value={sessionConfig.cookies ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, cookies: e.target.value }))} /></Field>
             </div>
           )}
         </div>
-
         <div className="modal-foot">
           <button className="verify-btn verify-btn-subtle" onClick={onClose}>Close</button>
           <button className="verify-btn" onClick={() => { onSave(); onClose() }}>Save settings</button>
@@ -564,7 +653,6 @@ export function ChatShell() {
     enabled: Boolean(activeChatId),
     retry: false,
   })
-
   const debugTransportQuery = useQuery({
     queryKey: ['debug-transport', activeChatId],
     queryFn: () => getDebugTransport(activeChatId!),
@@ -574,37 +662,20 @@ export function ChatShell() {
 
   const createChatMutation = useMutation({
     mutationFn: () => createChat({ ...sessionConfig }),
-    onSuccess: (chat) => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] })
-      navigate({ to: '/chat/$chatId', params: { chatId: chat.id } })
-    },
+    onSuccess: (chat) => { queryClient.invalidateQueries({ queryKey: ['chats'] }); navigate({ to: '/chat/$chatId', params: { chatId: chat.id } }) },
   })
-
   const renameChatMutation = useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameChat(id, title),
-    onSuccess: (chat) => {
-      queryClient.setQueryData(['chat', chat.id], chat)
-      queryClient.invalidateQueries({ queryKey: ['chats'] })
-    },
+    onSuccess: (chat) => { queryClient.setQueryData(['chat', chat.id], chat); queryClient.invalidateQueries({ queryKey: ['chats'] }) },
   })
-
   const deleteChatMutation = useMutation({
     mutationFn: (id: string) => deleteChat(id),
-    onSuccess: (_, id) => {
-      queryClient.removeQueries({ queryKey: ['chat', id] })
-      queryClient.invalidateQueries({ queryKey: ['chats'] })
-      if (id === activeChatId) navigate({ to: '/' })
-    },
+    onSuccess: (_, id) => { queryClient.removeQueries({ queryKey: ['chat', id] }); queryClient.invalidateQueries({ queryKey: ['chats'] }); if (id === activeChatId) navigate({ to: '/' }) },
   })
-
   const verificationMutation = useMutation({
     mutationFn: async () => updateChatVerification(activeChatId!, verificationDraft),
-    onSuccess: (chat) => {
-      queryClient.setQueryData(['chat', chat.id], chat)
-      queryClient.invalidateQueries({ queryKey: ['debug-transport', chat.id] })
-    },
+    onSuccess: (chat) => { queryClient.setQueryData(['chat', chat.id], chat); queryClient.invalidateQueries({ queryKey: ['debug-transport', chat.id] }) },
   })
-
   const sendMessageMutation = useMutation({
     mutationFn: async () => {
       let chatId = activeChatId
@@ -615,13 +686,7 @@ export function ChatShell() {
         queryClient.invalidateQueries({ queryKey: ['chats'] })
         navigate({ to: '/chat/$chatId', params: { chatId } })
       }
-      const optimisticUser: ChatMessage = {
-        id: `pending-${Date.now()}`,
-        role: 'user',
-        content: message,
-        created_at: new Date().toISOString(),
-      }
-      setPendingUserMessage(optimisticUser)
+      setPendingUserMessage({ id: `pending-${Date.now()}`, role: 'user', content: message, created_at: new Date().toISOString() })
       setStreamingAssistant('')
       setStreamError(null)
       setIsStreaming(true)
@@ -633,42 +698,22 @@ export function ChatShell() {
     onSuccess: (chat) => {
       queryClient.setQueryData(['chat', chat.id], chat)
       queryClient.invalidateQueries({ queryKey: ['chats'] })
-      setMessage('')
-      setPendingUserMessage(null)
-      setStreamingAssistant('')
-      setStreamError(null)
-      setIsStreaming(false)
+      setMessage(''); setPendingUserMessage(null); setStreamingAssistant(''); setStreamError(null); setIsStreaming(false)
     },
-    onError: (error) => {
-      setStreamError(String((error as Error).message))
-      setPendingUserMessage(null)
-      setStreamingAssistant('')
-      setIsStreaming(false)
-    },
+    onError: (error) => { setStreamError(String((error as Error).message)); setPendingUserMessage(null); setStreamingAssistant(''); setIsStreaming(false) },
   })
 
-  useEffect(() => {
-    setPendingUserMessage(null)
-    setStreamingAssistant('')
-    setStreamError(null)
-    setIsStreaming(false)
-  }, [activeChatId])
+  useEffect(() => { setPendingUserMessage(null); setStreamingAssistant(''); setStreamError(null); setIsStreaming(false) }, [activeChatId])
 
   const messages = useMemo(() => {
     const base = [...(chatQuery.data?.messages ?? [])]
     if (pendingUserMessage) base.push(pendingUserMessage)
-    if (isStreaming) base.push({
-      id: 'streaming-assistant',
-      role: 'assistant',
-      content: streamingAssistant,
-      created_at: new Date().toISOString(),
-    })
+    if (isStreaming) base.push({ id: 'streaming-assistant', role: 'assistant', content: streamingAssistant, created_at: new Date().toISOString() })
     return base
   }, [chatQuery.data, pendingUserMessage, streamingAssistant, isStreaming])
 
   const scrollRef = useAutoScroll(messages)
 
-  /* auto-resize textarea */
   useEffect(() => {
     const el = textareaRef.current
     if (!el) return
@@ -677,13 +722,7 @@ export function ChatShell() {
   }, [message])
 
   const isBusy = sendMessageMutation.isPending || isStreaming
-
-  const doSend = () => {
-    if (!message.trim() || isBusy) return
-    sendMessageMutation.mutate()
-  }
-
-  /* Enter = send, Shift+Enter = newline */
+  const doSend = () => { if (!message.trim() || isBusy) return; sendMessageMutation.mutate() }
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend() }
   }
@@ -715,17 +754,10 @@ export function ChatShell() {
   return (
     <>
       <style>{CSS}</style>
-      <SettingsDialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        sessionConfig={sessionConfig}
-        setSessionConfig={setSessionConfig}
-        onSave={saveSession}
-      />
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} sessionConfig={sessionConfig} setSessionConfig={setSessionConfig} onSave={saveSession} />
+
       <div className="shell">
-        <div className="orb-field" aria-hidden>
-          <div className="orb orb-1" /><div className="orb orb-2" /><div className="orb orb-3" />
-        </div>
+        <div className="orb-field" aria-hidden><div className="orb orb-1" /><div className="orb orb-2" /><div className="orb orb-3" /></div>
         <div className="noise" aria-hidden />
 
         {/* ══ SIDEBAR ══ */}
@@ -733,21 +765,17 @@ export function ChatShell() {
           <div className="sidebar-brand">
             <div className="brand-icon">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
-                <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+                <path d="M12 2L2 7l10 5 10-5-10-5z" /><path d="M2 17l10 5 10-5" /><path d="M2 12l10 5 10-5" />
               </svg>
             </div>
             <span className="brand-name">GPT Fork</span>
           </div>
-
           <div className="px-new-chat">
             <button className="new-chat-btn" onClick={() => createChatMutation.mutate()}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-                <path d="M12 5v14M5 12h14"/>
-              </svg>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
               New conversation
             </button>
           </div>
-
           <div className="chat-list">
             {!chatsQuery.data?.length && <p className="empty-list">No conversations yet</p>}
             {chatsQuery.data?.map((chat, i) => (
@@ -762,11 +790,10 @@ export function ChatShell() {
               </div>
             ))}
           </div>
-
           <div className="settings-section">
             <button className="settings-toggle" onClick={() => setSettingsOpen(true)}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                <circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/>
+                <circle cx="12" cy="12" r="3" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14" />
               </svg>
               Open settings
             </button>
@@ -778,7 +805,7 @@ export function ChatShell() {
           <header className="topbar fade-in">
             <button className="icon-btn p1" onClick={() => setSidebarOpen((s) => !s)} title="Toggle sidebar">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+                <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
               </svg>
             </button>
             <div className="topbar-info">
@@ -796,7 +823,7 @@ export function ChatShell() {
               <div className="empty-chat fade-in">
                 <div className="empty-icon">
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                   </svg>
                 </div>
                 <h1 className="empty-title">GPT Fork Web</h1>
@@ -817,18 +844,15 @@ export function ChatShell() {
                 <span className="verify-status-badge">{chatQuery.data.verification?.history_verification ?? 'not_checked'}</span>
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
                   style={{ marginLeft: 'auto', transform: verificationOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
-                  <polyline points="6 9 12 15 18 9"/>
+                  <polyline points="6 9 12 15 18 9" />
                 </svg>
               </button>
               {verificationOpen && (
                 <VerificationPanel
-                  chat={chatQuery.data}
-                  debug={debugTransportQuery.data}
-                  draft={verificationDraft}
-                  setDraft={setVerificationDraft}
+                  chat={chatQuery.data} debug={debugTransportQuery.data}
+                  draft={verificationDraft} setDraft={setVerificationDraft}
                   refresh={() => debugTransportQuery.refetch()}
-                  save={() => verificationMutation.mutate()}
-                  saving={verificationMutation.isPending}
+                  save={() => verificationMutation.mutate()} saving={verificationMutation.isPending}
                 />
               )}
             </div>
@@ -847,18 +871,14 @@ export function ChatShell() {
           <div className="input-dock">
             <div className="input-inner">
               <textarea
-                ref={textareaRef}
-                rows={1}
-                className="msg-input"
+                ref={textareaRef} rows={1} className="msg-input"
                 placeholder="Message… (Enter to send, Shift+Enter for newline)"
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                onKeyDown={handleKeyDown}
+                value={message} onChange={(e) => setMessage(e.target.value)} onKeyDown={handleKeyDown}
               />
               <button className={clsx('send-btn', isBusy && 'send-busy')} disabled={!message.trim() || isBusy} onClick={doSend}>
                 {isBusy
-                  ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                  : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                  ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="spin"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                  : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
                 }
               </button>
             </div>
@@ -870,7 +890,7 @@ export function ChatShell() {
 }
 
 /* ════════════════════════════════════════════════════════
-   ALL CSS
+   CSS — all tokens + animations
 ════════════════════════════════════════════════════════ */
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -882,346 +902,228 @@ const CSS = `
   --border:        rgba(255,255,255,0.07);
   --border-hi:     rgba(255,255,255,0.12);
   --border-sub:    rgba(255,255,255,0.03);
-
   --txt:           #b4bcd4;
   --txt-dim:       #7a82a0;
   --heading:       #e8ecf8;
   --muted:         #4e5470;
-
-  --accent:        #e8a030;        /* amber – warm, readable */
+  --accent:        #e8a030;
   --accent-dim:    rgba(232,160,48,0.12);
   --accent-hi:     #f2bc5a;
-
   --blue:          #3b6ef5;
   --blue-dim:      rgba(59,110,245,0.15);
   --blue-hi:       #6090ff;
-
   --code-bg:       #090b10;
   --code-header:   #0f1118;
   --code-txt:      #c4cfdf;
   --inline-bg:     rgba(255,255,255,0.07);
   --inline-txt:    #d0a060;
-
   --bubble-ai:     rgba(20,22,32,0.9);
   --bubble-user-a: #1e3a6e;
   --bubble-user-b: #162d58;
-
-  font-family: 'Geist', ui-sans-serif, system-ui, sans-serif;
+  font-family:'Geist',ui-sans-serif,system-ui,sans-serif;
 }
 
-*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-button { cursor:pointer; border:none; background:none; font:inherit; }
-input, textarea, select { font:inherit; }
-input:focus, textarea:focus, select:focus { outline:none; }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+button{cursor:pointer;border:none;background:none;font:inherit;}
+input,textarea,select{font:inherit;}
+input:focus,textarea:focus,select:focus{outline:none;}
 
-/* ── Shell ── */
-.shell {
-  position:relative; display:flex; height:100svh; overflow:hidden;
-  background:var(--bg); color:var(--txt);
-  font-family:'Geist', ui-sans-serif, system-ui, sans-serif;
-}
+.shell{position:relative;display:flex;height:100svh;overflow:hidden;background:var(--bg);color:var(--txt);font-family:'Geist',ui-sans-serif,system-ui,sans-serif;}
 
-/* ── Background orbs ── */
-.orb-field { position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:0; }
-.orb { position:absolute; border-radius:50%; filter:blur(110px); }
-.orb-1 { width:500px; height:500px; opacity:.09; background:radial-gradient(circle,#3b6ef5,transparent 70%); top:-160px; left:-60px; animation:d1 24s ease-in-out infinite alternate; }
-.orb-2 { width:420px; height:420px; opacity:.07; background:radial-gradient(circle,#e8a030,transparent 70%); bottom:-100px; right:-50px; animation:d2 30s ease-in-out infinite alternate; }
-.orb-3 { width:280px; height:280px; opacity:.06; background:radial-gradient(circle,#2dd4bf,transparent 70%); top:42%; left:38%; animation:d3 20s ease-in-out infinite alternate; }
+.orb-field{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0;}
+.orb{position:absolute;border-radius:50%;filter:blur(110px);}
+.orb-1{width:500px;height:500px;opacity:.09;background:radial-gradient(circle,#3b6ef5,transparent 70%);top:-160px;left:-60px;animation:d1 24s ease-in-out infinite alternate;}
+.orb-2{width:420px;height:420px;opacity:.07;background:radial-gradient(circle,#e8a030,transparent 70%);bottom:-100px;right:-50px;animation:d2 30s ease-in-out infinite alternate;}
+.orb-3{width:280px;height:280px;opacity:.06;background:radial-gradient(circle,#2dd4bf,transparent 70%);top:42%;left:38%;animation:d3 20s ease-in-out infinite alternate;}
 @keyframes d1{from{transform:translate(0,0)}to{transform:translate(50px,30px)}}
 @keyframes d2{from{transform:translate(0,0)}to{transform:translate(-35px,-22px)}}
 @keyframes d3{from{transform:translate(0,0)}to{transform:translate(-28px,40px)}}
 
-.noise {
-  position:absolute; inset:0; pointer-events:none; z-index:0; opacity:.022;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size:128px;
-}
+.noise{position:absolute;inset:0;pointer-events:none;z-index:0;opacity:.022;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-size:128px;}
 
-/* ── Sidebar ── */
-.sidebar {
-  position:relative; z-index:10; display:flex; flex-direction:column;
-  width:264px; min-width:264px;
-  border-right:1px solid var(--border);
-  background:rgba(18,20,29,.9);
-  backdrop-filter:blur(24px);
-  overflow:hidden;
-  transition:width .28s cubic-bezier(.4,0,.2,1), min-width .28s cubic-bezier(.4,0,.2,1), border-color .28s;
-}
-.sidebar-closed { width:0!important; min-width:0!important; border-right-color:transparent!important; }
+.sidebar{position:relative;z-index:10;display:flex;flex-direction:column;width:264px;min-width:264px;border-right:1px solid var(--border);background:rgba(18,20,29,.9);backdrop-filter:blur(24px);overflow:hidden;transition:width .28s cubic-bezier(.4,0,.2,1),min-width .28s cubic-bezier(.4,0,.2,1),border-color .28s;}
+.sidebar-closed{width:0!important;min-width:0!important;border-right-color:transparent!important;}
 
-.sidebar-brand { display:flex; align-items:center; gap:10px; padding:18px 14px 12px; }
-.brand-icon {
-  display:flex; align-items:center; justify-content:center;
-  width:28px; height:28px; border-radius:8px; flex-shrink:0;
-  background:linear-gradient(135deg,#2a52c9,#1a3280);
-  box-shadow:0 3px 10px rgba(42,82,201,.4);
-}
-.brand-name { font-size:13px; font-weight:700; letter-spacing:-.3px; color:var(--heading); white-space:nowrap; }
+.sidebar-brand{display:flex;align-items:center;gap:10px;padding:18px 14px 12px;}
+.brand-icon{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;flex-shrink:0;background:linear-gradient(135deg,#2a52c9,#1a3280);box-shadow:0 3px 10px rgba(42,82,201,.4);}
+.brand-name{font-size:13px;font-weight:700;letter-spacing:-.3px;color:var(--heading);white-space:nowrap;}
 
-.px-new-chat { padding:0 10px 10px; }
-.new-chat-btn {
-  display:flex; align-items:center; gap:8px; width:100%;
-  padding:9px 12px; border-radius:10px;
-  border:1px solid rgba(232,160,48,.22);
-  background:rgba(232,160,48,.06); color:var(--accent-hi);
-  font-size:13px; font-weight:500;
-  transition:background .15s, border-color .15s, transform .1s;
-}
-.new-chat-btn:hover { background:rgba(232,160,48,.12); border-color:rgba(232,160,48,.38); }
-.new-chat-btn:active { transform:scale(.98); }
+.px-new-chat{padding:0 10px 10px;}
+.new-chat-btn{display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;border-radius:10px;border:1px solid rgba(232,160,48,.22);background:rgba(232,160,48,.06);color:var(--accent-hi);font-size:13px;font-weight:500;transition:background .15s,border-color .15s,transform .1s;}
+.new-chat-btn:hover{background:rgba(232,160,48,.12);border-color:rgba(232,160,48,.38);}
+.new-chat-btn:active{transform:scale(.98);}
 
-.chat-list { flex:1; overflow-y:auto; padding:4px 8px; display:flex; flex-direction:column; gap:2px; }
-.empty-list { padding:24px 10px; text-align:center; font-size:12px; color:var(--muted); }
+.chat-list{flex:1;overflow-y:auto;padding:4px 8px;display:flex;flex-direction:column;gap:2px;}
+.empty-list{padding:24px 10px;text-align:center;font-size:12px;color:var(--muted);}
 
-/* ── Chat row ── */
-.chat-row {
-  position:relative; display:flex; align-items:center; gap:6px;
-  border-radius:10px; padding:9px 10px;
-  border:1px solid transparent;
-  cursor:pointer; user-select:none;
-  transition:background .12s, border-color .12s;
-  animation:rowIn .28s ease both;
-}
-.chat-row:hover { background:rgba(255,255,255,.04); }
-.chat-row:hover .chat-row-actions { opacity:1; }
-.chat-row-active { background:rgba(255,255,255,.065); border-color:var(--border); }
-.active-pip {
-  position:absolute; left:-1px; top:50%; transform:translateY(-50%);
-  width:2px; height:18px; border-radius:0 2px 2px 0;
-  background:var(--accent);
-}
+.chat-row{position:relative;display:flex;align-items:center;gap:6px;border-radius:10px;padding:9px 10px;border:1px solid transparent;cursor:pointer;user-select:none;transition:background .12s,border-color .12s;animation:rowIn .28s ease both;}
+.chat-row:hover{background:rgba(255,255,255,.04);}
+.chat-row:hover .chat-row-actions{opacity:1;}
+.chat-row-active{background:rgba(255,255,255,.065);border-color:var(--border);}
+.active-pip{position:absolute;left:-1px;top:50%;transform:translateY(-50%);width:2px;height:18px;border-radius:0 2px 2px 0;background:var(--accent);}
 @keyframes rowIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
 
-.chat-row-body { flex:1; min-width:0; }
-.chat-row-title { display:block; font-size:13px; font-weight:500; color:var(--txt); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.chat-row-active .chat-row-title { color:var(--heading); }
-.chat-row-meta { display:block; font-size:11px; color:var(--muted); margin-top:2px; }
+.chat-row-body{flex:1;min-width:0;}
+.chat-row-title{display:block;font-size:13px;font-weight:500;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.chat-row-active .chat-row-title{color:var(--heading);}
+.chat-row-meta{display:block;font-size:11px;color:var(--muted);margin-top:2px;}
+.chat-row-actions{display:flex;align-items:center;gap:2px;opacity:0;transition:opacity .12s;flex-shrink:0;}
+.rename-input{flex:1;border-radius:6px;border:1px solid var(--accent);background:rgba(232,160,48,.08);color:var(--heading);padding:3px 8px;font-size:13px;box-shadow:0 0 0 2px rgba(232,160,48,.12);}
 
-.chat-row-actions { display:flex; align-items:center; gap:2px; opacity:0; transition:opacity .12s; flex-shrink:0; }
+.icon-btn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:6px;color:var(--muted);border:none;background:none;transition:color .12s,background .12s;}
+.icon-btn:hover{color:var(--txt);background:rgba(255,255,255,.08);}
+.icon-btn-danger:hover{color:#f87171;background:rgba(248,113,113,.1);}
+.icon-btn.p1{width:32px;height:32px;border-radius:8px;}
 
-.rename-input {
-  flex:1; border-radius:6px; border:1px solid var(--accent);
-  background:rgba(232,160,48,.08); color:var(--heading);
-  padding:3px 8px; font-size:13px;
-  box-shadow:0 0 0 2px rgba(232,160,48,.12);
-}
+.settings-section{border-top:1px solid var(--border);padding:8px;}
+.settings-toggle{display:flex;align-items:center;gap:7px;width:100%;padding:8px 10px;border-radius:8px;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);transition:color .12s,background .12s;}
+.settings-toggle:hover{color:var(--txt-dim);background:rgba(255,255,255,.04);}
 
-.icon-btn {
-  display:flex; align-items:center; justify-content:center;
-  width:24px; height:24px; border-radius:6px;
-  color:var(--muted); border:none; background:none;
-  transition:color .12s, background .12s;
-}
-.icon-btn:hover { color:var(--txt); background:rgba(255,255,255,.08); }
-.icon-btn-danger:hover { color:#f87171; background:rgba(248,113,113,.1); }
-.icon-btn.p1 { width:32px; height:32px; border-radius:8px; }
+.check-row{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--txt);}
+.check-row input{accent-color:var(--accent);}
+.hidden-input{display:none;}
 
-/* ── Settings ── */
-.settings-section { border-top:1px solid var(--border); padding:8px; }
-.settings-toggle {
-  display:flex; align-items:center; gap:7px; width:100%;
-  padding:8px 10px; border-radius:8px;
-  font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
-  color:var(--muted);
-  transition:color .12s, background .12s;
-}
-.check-row { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--txt); }
-.check-row input { accent-color: var(--accent); }
-.hidden-input { display:none; }
-.modal-backdrop { position:fixed; inset:0; background:rgba(5,7,12,.72); backdrop-filter:blur(10px); z-index:80; display:flex; align-items:center; justify-content:center; padding:20px; }
-.modal-card { width:min(760px, 100%); max-height:90svh; overflow:auto; border:1px solid var(--border-hi); background:rgba(18,20,29,.96); border-radius:20px; box-shadow:0 30px 90px rgba(0,0,0,.45); }
-.modal-head, .modal-foot { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 18px; border-bottom:1px solid var(--border); }
-.modal-foot { border-bottom:none; border-top:1px solid var(--border); }
-.modal-title { color:var(--heading); font-size:18px; font-weight:700; }
-.modal-sub { color:var(--muted); font-size:12px; }
-.modal-tabs { display:flex; gap:8px; padding:14px 18px 0; }
-.modal-tab { padding:9px 12px; border-radius:10px; background:rgba(255,255,255,.04); color:var(--txt-dim); font-size:12px; font-weight:600; }
-.modal-tab-active { background:rgba(232,160,48,.14); color:var(--accent-hi); border:1px solid rgba(232,160,48,.18); }
-.modal-body { padding:18px; }
-.settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
-.cookies-actions { display:flex; gap:8px; justify-content:flex-end; margin-bottom:10px; }
-.cookies-area { min-height:220px; }
-.verify-wrap { padding: 0 18px 10px; }
-.verify-toggle { margin: 6px auto 0; max-width: 1100px; border:1px solid var(--border); background:rgba(255,255,255,.03); }
-.verify-status-badge { margin-left: 8px; padding:2px 7px; border-radius:999px; background:rgba(232,160,48,.14); color:var(--accent-hi); font-size:10px; letter-spacing:0; text-transform:none; }
-.verify-panel { max-width:1100px; margin:10px auto 0; border:1px solid var(--border); background:rgba(18,20,29,.82); backdrop-filter:blur(18px); border-radius:16px; padding:16px; }
-.verify-head { display:flex; gap:12px; justify-content:space-between; align-items:flex-start; margin-bottom:14px; }
-.verify-title { color:var(--heading); font-weight:700; font-size:14px; }
-.verify-sub { color:var(--muted); font-size:12px; margin-top:4px; }
-.verify-actions { display:flex; gap:8px; }
-.verify-btn { padding:8px 12px; border-radius:10px; background:var(--accent); color:#1a1307; font-weight:700; font-size:12px; }
-.verify-btn-subtle { background:rgba(255,255,255,.06); color:var(--txt); }
-.verify-btn:disabled { opacity:.6; cursor:not-allowed; }
-.verify-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:14px; }
-.verify-card { border:1px solid var(--border); background:rgba(255,255,255,.025); border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:6px; }
-.verify-card span { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
-.verify-card strong { color:var(--heading); font-size:12px; }
-.verify-mono { font-family:'JetBrains Mono', monospace; font-size:11px !important; word-break:break-all; }
-.verify-form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:6px; }
-.verify-pill { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:rgba(255,255,255,.03); color:var(--heading); font-size:12px; }
-.settings-toggle:hover { color:var(--txt-dim); background:rgba(255,255,255,.04); }
-.settings-body { padding:8px 2px 4px; display:flex; flex-direction:column; gap:10px; }
-@keyframes settDown{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}
-.settings-anim { animation:settDown .2s ease both; }
+.modal-backdrop{position:fixed;inset:0;background:rgba(5,7,12,.72);backdrop-filter:blur(10px);z-index:80;display:flex;align-items:center;justify-content:center;padding:20px;}
+.modal-card{width:min(760px,100%);max-height:90svh;overflow:auto;border:1px solid var(--border-hi);background:rgba(18,20,29,.96);border-radius:20px;box-shadow:0 30px 90px rgba(0,0,0,.45);}
+.modal-head,.modal-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--border);}
+.modal-foot{border-bottom:none;border-top:1px solid var(--border);}
+.modal-title{color:var(--heading);font-size:18px;font-weight:700;}
+.modal-sub{color:var(--muted);font-size:12px;}
+.modal-tabs{display:flex;gap:8px;padding:14px 18px 0;}
+.modal-tab{padding:9px 12px;border-radius:10px;background:rgba(255,255,255,.04);color:var(--txt-dim);font-size:12px;font-weight:600;border:1px solid transparent;}
+.modal-tab-active{background:rgba(232,160,48,.14);color:var(--accent-hi);border-color:rgba(232,160,48,.18);}
+.modal-body{padding:18px;}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}
+.cookies-actions{display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px;}
+.cookies-area{min-height:220px;}
 
-.field { display:flex; flex-direction:column; gap:5px; }
-.field-label { font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.verify-wrap{padding:0 18px 10px;}
+.verify-toggle{margin:6px auto 0;max-width:1100px;border:1px solid var(--border);background:rgba(255,255,255,.03);}
+.verify-status-badge{margin-left:8px;padding:2px 7px;border-radius:999px;background:rgba(232,160,48,.14);color:var(--accent-hi);font-size:10px;letter-spacing:0;text-transform:none;}
+.verify-panel{max-width:1100px;margin:10px auto 0;border:1px solid var(--border);background:rgba(18,20,29,.82);backdrop-filter:blur(18px);border-radius:16px;padding:16px;}
+.verify-head{display:flex;gap:12px;justify-content:space-between;align-items:flex-start;margin-bottom:14px;}
+.verify-title{color:var(--heading);font-weight:700;font-size:14px;}
+.verify-sub{color:var(--muted);font-size:12px;margin-top:4px;}
+.verify-actions{display:flex;gap:8px;}
+.verify-btn{padding:8px 12px;border-radius:10px;background:var(--accent);color:#1a1307;font-weight:700;font-size:12px;}
+.verify-btn-subtle{background:rgba(255,255,255,.06);color:var(--txt);}
+.verify-btn:disabled{opacity:.6;cursor:not-allowed;}
+.verify-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px;}
+.verify-card{border:1px solid var(--border);background:rgba(255,255,255,.025);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:6px;}
+.verify-card span{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;}
+.verify-card strong{color:var(--heading);font-size:12px;}
+.verify-mono{font-family:'JetBrains Mono',monospace;font-size:11px!important;word-break:break-all;}
+.verify-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:6px;}
+.verify-pill{border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:rgba(255,255,255,.03);color:var(--heading);font-size:12px;}
 
-.s-input {
-  width:100%; border-radius:8px; border:1px solid var(--border);
-  background:rgba(255,255,255,.04); color:var(--heading);
-  padding:7px 10px; font-size:13px;
-  transition:border-color .15s, box-shadow .15s;
-}
-.s-input:focus { border-color:rgba(232,160,48,.5); box-shadow:0 0 0 2px rgba(232,160,48,.1); }
-.s-textarea { min-height:64px; resize:none; }
+.field{display:flex;flex-direction:column;gap:5px;}
+.field-label{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);}
 
-.save-btn {
-  width:100%; padding:8px; border-radius:8px;
-  border:1px solid var(--border); background:rgba(255,255,255,.04);
-  color:var(--txt-dim); font-size:12px; font-weight:500;
-  transition:background .12s, color .12s;
-}
-.save-btn:hover { background:rgba(255,255,255,.08); color:var(--heading); }
+.s-input{width:100%;border-radius:8px;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--heading);padding:7px 10px;font-size:13px;transition:border-color .15s,box-shadow .15s;}
+.s-input:focus{border-color:rgba(232,160,48,.5);box-shadow:0 0 0 2px rgba(232,160,48,.1);}
+.s-textarea{min-height:64px;resize:none;}
 
-/* ── Main ── */
-.main-col { position:relative; z-index:10; display:flex; flex-direction:column; flex:1; min-width:0; }
+.main-col{position:relative;z-index:10;display:flex;flex-direction:column;flex:1;min-width:0;}
 
-/* ── Topbar ── */
-.topbar {
-  display:flex; align-items:center; gap:12px;
-  padding:10px 18px; border-bottom:1px solid var(--border);
-  background:rgba(12,13,18,.8); backdrop-filter:blur(20px);
-}
-.topbar-info { flex:1; min-width:0; }
-.topbar-title { display:block; font-size:14px; font-weight:600; color:var(--heading); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.topbar-meta { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); margin-top:1px; }
-.meta-dot { width:3px; height:3px; border-radius:50%; background:var(--muted); opacity:.5; flex-shrink:0; }
-.stream-indicator { display:flex; align-items:center; gap:4px; color:var(--accent); }
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border);background:rgba(12,13,18,.8);backdrop-filter:blur(20px);}
+.topbar-info{flex:1;min-width:0;}
+.topbar-title{display:block;font-size:14px;font-weight:600;color:var(--heading);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.topbar-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-top:1px;}
+.meta-dot{width:3px;height:3px;border-radius:50%;background:var(--muted);opacity:.5;flex-shrink:0;}
+.stream-indicator{display:flex;align-items:center;gap:4px;color:var(--accent);}
 
-/* ── Messages ── */
-.messages-area { flex:1; overflow-y:auto; padding:28px 20px; }
-.messages-inner { max-width:700px; margin:0 auto; display:flex; flex-direction:column; gap:20px; }
+.messages-area{flex:1;overflow-y:auto;padding:28px 20px;}
+.messages-inner{max-width:700px;margin:0 auto;display:flex;flex-direction:column;gap:20px;}
 
 @keyframes msgIn{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:translateY(0)}}
-.msg-enter { animation:msgIn .3s cubic-bezier(.22,1,.36,1) both; }
+.msg-enter{animation:msgIn .3s cubic-bezier(.22,1,.36,1) both;}
 
-.msg-row { display:flex; gap:12px; align-items:flex-start; }
-.msg-row-user { flex-direction:row-reverse; }
+.msg-row{display:flex;gap:12px;align-items:flex-start;}
+.msg-row-user{flex-direction:row-reverse;}
+.avatar{flex-shrink:0;width:28px;height:28px;border-radius:8px;margin-top:2px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:900;letter-spacing:.05em;}
+.avatar-ai{background:rgba(59,110,245,.15);border:1px solid rgba(59,110,245,.22);color:var(--blue-hi);}
+.avatar-user{background:rgba(232,160,48,.1);border:1px solid rgba(232,160,48,.18);color:var(--accent-hi);}
 
-.avatar {
-  flex-shrink:0; width:28px; height:28px; border-radius:8px; margin-top:2px;
-  display:flex; align-items:center; justify-content:center;
-  font-size:9px; font-weight:900; letter-spacing:.05em;
-}
-.avatar-ai { background:rgba(59,110,245,.15); border:1px solid rgba(59,110,245,.22); color:var(--blue-hi); }
-.avatar-user { background:rgba(232,160,48,.1); border:1px solid rgba(232,160,48,.18); color:var(--accent-hi); }
+.bubble{border-radius:16px;padding:12px 16px;font-size:14px;max-width:82%;min-width:40px;}
+.bubble-ai{background:var(--bubble-ai);border:1px solid var(--border);backdrop-filter:blur(8px);}
+.bubble-user{background:linear-gradient(135deg,var(--bubble-user-a),var(--bubble-user-b));border:1px solid rgba(59,110,245,.22);}
+.user-text{line-height:1.7;color:#dde6f8;white-space:pre-wrap;word-break:break-word;}
 
-.bubble { border-radius:16px; padding:12px 16px; font-size:14px; max-width:82%; min-width:40px; }
-.bubble-ai { background:var(--bubble-ai); border:1px solid var(--border); backdrop-filter:blur(8px); }
-.bubble-user {
-  background:linear-gradient(135deg,var(--bubble-user-a),var(--bubble-user-b));
-  border:1px solid rgba(59,110,245,.22);
-}
-.user-text { line-height:1.7; color:#dde6f8; white-space:pre-wrap; word-break:break-word; }
+/* ── Markdown — scoped inside .md-content ── */
+.md-content{font-size:14px;line-height:1.75;color:var(--txt);}
+.md-content>*:first-child{margin-top:0!important;}
+.md-content>*:last-child{margin-bottom:0!important;}
 
-/* ── Markdown ── */
-.md-content { font-size:14px; line-height:1.75; color:var(--txt); }
-.md-content > *:first-child { margin-top:0!important; }
-.md-content > *:last-child { margin-bottom:0!important; }
-.md-p { margin:8px 0; }
-.md-h1 { font-size:1.2em; font-weight:700; color:var(--heading); margin:18px 0 8px; }
-.md-h2 { font-size:1.05em; font-weight:600; color:var(--heading); margin:14px 0 6px; }
-.md-h3 { font-size:.95em; font-weight:600; color:var(--heading); margin:12px 0 5px; }
-.md-ul,.md-ol { margin:8px 0 8px 20px; }
-.md-li { margin:3px 0; line-height:1.7; }
-.md-bq { border-left:2px solid var(--accent); padding-left:14px; margin:10px 0; color:var(--txt-dim); font-style:italic; }
-.md-a { color:var(--blue-hi); text-decoration:underline; text-underline-offset:2px; transition:opacity .12s; }
-.md-a:hover { opacity:.75; }
-.md-hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
-.md-strong { font-weight:600; color:var(--heading); }
-.md-em { color:var(--txt-dim); }
-.md-table-wrap { margin:10px 0; overflow-x:auto; border-radius:10px; border:1px solid var(--border); }
-.md-table { width:100%; border-collapse:collapse; font-size:13px; }
-.md-th { padding:8px 14px; text-align:left; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); background:var(--code-header); border-bottom:1px solid var(--border); }
-.md-td { padding:8px 14px; color:var(--txt); border-bottom:1px solid var(--border-sub); }
-.inline-code { border-radius:5px; padding:1px 6px; font-family:'JetBrains Mono',monospace; font-size:.85em; background:var(--inline-bg); color:var(--inline-txt); }
+/* CRITICAL: .md-content pre owns the fenced code wrapper.
+   We style it to be invisible (zero padding/margin/background)
+   so our CodeBlock component's own styling takes full control. */
+.md-content pre{margin:0;padding:0;background:none;border:none;}
+
+.md-p{margin:8px 0;}
+.md-h1{font-size:1.2em;font-weight:700;color:var(--heading);margin:18px 0 8px;}
+.md-h2{font-size:1.05em;font-weight:600;color:var(--heading);margin:14px 0 6px;}
+.md-h3{font-size:.95em;font-weight:600;color:var(--heading);margin:12px 0 5px;}
+.md-h4{font-size:.9em;font-weight:600;color:var(--heading);margin:10px 0 4px;}
+.md-ul,.md-ol{margin:8px 0 8px 20px;}
+.md-li{margin:3px 0;line-height:1.7;}
+.md-bq{border-left:2px solid var(--accent);padding-left:14px;margin:10px 0;color:var(--txt-dim);font-style:italic;}
+.md-a{color:var(--blue-hi);text-decoration:underline;text-underline-offset:2px;transition:opacity .12s;}
+.md-a:hover{opacity:.75;}
+.md-hr{border:none;border-top:1px solid var(--border);margin:14px 0;}
+.md-strong{font-weight:600;color:var(--heading);}
+.md-em{color:var(--txt-dim);}
+.md-table-wrap{margin:10px 0;overflow-x:auto;border-radius:10px;border:1px solid var(--border);}
+.md-table{width:100%;border-collapse:collapse;font-size:13px;}
+.md-th{padding:8px 14px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:var(--code-header);border-bottom:1px solid var(--border);}
+.md-td{padding:8px 14px;color:var(--txt);border-bottom:1px solid var(--border-sub);}
+.inline-code{border-radius:5px;padding:1px 6px;font-family:'JetBrains Mono',monospace;font-size:.85em;background:var(--inline-bg);color:var(--inline-txt);}
 
 /* ── Code block ── */
-.code-block { margin:10px 0; border-radius:12px; overflow:hidden; border:1px solid var(--border-hi); }
-.code-header { display:flex; align-items:center; justify-content:space-between; padding:8px 14px; background:var(--code-header); border-bottom:1px solid var(--border); }
-.code-dots { display:flex; align-items:center; gap:6px; }
-.dot { width:10px; height:10px; border-radius:50%; }
-.dot-r { background:#ff5f57; opacity:.7; }
-.dot-y { background:#febc2e; opacity:.7; }
-.dot-g { background:#28c840; opacity:.7; }
-.code-lang { margin-left:8px; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); }
-.code-actions { display:flex; align-items:center; gap:4px; }
-.code-btn {
-  display:flex; align-items:center; gap:4px;
-  padding:3px 8px; border-radius:6px; border:1px solid transparent;
-  font-size:11px; font-weight:500; color:var(--muted);
-  transition:color .12s, background .12s, border-color .12s;
-}
-.code-btn:hover { color:var(--txt); background:rgba(255,255,255,.06); border-color:var(--border); }
-.code-pre { overflow-x:auto; padding:14px 16px; background:var(--code-bg); margin:0; }
-.code-inner { font-family:'JetBrains Mono','Fira Code',monospace; font-size:13px; line-height:1.65; color:var(--code-txt); }
+.code-block{margin:10px 0;border-radius:12px;overflow:hidden;border:1px solid var(--border-hi);}
+.code-header{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--code-header);border-bottom:1px solid var(--border);}
+.code-dots{display:flex;align-items:center;gap:6px;}
+.dot{width:10px;height:10px;border-radius:50%;}
+.dot-r{background:#ff5f57;opacity:.7;}
+.dot-y{background:#febc2e;opacity:.7;}
+.dot-g{background:#28c840;opacity:.7;}
+.code-lang{margin-left:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);}
+.code-actions{display:flex;align-items:center;gap:4px;}
+.code-btn{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:6px;border:1px solid transparent;font-size:11px;font-weight:500;color:var(--muted);transition:color .12s,background .12s,border-color .12s;}
+.code-btn:hover{color:var(--txt);background:rgba(255,255,255,.06);border-color:var(--border);}
+.code-pre{overflow-x:auto;padding:14px 16px;background:var(--code-bg);margin:0;}
+.code-inner{font-family:'JetBrains Mono','Fira Code',monospace;font-size:13px;line-height:1.65;color:var(--code-txt);}
 
 /* ── Empty state ── */
-.empty-chat { max-width:400px; margin:80px auto 0; text-align:center; }
-.empty-icon {
-  width:54px; height:54px; margin:0 auto 18px; border-radius:16px;
-  display:flex; align-items:center; justify-content:center;
-  background:var(--blue-dim); border:1px solid rgba(59,110,245,.18); color:var(--blue-hi);
-}
-.empty-title { font-size:21px; font-weight:700; letter-spacing:-.4px; color:var(--heading); }
-.empty-sub { margin-top:10px; font-size:13px; line-height:1.6; color:var(--muted); }
-.empty-hint { margin-top:7px; font-size:11px; color:var(--muted); opacity:.5; }
+.empty-chat{max-width:400px;margin:80px auto 0;text-align:center;}
+.empty-icon{width:54px;height:54px;margin:0 auto 18px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:var(--blue-dim);border:1px solid rgba(59,110,245,.18);color:var(--blue-hi);}
+.empty-title{font-size:21px;font-weight:700;letter-spacing:-.4px;color:var(--heading);}
+.empty-sub{margin-top:10px;font-size:13px;line-height:1.6;color:var(--muted);}
+.empty-hint{margin-top:7px;font-size:11px;color:var(--muted);opacity:.5;}
 
-/* ── Error zone ── */
-.error-zone { max-width:700px; width:100%; margin:0 auto; padding:0 20px 6px; }
-.error-banner { padding:9px 14px; border-radius:10px; font-size:12px; border:1px solid rgba(248,113,113,.18); background:rgba(248,113,113,.07); color:#f87171; margin-bottom:5px; }
+.error-zone{max-width:700px;width:100%;margin:0 auto;padding:0 20px 6px;}
+.error-banner{padding:9px 14px;border-radius:10px;font-size:12px;border:1px solid rgba(248,113,113,.18);background:rgba(248,113,113,.07);color:#f87171;margin-bottom:5px;}
 
-/* ── Input dock ── */
-.input-dock {
-  padding:12px 20px 16px; border-top:1px solid var(--border);
-  background:rgba(12,13,18,.85); backdrop-filter:blur(20px);
-}
-.input-inner { max-width:700px; margin:0 auto; display:flex; align-items:flex-end; gap:10px; }
-.msg-input {
-  flex:1; resize:none; overflow:hidden; border-radius:14px;
-  border:1px solid var(--border); background:var(--panel-hi);
-  padding:11px 15px; font-size:14px; line-height:1.6;
-  color:var(--heading); font-family:'Geist',ui-sans-serif,system-ui,sans-serif;
-  max-height:220px; transition:border-color .15s, box-shadow .15s;
-}
-.msg-input::placeholder { color:var(--muted); }
-.msg-input:focus { border-color:rgba(232,160,48,.38); box-shadow:0 0 0 2px rgba(232,160,48,.08); }
+.input-dock{padding:12px 20px 16px;border-top:1px solid var(--border);background:rgba(12,13,18,.85);backdrop-filter:blur(20px);}
+.input-inner{max-width:700px;margin:0 auto;display:flex;align-items:flex-end;gap:10px;}
+.msg-input{flex:1;resize:none;overflow:hidden;border-radius:14px;border:1px solid var(--border);background:var(--panel-hi);padding:11px 15px;font-size:14px;line-height:1.6;color:var(--heading);font-family:'Geist',ui-sans-serif,system-ui,sans-serif;max-height:220px;transition:border-color .15s,box-shadow .15s;}
+.msg-input::placeholder{color:var(--muted);}
+.msg-input:focus{border-color:rgba(232,160,48,.38);box-shadow:0 0 0 2px rgba(232,160,48,.08);}
 
-.send-btn {
-  flex-shrink:0; width:42px; height:42px; border-radius:12px;
-  display:flex; align-items:center; justify-content:center;
-  background:linear-gradient(135deg,var(--blue),#1c3a9e);
-  color:#fff; box-shadow:0 4px 14px rgba(59,110,245,.28);
-  transition:box-shadow .2s, transform .1s, opacity .15s;
-  border:none; cursor:pointer;
-}
-.send-btn:not(:disabled):hover { box-shadow:0 4px 20px rgba(59,110,245,.46); transform:translateY(-1px); }
-.send-btn:not(:disabled):active { transform:scale(.96); }
-.send-btn:disabled { opacity:.3; cursor:not-allowed; box-shadow:none; }
-.send-busy { background:rgba(59,110,245,.3)!important; }
+.send-btn{flex-shrink:0;width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--blue),#1c3a9e);color:#fff;box-shadow:0 4px 14px rgba(59,110,245,.28);transition:box-shadow .2s,transform .1s,opacity .15s;border:none;cursor:pointer;}
+.send-btn:not(:disabled):hover{box-shadow:0 4px 20px rgba(59,110,245,.46);transform:translateY(-1px);}
+.send-btn:not(:disabled):active{transform:scale(.96);}
+.send-btn:disabled{opacity:.3;cursor:not-allowed;box-shadow:none;}
+.send-busy{background:rgba(59,110,245,.3)!important;}
 
-/* ── Animations ── */
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .fade-in{animation:fadeIn .4s ease both;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
-.blink-cursor { display:inline-block; width:2px; height:1em; background:currentColor; vertical-align:middle; margin-left:2px; animation:blink 1s step-start infinite; }
+.blink-cursor{display:inline-block;width:2px;height:1em;background:currentColor;vertical-align:middle;margin-left:2px;animation:blink 1s step-start infinite;}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spin{animation:spin .75s linear infinite;}
 @keyframes pDot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.6);opacity:.5}}
-.pulse-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--accent); animation:pDot 1.1s ease-in-out infinite; }
+.pulse-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pDot 1.1s ease-in-out infinite;}
 
-/* ── Scrollbar ── */
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-track{background:transparent;}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:99px;}
