@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .client import ProxyNotImplementedError, complete_chat, list_models, stream_chat_completion
+from .client import complete_chat, list_models, stream_chat_completion
 from .config import settings
 from .models import ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, HealthResponse, ModelList
 from .streaming import chat_completions_stream
@@ -63,32 +63,25 @@ async def chat_completions(request: ChatRequest):
     if request.model not in model_ids:
         raise openai_error(f"Unknown model: {request.model}", 400, "model_not_found")
 
+    conversation_id = request.user.strip() if isinstance(request.user, str) and request.user.strip() else None
+    dumped_messages = [message.model_dump() for message in request.messages]
+
     if request.stream:
         async def event_stream():
-            try:
-                upstream = stream_chat_completion(
-                    model=request.model,
-                    messages=[message.model_dump() for message in request.messages],
-                )
-                async for item in chat_completions_stream(upstream, request.model):
-                    yield item
-            except ProxyNotImplementedError as exc:
-                error_payload = {
-                    "error": {
-                        "message": str(exc),
-                        "type": "server_error",
-                        "code": "not_implemented",
-                    }
-                }
-                yield f"data: {JSONResponse(content=error_payload).body.decode()}\n\n"
-                yield "data: [DONE]\n\n"
+            upstream = stream_chat_completion(
+                model=request.model,
+                messages=dumped_messages,
+                conversation_id=conversation_id,
+            )
+            async for item in chat_completions_stream(upstream, request.model):
+                yield item
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     try:
-        text = complete_chat(model=request.model, messages=[message.model_dump() for message in request.messages])
-    except ProxyNotImplementedError as exc:
-        raise openai_error(str(exc), 501, "not_implemented") from exc
+        text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id)
+    except ValueError as exc:
+        raise openai_error(str(exc), 400, "invalid_messages") from exc
 
     payload = ChatResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",

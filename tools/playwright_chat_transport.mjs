@@ -174,10 +174,30 @@ async function ensureComposerContext(page, targetUrl, newConversation) {
 async function sendPrompt(page, message, targetUrl, newConversation) {
   const composer = await ensureComposerContext(page, targetUrl, newConversation)
   emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
-  await composer.locator.click()
+
+  const activateComposer = async (locator) => {
+    await locator.scrollIntoViewIfNeeded().catch(() => {})
+    await locator.focus().catch(() => {})
+    await locator.click({ timeout: 1500 }).catch(async () => {
+      await locator.evaluate((node) => {
+        if (node && typeof node.focus === 'function') node.focus()
+      }).catch(() => {})
+    })
+  }
+
+  await activateComposer(composer.locator)
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
   await page.keyboard.press('Backspace').catch(() => {})
-  await page.keyboard.insertText(message)
+
+  if (composer.selector.includes('textarea')) {
+    await composer.locator.fill('').catch(() => {})
+    await composer.locator.fill(message).catch(async () => {
+      await page.keyboard.insertText(message)
+    })
+  } else {
+    await page.keyboard.insertText(message)
+  }
+
   let enteredText = ''
   try {
     enteredText = await composer.locator.inputValue()

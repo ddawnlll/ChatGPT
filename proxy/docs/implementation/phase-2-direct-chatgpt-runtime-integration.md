@@ -1,9 +1,9 @@
 # Phase 2 — Direct ChatGPT Runtime Integration
 
-**Status:** Planned
+**Status:** Complete
 **Owner:** Proxy/runtime integration track
 **Last updated:** 2026-05-03
-**Delivery status:** Not started
+**Delivery status:** Complete
 
 ---
 
@@ -42,16 +42,20 @@ This phase is where the proxy stops being just a shell and becomes functional.
 
 ## 4. Current Failure State / Known Blockers
 
-- There is no `proxy/app/client.py` that wraps `build_transport(...)`
-- There is no in-memory conversation state for OpenAI-style clients
-- There is no mapping from OpenAI message arrays to local conversation continuation
-- There is no direct streaming bridge from runtime chunks to OpenAI SSE
+Original blockers were:
+
+- there was no `proxy/app/client.py` that wrapped `build_transport(...)`
+- there was no in-memory conversation state for OpenAI-style clients
+- there was no mapping from OpenAI message arrays to local conversation continuation
+- there was no direct streaming bridge from runtime chunks to OpenAI SSE
+
+These are now resolved.
 
 ---
 
 ## 5. Workstream A — Runtime Client Wrapper
 
-**Status:** Planned
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -59,23 +63,23 @@ Create a dedicated proxy-side runtime client wrapper over `build_transport(...)`
 
 ### Implementation Tasks
 
-- [ ] Add a proxy-local `RuntimeClient` abstraction
-- [ ] Normalize session material inputs for the proxy
-- [ ] Build transports through `build_transport(...)`
-- [ ] Prefer `playwright` by default
-- [ ] Expose both non-streaming and streaming methods
+- [x] Add a proxy-local `RuntimeClient` abstraction
+- [x] Normalize session material inputs for the proxy
+- [x] Build transports through `build_transport(...)`
+- [x] Prefer `playwright` by default
+- [x] Expose both non-streaming and streaming methods
 
 ### Acceptance Criteria
 
-- [ ] proxy can create a transport from configured session material
-- [ ] proxy can send one message directly through runtime
-- [ ] proxy can stream one message directly through runtime
+- [x] proxy can create a transport from configured session material
+- [x] proxy can send one message directly through runtime
+- [x] proxy can stream one message directly through runtime
 
 ---
 
 ## 6. Workstream B — Conversation State Mapping
 
-**Status:** Planned
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -83,23 +87,23 @@ Map OpenAI-style request continuity to local runtime continuity.
 
 ### Implementation Tasks
 
-- [ ] Add in-memory conversation store
-- [ ] Track proxy conversation IDs / response IDs
-- [ ] Reuse transport/client instances when appropriate
-- [ ] Carry remote conversation IDs through runtime state
-- [ ] Define behavior for brand-new vs continuing chats
+- [x] Add in-memory conversation store
+- [x] Track proxy conversation IDs / response IDs
+- [x] Reuse transport/client instances when appropriate
+- [x] Carry remote conversation IDs through runtime state
+- [x] Define behavior for brand-new vs continuing chats
 
 ### Acceptance Criteria
 
-- [ ] repeated requests can continue the same local runtime state
-- [ ] new conversations do not accidentally reuse old runtime state
-- [ ] no cross-conversation leakage
+- [x] repeated requests can continue the same local runtime state
+- [x] new conversations do not accidentally reuse old runtime state
+- [x] no cross-conversation leakage
 
 ---
 
 ## 7. Workstream C — `/v1/chat/completions` Direct Execution
 
-**Status:** Planned
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -107,23 +111,23 @@ Make `POST /v1/chat/completions` execute directly against the runtime.
 
 ### Implementation Tasks
 
-- [ ] Extract latest actionable user prompt from request
-- [ ] decide whether this is a new or continuing conversation
-- [ ] invoke runtime non-streaming path when `stream=false`
-- [ ] invoke runtime streaming path when `stream=true`
-- [ ] return OpenAI-shaped response payloads
+- [x] Extract latest actionable user prompt from request
+- [x] decide whether this is a new or continuing conversation
+- [x] invoke runtime non-streaming path when `stream=false`
+- [x] invoke runtime streaming path when `stream=true`
+- [x] return OpenAI-shaped response payloads
 
 ### Acceptance Criteria
 
-- [ ] non-streaming chat completions work end-to-end
-- [ ] streaming chat completions work end-to-end
-- [ ] assistant text matches runtime output
+- [x] non-streaming chat completions work end-to-end
+- [x] streaming chat completions work end-to-end
+- [x] assistant text matches runtime output
 
 ---
 
 ## 8. Workstream D — Model / Config Mapping
 
-**Status:** Planned
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -131,24 +135,24 @@ Map proxy model identifiers to local runtime session material.
 
 ### Implementation Tasks
 
-- [ ] define initial static model aliases
-- [ ] map model IDs to:
+- [x] define initial static model aliases
+- [x] map model IDs to:
   - `transport_mode`
   - `thinking_mode`
   - `model_name`
-- [ ] define safe defaults for omitted fields
-- [ ] keep config explicit and documented
+- [x] define safe defaults for omitted fields
+- [x] keep config explicit and documented
 
 ### Acceptance Criteria
 
-- [ ] model IDs resolve deterministically
-- [ ] runtime receives the intended transport/thinking/model values
+- [x] model IDs resolve deterministically
+- [x] runtime receives the intended transport/thinking/model values
 
 ---
 
 ## 9. Workstream E — Session Material Strategy
 
-**Status:** Planned
+**Status:** Complete
 
 ### Problem / Goal
 
@@ -156,36 +160,66 @@ Decide how the proxy acquires auth/browser settings.
 
 ### Implementation Tasks
 
-- [ ] define config source for cookies/auth/browser profile fields
-- [ ] reuse existing session conventions from this repo where possible
-- [ ] decide whether proxy is single-user or keyed multi-profile in Phase 2
-- [ ] redact sensitive values in logs/debug output
+- [x] define config source for cookies/auth/browser profile fields
+- [x] reuse existing session conventions from this repo where possible
+- [x] decide whether proxy is single-user or keyed multi-profile in Phase 2
+- [x] redact sensitive values in logs/debug output
 
 ### Acceptance Criteria
 
-- [ ] proxy can start with usable runtime session material
-- [ ] secrets are not printed raw
+- [x] proxy can start with usable runtime session material
+- [x] secrets are not printed raw
 
 ---
 
 ## 10. Workstream F — Direct Runtime Tests
 
-**Status:** Planned
+**Status:** Complete
 
 ### Implementation Tasks
 
-- [ ] mock transport construction tests
-- [ ] chat completion response-shaping tests
-- [ ] streaming conversion tests against runtime chunk inputs
-- [ ] conversation reuse tests
+- [x] mock transport construction tests
+- [x] chat completion response-shaping tests
+- [x] streaming conversion tests against runtime chunk inputs
+- [x] conversation reuse tests
 
 ### Acceptance Criteria
 
-- [ ] runtime integration is covered without depending on live browser execution
+- [x] runtime integration is covered without depending on live browser execution
+
+### Validation Results
+
+- [x] `python3 -m py_compile proxy/app/*.py proxy/tests/*.py`
+- [x] `.venv-test/bin/pytest -q proxy/tests/test_proxy_phase1.py`
+- [x] Current result: `10 passed`
 
 ---
 
-## 11. Combined Implementation Order
+## 11. Live Runtime Smoke Validation
+
+**Status:** Complete
+
+### Goal
+
+Prove the proxy-side runtime path works against the real Playwright-backed browser transport, not only mocked transports.
+
+### Validation
+
+- [x] `node --check tools/playwright_chat_transport.mjs`
+- [x] `.venv/bin/python - <<'PY' ... RuntimeClient('chatgpt-playwright').complete_chat(...) ... PY`
+- [x] real response returned: `PROXY_SMOKE_OK`
+
+### Meaning
+
+This verifies that:
+
+- the proxy-side runtime client can build a real transport
+- the Playwright path can execute from the proxy integration boundary
+- the first live end-to-end path works beyond mocks
+
+---
+
+## 12. Combined Implementation Order
 
 1. Add runtime client wrapper
 2. Add conversation state mapping
@@ -197,41 +231,43 @@ Decide how the proxy acquires auth/browser settings.
 
 ### Acceptance Criteria for First Combined Run
 
-- [ ] one-shot non-streaming call works
-- [ ] one-shot streaming call works
-- [ ] continuing conversation works
-- [ ] new conversation isolation works
+- [x] one-shot non-streaming call works
+- [x] one-shot streaming call works
+- [x] continuing conversation works
+- [x] new conversation isolation works
 
 ---
 
-## 12. Definition of Done
+## 13. Definition of Done
 
-### 12.1 Runtime integration
+### 13.1 Runtime integration
 
-- [ ] proxy directly uses local runtime code
-- [ ] no `api_server.py` dependency exists in request execution path
+- [x] proxy directly uses local runtime code
+- [x] no `api_server.py` dependency exists in request execution path
 
-### 12.2 Conversation handling
+### 13.2 Conversation handling
 
-- [ ] new vs continuing conversation behavior is explicit
-- [ ] state reuse is deterministic
+- [x] new vs continuing conversation behavior is explicit
+- [x] state reuse is deterministic
 
-### 12.3 Compatibility
+### 13.3 Compatibility
 
-- [ ] `/v1/chat/completions` works for both streaming and non-streaming clients
+- [x] `/v1/chat/completions` works for both streaming and non-streaming clients
 
-### 12.4 Testing
+### 13.4 Testing
 
-- [ ] direct runtime integration tests exist
+- [x] direct runtime integration tests exist
+- [x] live runtime smoke validation has been performed
 
 ---
 
-## 13. What Phase 3 Inherits
+## 14. What Phase 3 Inherits
 
 Phase 3 inherits:
 
 - a working direct-runtime OpenAI-compatible proxy
 - basic model/config resolution
 - in-memory conversation continuity
+- validated first-pass live Playwright runtime execution
 
 Phase 3 focuses on pi compatibility validation and higher-level agent usage.
