@@ -235,6 +235,12 @@ async function extractAssistantText(locator) {
       }
       if (tag === 'code') {
         const code = el.innerText || el.textContent || ''
+        const className = el.className || ''
+        const langMatch = className.match(/language-([\w+-]+)/i)
+        const language = langMatch ? langMatch[1] : ''
+        if (language || code.includes('\n')) {
+          return code ? `\n\n\`\`\`${language ? language : ''}\n${code.trimEnd()}\n\`\`\`\n\n` : ''
+        }
         return code ? `\`${code}\`` : ''
       }
       if (tag === 'a') {
@@ -251,7 +257,7 @@ async function extractAssistantText(locator) {
       for (const child of el.childNodes) text += walk(child)
 
       if (['p', 'div', 'section', 'article', 'blockquote'].includes(tag)) {
-        return text.trim() ? `${text.trim()}\n\n` : ''
+        return text.trim() ? `${text.replace(/^\n+|\n+$/g, '')}\n\n` : ''
       }
       if (['li'].includes(tag)) {
         return text.trim() ? `- ${text.trim()}\n` : ''
@@ -474,6 +480,11 @@ async function openOrAttachBrowser(browser, targetUrl) {
   return { browserHandle: null, context, page, attachedViaCdp: false }
 }
 
+function buildConversationUrl(targetUrl, remoteConversationId) {
+  const base = new URL(targetUrl)
+  return `${base.origin}/c/${remoteConversationId}`
+}
+
 async function ensureChatPage(page, targetUrl) {
   const currentUrl = page.url()
   const alreadyOnChat = currentUrl.startsWith('https://chatgpt.com/') || currentUrl === 'https://chatgpt.com'
@@ -490,6 +501,21 @@ async function ensureChatPage(page, targetUrl) {
   await waitForChatShell(page, 5000)
 }
 
+async function ensureRemoteConversation(page, targetUrl, remoteConversationId) {
+  if (!remoteConversationId) return
+  const desiredUrl = buildConversationUrl(targetUrl, remoteConversationId)
+  const currentUrl = page.url().split(/[?#]/)[0]
+  if (currentUrl === desiredUrl) {
+    emit({ type: 'status', stage: 'reusing_matching_remote_conversation', remote_conversation_id: remoteConversationId, current_url: page.url() })
+    return
+  }
+  emit({ type: 'status', stage: 'switching_remote_conversation', remote_conversation_id: remoteConversationId, from_url: page.url(), target_url: desiredUrl })
+  await page.goto(desiredUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+  await page.waitForLoadState('domcontentloaded').catch(() => {})
+  await waitForNoChallenge(page, 10000)
+  await waitForChatShell(page, 5000)
+}
+
 async function main() {
   const request = await readStdinJson()
   const transport = request.transport || {}
@@ -499,6 +525,9 @@ async function main() {
   try {
     page.on('websocket', (ws) => emit({ type: 'status', stage: 'websocket_created', websocket_url: ws.url() }))
     await ensureChatPage(page, request.url || 'https://chatgpt.com/')
+    if (!request.new_conversation && request.remote_conversation_id) {
+      await ensureRemoteConversation(page, request.url || 'https://chatgpt.com/', request.remote_conversation_id)
+    }
     emit({ type: 'status', stage: 'page_loaded', url: page.url() })
     const ui = await detectLoggedInUi(page)
     emit({ type: 'status', stage: 'ui_detected', ui })

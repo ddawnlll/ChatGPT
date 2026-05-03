@@ -113,6 +113,7 @@ class PlaywrightTransport:
             "message": message,
             "image": image,
             "new_conversation": new_conversation,
+            "remote_conversation_id": self.data.get("conversation_id"),
             "url": self.session_material.get("browser_chat_url") or "https://chatgpt.com/",
             "capture_timeout_ms": self.session_material.get("browser_capture_timeout_ms", 120000),
             "transport": {
