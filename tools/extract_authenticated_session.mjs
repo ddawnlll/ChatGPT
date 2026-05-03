@@ -120,6 +120,25 @@ async function writeJson(path, payload) {
   await fs.writeFile(path, JSON.stringify(payload, null, 2) + '\n', 'utf8')
 }
 
+async function captureWebsocketUrl(context, discovered, targetUrl, timeoutMs) {
+  if (discovered.websocket_url) return
+  const probePage = await context.newPage()
+  probePage.on('websocket', (ws) => {
+    discovered.websocket_url = ws.url()
+    discovered.websocket_urls_seen.push(ws.url())
+    log(`probe_websocket_created url=${ws.url()}`)
+  })
+  try {
+    await probePage.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && !discovered.websocket_url) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+  } finally {
+    await probePage.close().catch(() => {})
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   const discovered = {
@@ -150,6 +169,11 @@ async function main() {
     await page.goto(options.url, { waitUntil: 'domcontentloaded' })
     discovered.ui = await detectUi(page)
     log(`ui_detected logged_in=${discovered.ui.loggedInLikely} title=${discovered.ui.title}`)
+
+    if (!discovered.websocket_url && discovered.ui.loggedInLikely) {
+      log('websocket_url_missing_after_initial_attach probing_new_page')
+      await captureWebsocketUrl(context, discovered, options.url, options.timeoutMs)
+    }
 
     const cookies = await context.cookies().catch(() => [])
     for (const cookie of cookies) {
