@@ -46,14 +46,49 @@ def _detect_browser_type(executable: str) -> str:
     return "chromium"
 
 
-def get_default_browser_user_data_dir() -> str:
+def _default_real_browser_user_data_dir(executable: str) -> str:
+    lower = executable.lower()
+
+    if sys.platform == "darwin":
+        home = Path.home()
+        if "brave" in lower:
+            return str((home / "Library/Application Support/BraveSoftware/Brave-Browser").resolve())
+        if "chrome" in lower:
+            return str((home / "Library/Application Support/Google/Chrome").resolve())
+        if "chromium" in lower:
+            return str((home / "Library/Application Support/Chromium").resolve())
+        if "firefox" in lower:
+            return str((home / "Library/Application Support/Firefox").resolve())
+    elif sys.platform == "win32":
+        if "brave" in lower:
+            return os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\User Data")
+        if "chrome" in lower:
+            return os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data")
+        if "chromium" in lower:
+            return os.path.expandvars(r"%LocalAppData%\Chromium\User Data")
+        if "firefox" in lower:
+            return os.path.expandvars(r"%AppData%\Mozilla\Firefox")
+    else:
+        home = Path.home()
+        if "brave" in lower:
+            return str((home / ".config/BraveSoftware/Brave-Browser").resolve())
+        if "chrome" in lower:
+            return str((home / ".config/google-chrome").resolve())
+        if "chromium" in lower:
+            return str((home / ".config/chromium").resolve())
+        if "firefox" in lower:
+            return str((home / ".mozilla/firefox").resolve())
+
     project_root = Path(__file__).parent.parent.parent
-    browser_type = _detect_browser_type(
-        os.environ.get("CHATGPT_PROXY_BROWSER_EXECUTABLE_PATH", _find_system_browser())
-    )
+    browser_type = _detect_browser_type(executable)
     profile_name = "firefox_profile" if browser_type == "firefox" else "browser_profile"
     local_profile = project_root / "data" / profile_name
     return str(local_profile.resolve())
+
+
+def get_default_browser_user_data_dir() -> str:
+    executable = os.environ.get("CHATGPT_PROXY_BROWSER_EXECUTABLE_PATH", _find_system_browser())
+    return _default_real_browser_user_data_dir(executable)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

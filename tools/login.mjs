@@ -1,18 +1,9 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
 import process from 'node:process'
-import path from 'node:path'
 import fs from 'node:fs'
-
-const projectRoot = new URL('..', import.meta.url).pathname
-
-// Detect system browser
-const BROWSER_CANDIDATES = [
-  { type: 'chromium', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
-  { type: 'chromium', path: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' },
-  { type: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
-  { type: 'firefox',  path: '/Applications/Firefox.app/Contents/MacOS/firefox' },
-]
+import path from 'node:path'
+import { getDefaultExecutablePath, getDefaultUserDataDir } from './paths.mjs'
 
 function findBrowser() {
   const envPath = process.env.CHATGPT_PROXY_BROWSER_EXECUTABLE_PATH
@@ -20,33 +11,39 @@ function findBrowser() {
     const type = envPath.toLowerCase().includes('firefox') ? 'firefox' : 'chromium'
     return { type, path: envPath }
   }
-  for (const candidate of BROWSER_CANDIDATES) {
-    if (fs.existsSync(candidate.path)) return candidate
+
+  const detected = getDefaultExecutablePath()
+  if (!detected) return null
+  return {
+    type: detected.toLowerCase().includes('firefox') ? 'firefox' : 'chromium',
+    path: detected,
   }
-  return null
 }
 
 const browser = findBrowser()
 if (!browser) {
-  console.error('No system browser found! Install Google Chrome, Brave, or Firefox.')
+  console.error('No system browser found! Install Google Chrome, Brave, Chromium, or Firefox.')
   process.exit(1)
 }
 
-const profileDir = browser.type === 'firefox'
-  ? path.join(projectRoot, 'data/firefox_profile')
-  : path.join(projectRoot, 'data/browser_profile')
+const profileDir = process.env.CHATGPT_PROXY_BROWSER_USER_DATA_DIR || getDefaultUserDataDir()
+const profileDirectory = process.env.CHATGPT_PROXY_BROWSER_PROFILE_DIRECTORY || 'Default'
 
 console.log(`Using system ${browser.type}: ${browser.path}`)
-console.log(`Profile: ${profileDir}`)
+console.log(`User data dir: ${profileDir}`)
+if (browser.type === 'chromium') {
+  console.log(`Profile directory: ${profileDirectory}`)
+}
 console.log('')
 console.log('  1. Log in to ChatGPT in the browser window')
 console.log('  2. Once you see the chat UI, close the browser window manually')
-console.log('  3. Your session will be saved automatically')
+console.log('  3. Your session will be reused by the proxy')
 console.log('')
 
 const args = browser.type === 'chromium'
   ? [
       `--user-data-dir=${profileDir}`,
+      `--profile-directory=${profileDirectory}`,
       '--password-store=basic',
       '--no-first-run',
       '--no-default-browser-check',
@@ -60,7 +57,7 @@ const args = browser.type === 'chromium'
 
 const child = spawn(browser.path, args, { stdio: 'inherit' })
 
-child.on('close', (code) => {
+child.on('close', () => {
   console.log(`\nBrowser closed. You can now run: make start-proxy`)
 })
 

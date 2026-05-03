@@ -55,8 +55,7 @@ function buildLaunchArgs(browser) {
     return []
   }
 
-  // Chromium args — essential flags to mimic a normal browser while allowing Playwright CDP over pipes
-  return [
+  const args = [
     `--user-data-dir=${browser.user_data_dir || ''}`,
     '--remote-debugging-pipe',
     '--password-store=basic',
@@ -66,6 +65,12 @@ function buildLaunchArgs(browser) {
     '--disable-blink-features=AutomationControlled',
     'about:blank'
   ]
+
+  if (browser.profile_directory) {
+    args.splice(1, 0, `--profile-directory=${browser.profile_directory}`)
+  }
+
+  return args
 }
 
 function resolveExecutablePath(browser) {
@@ -631,7 +636,9 @@ async function handleRequest(request) {
         type: 'status',
         stage: 'launching_persistent_context',
         browser_type: browserTypeName,
-        executable_path: launchOptions.executablePath || 'playwright-default'
+        executable_path: launchOptions.executablePath || 'playwright-default',
+        user_data_dir: browser.user_data_dir || null,
+        profile_directory: browser.profile_directory || null,
       })
 
       globalContext = await browserType.launchPersistentContext(browser.user_data_dir, launchOptions)
