@@ -168,18 +168,54 @@ async function sendPrompt(page, message, targetUrl) {
   emit({ type: 'status', stage: 'send_triggered' })
 }
 
-async function findLatestAssistantLocator(page) {
-  const selectors = [
-    '[data-message-author-role="assistant"] .markdown',
-    '[data-message-author-role="assistant"] [class*="markdown"]',
-    '[data-message-author-role="assistant"]',
-    '[data-testid="conversation-turn-assistant"] .markdown',
-    '[data-testid="conversation-turn-assistant"]',
-  ]
-  for (const selector of selectors) {
+const ASSISTANT_SELECTORS = [
+  '[data-message-author-role="assistant"] .markdown',
+  '[data-message-author-role="assistant"] [class*="markdown"]',
+  '[data-message-author-role="assistant"]',
+  '[data-testid="conversation-turn-assistant"] .markdown',
+  '[data-testid="conversation-turn-assistant"]',
+]
+
+async function getAssistantSnapshot(page) {
+  for (const selector of ASSISTANT_SELECTORS) {
     const locator = page.locator(selector)
     const count = await locator.count().catch(() => 0)
-    if (count > 0) return locator.nth(count - 1)
+    if (count > 0) {
+      const latest = locator.nth(count - 1)
+      const rawText = await latest.innerText().catch(() => '')
+      return { selector, count, rawText }
+    }
+  }
+  return { selector: null, count: 0, rawText: '' }
+}
+
+async function findLatestAssistantLocator(page, baseline = null) {
+  if (baseline?.selector) {
+    const baselineLocator = page.locator(baseline.selector)
+    const baselineCount = await baselineLocator.count().catch(() => 0)
+    if (baselineCount > 0) {
+      if (baselineCount > (baseline.count || 0)) {
+        return { locator: baselineLocator.nth(baselineCount - 1), selector: baseline.selector, count: baselineCount, isNewMessage: true }
+      }
+      const latest = baselineLocator.nth(baselineCount - 1)
+      const rawText = await latest.innerText().catch(() => '')
+      if (rawText !== (baseline.rawText || '')) {
+        return { locator: latest, selector: baseline.selector, count: baselineCount, isNewMessage: false }
+      }
+      return null
+    }
+  }
+
+  for (const selector of ASSISTANT_SELECTORS) {
+    const locator = page.locator(selector)
+    const count = await locator.count().catch(() => 0)
+    if (count <= 0) continue
+    const latest = locator.nth(count - 1)
+    const rawText = await latest.innerText().catch(() => '')
+    if (baseline && rawText === (baseline.rawText || '')) {
+      continue
+    }
+    return { locator: latest, selector, count, isNewMessage: Boolean(baseline) }
   }
   return null
 }
@@ -191,38 +227,58 @@ function normalizeAssistantText(text) {
     .trim()
 }
 
-function isPlaceholderOnly(text) {
+function isIgnorableAssistantText(text) {
   const normalized = normalizeAssistantText(text)
-  return !normalized || /^(thinking|analyzing|reasoning)\.?$/i.test(normalized)
+  return (
+    !normalized ||
+    /^(thinking|analyzing|reasoning)\.?$/i.test(normalized) ||
+    /^hello!?\s+what.?s on your mind today\??$/i.test(normalized) ||
+    /^ready when you are\.?$/i.test(normalized) ||
+    /^how can i help(?:,.*)?\??$/i.test(normalized)
+  )
 }
 
-async function streamAssistantText(page, timeoutMs) {
+function isPlaceholderOnly(text) {
+  return isIgnorableAssistantText(text)
+}
+
+async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
   const deadline = Date.now() + timeoutMs
   let lastRawText = ''
   let lastNormalizedText = ''
   let stableTicks = 0
   let observedAnyText = false
   while (Date.now() < deadline) {
-    const locator = await findLatestAssistantLocator(page)
-    const rawText = locator ? await locator.innerText().catch(() => '') : ''
+    const assistantState = await findLatestAssistantLocator(page, baselineAssistant)
+    const rawText = assistantState ? await assistantState.locator.innerText().catch(() => '') : ''
     const normalizedText = normalizeAssistantText(rawText)
     if (rawText && rawText !== lastRawText) {
       observedAnyText = true
-      const chunk = normalizedText.slice(lastNormalizedText.length)
+      const ignorable = isIgnorableAssistantText(rawText)
+      const chunk = ignorable ? '' : normalizedText.slice(lastNormalizedText.length)
       if (chunk) emit({ type: 'chunk', content: chunk })
       lastRawText = rawText
-      lastNormalizedText = normalizedText
+      lastNormalizedText = ignorable ? '' : normalizedText
       stableTicks = 0
-      emit({ type: 'status', stage: 'assistant_text_updated', raw_length: rawText.length, normalized_length: normalizedText.length })
+      emit({ type: 'status', stage: 'assistant_text_updated', raw_length: rawText.length, normalized_length: normalizedText.length, assistant_selector: assistantState?.selector ?? null, assistant_count: assistantState?.count ?? null, is_new_message: assistantState?.isNewMessage ?? null, ignorable })
     } else if (rawText && rawText === lastRawText) {
       stableTicks += 1
     }
 
     const stopButtonVisible = await page.locator('button[aria-label*="Stop" i]').first().isVisible().catch(() => false)
-    if (observedAnyText && stableTicks >= 4 && !stopButtonVisible && !isPlaceholderOnly(lastRawText)) {
-      return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
+    const composerVisible = await page.locator(COMPOSER_SELECTORS.join(', ')).first().isVisible().catch(() => false)
+    const sendButtonVisible = await page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first().isVisible().catch(() => false)
+    if (observedAnyText && !isPlaceholderOnly(lastRawText)) {
+      if (!stopButtonVisible && (composerVisible || sendButtonVisible) && stableTicks >= 1) {
+        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible })
+        return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
+      }
+      if (!stopButtonVisible && stableTicks >= 2) {
+        emit({ type: 'status', stage: 'assistant_completion_detected', stable_ticks: stableTicks, composer_visible: composerVisible, send_button_visible: sendButtonVisible })
+        return { text: lastNormalizedText, timedOut: false, placeholderOnly: false }
+      }
     }
-    await page.waitForTimeout(700)
+    await page.waitForTimeout(250)
   }
   return { text: lastNormalizedText, timedOut: true, placeholderOnly: isPlaceholderOnly(lastRawText) }
 }
@@ -318,11 +374,12 @@ async function main() {
       return
     }
 
-    emit({ type: 'status', stage: 'sending_prompt' })
+    const baselineAssistant = await getAssistantSnapshot(page)
+    emit({ type: 'status', stage: 'sending_prompt', baseline_assistant: baselineAssistant })
     await waitForConversationIdle(page, 2500)
     await sendPrompt(page, request.message, request.url || 'https://chatgpt.com/')
-    emit({ type: 'status', stage: 'awaiting_assistant_stream' })
-    const streamResult = await streamAssistantText(page, Number(request.capture_timeout_ms || 120000))
+    emit({ type: 'status', stage: 'awaiting_assistant_stream', baseline_assistant: baselineAssistant })
+    const streamResult = await streamAssistantText(page, Number(request.capture_timeout_ms || 120000), baselineAssistant)
     const text = streamResult.text
     const finalUi = await detectLoggedInUi(page)
     if (streamResult.timedOut) {

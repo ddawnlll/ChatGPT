@@ -2,7 +2,8 @@
   "scripts": {
     "discover:ws": "node tools/discover_authenticated_ws.mjs",
     "discover:session": "node tools/extract_authenticated_session.mjs",
-    "transport:playwright": "node tools/playwright_chat_transport.mjs"
+    "transport:playwright": "node tools/playwright_chat_transport.mjs",
+    "test:frontend:playwright": "node tools/test_frontend_playwright_streaming.mjs"
   },
   "dependencies": {
     "react-markdown": "^10.1.0",

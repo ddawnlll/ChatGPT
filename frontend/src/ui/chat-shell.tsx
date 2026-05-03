@@ -647,17 +647,24 @@ export function ChatShell() {
     },
   })
 
+  useEffect(() => {
+    setPendingUserMessage(null)
+    setStreamingAssistant('')
+    setStreamError(null)
+    setIsStreaming(false)
+  }, [activeChatId])
+
   const messages = useMemo(() => {
     const base = [...(chatQuery.data?.messages ?? [])]
     if (pendingUserMessage) base.push(pendingUserMessage)
-    if (streamingAssistant) base.push({
+    if (isStreaming) base.push({
       id: 'streaming-assistant',
       role: 'assistant',
       content: streamingAssistant,
       created_at: new Date().toISOString(),
     })
     return base
-  }, [chatQuery.data, pendingUserMessage, streamingAssistant])
+  }, [chatQuery.data, pendingUserMessage, streamingAssistant, isStreaming])
 
   const scrollRef = useAutoScroll(messages)
 

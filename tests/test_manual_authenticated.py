@@ -63,6 +63,7 @@ def test_select_authenticated_cookies_keeps_identity_and_session_cookies():
 
 def test_build_authenticated_client_uses_authenticated_transport(monkeypatch):
     monkeypatch.setattr(auth_manual, "extract_websocket_url_from_har", lambda path: "wss://ws.chatgpt.com/test")
+    monkeypatch.setattr(auth_manual, "load_json", lambda path="session.json": {} if path != "session.json" else {})
 
     captured = {}
 
