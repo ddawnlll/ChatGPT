@@ -23,8 +23,11 @@ class DummyChatGPT:
     def get_debug_summary(self):
         return {"request_diagnostics": {"selected_transport_mode": self.transport_mode}}
 
-    def ask_question(self, message):
-        return f"ok:{message}"
+    def send_message(self, message, image=None, *, new_conversation=True):
+        class Result:
+            text = f"ok:{message}"
+            transport_details = {"selected_transport_mode": self.transport_mode}
+        return Result()
 
 
 def test_parse_netscape_cookies_txt_filters_chatgpt_and_openai_domains(tmp_path):
@@ -59,8 +62,24 @@ def test_select_authenticated_cookies_keeps_identity_and_session_cookies():
 
 
 def test_build_authenticated_client_uses_authenticated_transport(monkeypatch):
-    monkeypatch.setattr(auth_manual, "ChatGPT", DummyChatGPT)
     monkeypatch.setattr(auth_manual, "extract_websocket_url_from_har", lambda path: "wss://ws.chatgpt.com/test")
+
+    captured = {}
+
+    def fake_build_transport(session_material):
+        captured.update(session_material)
+        return DummyChatGPT(
+            cookies=session_material.get("cookies"),
+            authorization=session_material.get("authorization"),
+            thinking_mode=session_material.get("thinking_mode", "instant"),
+            model_name=session_material.get("model_name", "auto"),
+            transport_mode=session_material.get("transport_mode", "authenticated"),
+            allow_anon_fallback=session_material.get("allow_anon_fallback", False),
+            websocket_url=session_material.get("websocket_url"),
+            websocket_verify_token=session_material.get("websocket_verify_token"),
+        )
+
+    monkeypatch.setattr(auth_manual, "build_transport", fake_build_transport)
 
     client = auth_manual.build_authenticated_client(
         {"thinking_mode": "extended", "model_name": "auto", "allow_anon_fallback": False},
@@ -71,6 +90,7 @@ def test_build_authenticated_client_uses_authenticated_transport(monkeypatch):
     assert client.transport_mode == "authenticated"
     assert client.cookies == {"oai-did": "did-123"}
     assert client.websocket_url == "wss://ws.chatgpt.com/test"
+    assert captured["transport_mode"] == "authenticated"
 
 
 def test_extract_websocket_url_from_har_returns_latest_socket(tmp_path):
@@ -89,13 +109,21 @@ def test_extract_websocket_url_from_har_returns_latest_socket(tmp_path):
 
 
 def test_build_authenticated_client_uses_discovery_file_when_session_lacks_websocket(monkeypatch, tmp_path):
-    monkeypatch.setattr(auth_manual, "ChatGPT", DummyChatGPT)
-
     discovery_file = tmp_path / "session.discovered.json"
     discovery_file.write_text(json.dumps({
         "websocket_url": "wss://ws.chatgpt.com/from-discovery",
         "resume_conversation_token": "resume-token",
     }), encoding="utf-8")
+
+    monkeypatch.setattr(
+        auth_manual,
+        "build_transport",
+        lambda session_material: DummyChatGPT(
+            cookies=session_material.get("cookies"),
+            websocket_url=session_material.get("websocket_url"),
+            websocket_verify_token=session_material.get("websocket_verify_token"),
+        ),
+    )
 
     client = auth_manual.build_authenticated_client(
         {"websocket_discovery_path": str(discovery_file)},
@@ -104,6 +132,63 @@ def test_build_authenticated_client_uses_discovery_file_when_session_lacks_webso
 
     assert client.websocket_url == "wss://ws.chatgpt.com/from-discovery"
     assert client.websocket_verify_token == "resume-token"
+
+
+def test_build_authenticated_client_supports_playwright_transport(monkeypatch):
+    captured = {}
+
+    def fake_build_transport(session_material):
+        captured.update(session_material)
+        return DummyChatGPT(transport_mode=session_material.get("transport_mode", "authenticated"))
+
+    monkeypatch.setattr(auth_manual, "build_transport", fake_build_transport)
+
+    client = auth_manual.build_authenticated_client(
+        {
+            "transport_mode": "playwright",
+            "browser_user_data_dir": "/tmp/chromium",
+            "browser_profile_directory": "Default",
+            "browser_executable_path": "/usr/bin/chromium",
+            "browser_connect_over_cdp": True,
+            "browser_cdp_url": "http://127.0.0.1:9222",
+            "browser_auto_start_debug_browser": True,
+            "browser_debugging_port": 9222,
+        },
+        {},
+    )
+
+    assert client.transport_mode == "playwright"
+    assert captured["browser_user_data_dir"] == "/tmp/chromium"
+    assert captured["browser_profile_directory"] == "Default"
+    assert captured["browser_connect_over_cdp"] is True
+    assert captured["browser_cdp_url"] == "http://127.0.0.1:9222"
+    assert captured["browser_auto_start_debug_browser"] is True
+    assert captured["browser_debugging_port"] == 9222
+
+
+def test_merge_browser_settings_fills_missing_session_fields(tmp_path):
+    browser_settings = tmp_path / "browser-settings.json"
+    browser_settings.write_text(json.dumps({
+        "browser_user_data_dir": "/tmp/chromium",
+        "browser_profile_directory": "Default",
+        "browser_connect_over_cdp": True,
+    }), encoding="utf-8")
+
+    merged = auth_manual.merge_browser_settings(
+        {"transport_mode": "playwright", "browser_profile_directory": ""},
+        str(browser_settings),
+    )
+
+    assert merged["browser_user_data_dir"] == "/tmp/chromium"
+    assert merged["browser_profile_directory"] == "Default"
+    assert merged["browser_connect_over_cdp"] is True
+
+
+def test_load_discovered_cookies_reads_cookie_map(tmp_path):
+    discovery_file = tmp_path / "session.discovered.json"
+    discovery_file.write_text(json.dumps({"cookies": {"oai-did": "did-123", "cf_clearance": "cf"}}), encoding="utf-8")
+
+    assert auth_manual.load_discovered_cookies(str(discovery_file)) == {"oai-did": "did-123", "cf_clearance": "cf"}
 
 
 def test_load_json_returns_empty_when_missing(tmp_path):

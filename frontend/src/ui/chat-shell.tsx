@@ -35,10 +35,21 @@ const defaultSessionConfig: SessionFormState = {
   authorization: '',
   thinking_mode: 'extended',
   model_name: 'auto',
-  transport_mode: 'authenticated',
+  transport_mode: 'playwright',
   allow_anon_fallback: false,
   websocket_url: '',
   websocket_verify_token: '',
+  browser_user_data_dir: '/home/erfolg/.config/chromium',
+  browser_profile_directory: 'Default',
+  browser_executable_path: '/usr/bin/chromium',
+  browser_channel: '',
+  browser_headless: false,
+  browser_chat_url: 'https://chatgpt.com/',
+  browser_capture_timeout_ms: 120000,
+  browser_connect_over_cdp: true,
+  browser_cdp_url: 'http://127.0.0.1:9222',
+  browser_auto_start_debug_browser: true,
+  browser_debugging_port: 9222,
 }
 
 function loadSessionConfig(): SessionFormState {
@@ -429,10 +440,18 @@ function SettingsDialog({
               </Field>
               <Field label="Transport mode">
                 <select className="s-input" value={sessionConfig.transport_mode ?? 'authenticated'} onChange={(e) => setSessionConfig((s) => ({ ...s, transport_mode: e.target.value as SessionFormState['transport_mode'] }))}>
-                  <option value="authenticated">authenticated</option>
-                  <option value="anon">anon</option>
+                  <option value="playwright">playwright — full Chromium automation</option>
+                  <option value="authenticated">authenticated — hybrid Python + discovered session data</option>
+                  <option value="anon">anon — legacy/debug</option>
                 </select>
               </Field>
+              <div className="modal-sub">
+                {sessionConfig.transport_mode === 'playwright'
+                  ? 'Full Chromium automation: uses a real browser session/profile through Playwright.'
+                  : sessionConfig.transport_mode === 'authenticated'
+                    ? 'Hybrid authenticated mode: Python transport with cookies / websocket discovery data.'
+                    : 'Legacy anonymous/debug mode using backend-anon endpoints.'}
+              </div>
               <Field label="Allow anon fallback">
                 <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.allow_anon_fallback)} onChange={(e) => setSessionConfig((s) => ({ ...s, allow_anon_fallback: e.target.checked }))} /> <span>Enable explicit anon fallback</span></label>
               </Field>
@@ -445,6 +464,41 @@ function SettingsDialog({
               <Field label="WebSocket verify token">
                 <input className="s-input" value={sessionConfig.websocket_verify_token ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, websocket_verify_token: e.target.value }))} placeholder="timestamp-signature" />
               </Field>
+
+              {sessionConfig.transport_mode === 'playwright' && (
+                <>
+                  <Field label="Browser user data dir">
+                    <input className="s-input" value={sessionConfig.browser_user_data_dir ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_user_data_dir: e.target.value }))} placeholder="/home/user/.config/chromium" />
+                  </Field>
+                  <Field label="Browser profile directory">
+                    <input className="s-input" value={sessionConfig.browser_profile_directory ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_profile_directory: e.target.value }))} placeholder="Default" />
+                  </Field>
+                  <Field label="Browser executable path">
+                    <input className="s-input" value={sessionConfig.browser_executable_path ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_executable_path: e.target.value }))} placeholder="/usr/bin/chromium" />
+                  </Field>
+                  <Field label="Connect over CDP">
+                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_connect_over_cdp)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_connect_over_cdp: e.target.checked }))} /> <span>Attach to a debug-enabled browser session</span></label>
+                  </Field>
+                  <Field label="CDP URL">
+                    <input className="s-input" value={sessionConfig.browser_cdp_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_cdp_url: e.target.value }))} placeholder="http://127.0.0.1:9222" />
+                  </Field>
+                  <Field label="Auto-start debug browser">
+                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_auto_start_debug_browser)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_auto_start_debug_browser: e.target.checked }))} /> <span>Start Chromium automatically if CDP is not already available</span></label>
+                  </Field>
+                  <Field label="Debugging port">
+                    <input className="s-input" type="number" value={sessionConfig.browser_debugging_port ?? 9222} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_debugging_port: Number(e.target.value) || 9222 }))} />
+                  </Field>
+                  <Field label="Browser headless">
+                    <label className="check-row"><input type="checkbox" checked={Boolean(sessionConfig.browser_headless)} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_headless: e.target.checked }))} /> <span>Run browser headless</span></label>
+                  </Field>
+                  <Field label="Browser chat URL">
+                    <input className="s-input" value={sessionConfig.browser_chat_url ?? ''} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_chat_url: e.target.value }))} placeholder="https://chatgpt.com/" />
+                  </Field>
+                  <Field label="Browser capture timeout (ms)">
+                    <input className="s-input" type="number" value={sessionConfig.browser_capture_timeout_ms ?? 120000} onChange={(e) => setSessionConfig((s) => ({ ...s, browser_capture_timeout_ms: Number(e.target.value) || 120000 }))} />
+                  </Field>
+                </>
+              )}
             </div>
           ) : (
             <div>

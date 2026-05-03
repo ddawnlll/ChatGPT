@@ -4,10 +4,21 @@ export type SessionConfig = {
   authorization?: string
   thinking_mode: 'instant' | 'extended' | 'pro'
   model_name: string
-  transport_mode?: 'authenticated' | 'anon'
+  transport_mode?: 'authenticated' | 'anon' | 'playwright'
   allow_anon_fallback?: boolean
   websocket_url?: string
   websocket_verify_token?: string
+  browser_user_data_dir?: string
+  browser_profile_directory?: string
+  browser_executable_path?: string
+  browser_channel?: string
+  browser_headless?: boolean
+  browser_chat_url?: string
+  browser_capture_timeout_ms?: number
+  browser_connect_over_cdp?: boolean
+  browser_cdp_url?: string
+  browser_auto_start_debug_browser?: boolean
+  browser_debugging_port?: number
 }
 
 export type ChatSummary = {

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .venv-test/
 session.json
+browser-settings.json
 session.discovered.json
 cookies.txt
 *.har

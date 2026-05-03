@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import api_server
+from transport_runtime import TransportResult
 
 
 class DummyChatClient:
@@ -19,17 +20,35 @@ class DummyChatClient:
     def get_transport_audit(self):
         return {"anon_endpoints": {"conversation": "https://chatgpt.com/backend-anon/f/conversation"}}
 
-    def ask_question(self, message, image=None):
-        self.calls.append(("ask_question", message, image))
-        self.data["conversation_id"] = "conv-1"
-        self.data["parent_message_id"] = f"parent-{len(self.calls)}"
-        self.response = f"answer:{message}"
-        return self.response
+    def _result(self):
+        return TransportResult(
+            text=self.response,
+            remote_conversation_id=self.data.get("conversation_id"),
+            remote_parent_message_id=self.data.get("parent_message_id"),
+            transport_details={"selected_transport_mode": "anon"},
+            verification_hints={"remote_conversation_exists": bool(self.data.get("conversation_id"))},
+        )
 
-    def hold_conversation(self, message, new=False):
-        self.calls.append(("hold_conversation", message, new))
-        self.data["parent_message_id"] = f"parent-{len(self.calls)}"
-        self.response = f"continued:{message}"
+    def send_message(self, message, image=None, *, new_conversation=True):
+        if new_conversation or image:
+            self.calls.append(("ask_question", message, image))
+            self.data["conversation_id"] = "conv-1"
+            self.data["parent_message_id"] = f"parent-{len(self.calls)}"
+            self.response = f"answer:{message}"
+        else:
+            self.calls.append(("hold_conversation", message, False))
+            self.data["parent_message_id"] = f"parent-{len(self.calls)}"
+            self.response = f"continued:{message}"
+        return self._result()
+
+    def stream_message(self, message, image=None, *, new_conversation=True):
+        result = self.send_message(message, image, new_conversation=new_conversation)
+        midpoint = max(1, len(result.text) // 2)
+        yield result.text[:midpoint]
+        yield result.text[midpoint:]
+
+    def get_last_result(self):
+        return self._result()
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +128,38 @@ def test_resolve_session_material_rejects_invalid_thinking_mode():
 
     with pytest.raises(api_server.HTTPException):
         api_server.resolve_session_material(request)
+
+
+def test_resolve_session_material_accepts_playwright_browser_fields():
+    request = api_server.ConversationRequest(
+        message="hello",
+        transport_mode="playwright",
+        browser_user_data_dir="/tmp/chromium",
+        browser_profile_directory="Default",
+        browser_executable_path="/usr/bin/chromium",
+        browser_channel="chromium",
+        browser_headless=True,
+        browser_chat_url="https://chatgpt.com/",
+        browser_capture_timeout_ms=12345,
+        browser_connect_over_cdp=True,
+        browser_cdp_url="http://127.0.0.1:9222",
+        browser_auto_start_debug_browser=True,
+        browser_debugging_port=9222,
+    )
+
+    resolved = api_server.resolve_session_material(request)
+    assert resolved["transport_mode"] == "playwright"
+    assert resolved["browser_user_data_dir"] == "/tmp/chromium"
+    assert resolved["browser_profile_directory"] == "Default"
+    assert resolved["browser_executable_path"] == "/usr/bin/chromium"
+    assert resolved["browser_channel"] == "chromium"
+    assert resolved["browser_headless"] is True
+    assert resolved["browser_chat_url"] == "https://chatgpt.com/"
+    assert resolved["browser_capture_timeout_ms"] == 12345
+    assert resolved["browser_connect_over_cdp"] is True
+    assert resolved["browser_cdp_url"] == "http://127.0.0.1:9222"
+    assert resolved["browser_auto_start_debug_browser"] is True
+    assert resolved["browser_debugging_port"] == 9222
 
 
 def test_resolve_session_material_accepts_model_name_without_session_id():

@@ -10,6 +10,8 @@
   "websocket_verify_token": null,
   "websocket_discovery_path": "session.discovered.json",
   "websocket_har_path": "chatgpt.com3.har",
+  "transport_mode": "playwright",
+  "browser_settings_path": "browser-settings.json",
   "cookies": [
     {
       "name": "session_cookie",

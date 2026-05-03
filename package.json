@@ -1,6 +1,8 @@
 {
   "scripts": {
-    "discover:ws": "node tools/discover_authenticated_ws.mjs"
+    "discover:ws": "node tools/discover_authenticated_ws.mjs",
+    "discover:session": "node tools/extract_authenticated_session.mjs",
+    "transport:playwright": "node tools/playwright_chat_transport.mjs"
   },
   "dependencies": {
     "react-markdown": "^10.1.0",

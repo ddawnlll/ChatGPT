@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from uvicorn import run
 
-from wrapper import ChatGPT
+from transport_runtime import ChatTransport, build_transport
 
 
 app = FastAPI()
@@ -29,9 +29,9 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "chats.sqlite3"
 SESSION_STORE: dict[str, dict[str, Any]] = {}
 CHAT_STORE: dict[str, dict[str, Any]] = {}
-CHAT_CLIENTS: dict[str, ChatGPT] = {}
+CHAT_CLIENTS: dict[str, ChatTransport] = {}
 ALLOWED_THINKING_MODES = {"instant", "extended", "pro"}
-ALLOWED_TRANSPORT_MODES = {"authenticated", "anon"}
+ALLOWED_TRANSPORT_MODES = {"authenticated", "anon", "playwright"}
 ALLOWED_VERIFICATION_STATES = {"not_checked", "passed", "failed"}
 
 
@@ -59,6 +59,17 @@ class SessionMaterialRequest(BaseModel):
     extra_headers: dict[str, str] | None = None
     websocket_url: str | None = None
     websocket_verify_token: str | None = None
+    browser_user_data_dir: str | None = None
+    browser_profile_directory: str | None = None
+    browser_executable_path: str | None = None
+    browser_channel: str | None = None
+    browser_headless: bool = False
+    browser_chat_url: str | None = None
+    browser_capture_timeout_ms: int | None = None
+    browser_connect_over_cdp: bool = False
+    browser_cdp_url: str | None = None
+    browser_auto_start_debug_browser: bool = False
+    browser_debugging_port: int | None = None
 
 
 class ConversationRequest(SessionMaterialRequest):
@@ -273,6 +284,17 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
         "extra_headers": dict(request.extra_headers or {}),
         "websocket_url": request.websocket_url,
         "websocket_verify_token": request.websocket_verify_token,
+        "browser_user_data_dir": request.browser_user_data_dir,
+        "browser_profile_directory": request.browser_profile_directory,
+        "browser_executable_path": request.browser_executable_path,
+        "browser_channel": request.browser_channel,
+        "browser_headless": bool(request.browser_headless),
+        "browser_chat_url": request.browser_chat_url,
+        "browser_capture_timeout_ms": request.browser_capture_timeout_ms,
+        "browser_connect_over_cdp": bool(request.browser_connect_over_cdp),
+        "browser_cdp_url": request.browser_cdp_url,
+        "browser_auto_start_debug_browser": bool(request.browser_auto_start_debug_browser),
+        "browser_debugging_port": request.browser_debugging_port,
     }
 
     if not request.session_id:
@@ -304,6 +326,17 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
     merged_session["extra_headers"] = incoming_session["extra_headers"] or stored_session.get("extra_headers", {})
     merged_session["websocket_url"] = incoming_session["websocket_url"] or stored_session.get("websocket_url")
     merged_session["websocket_verify_token"] = incoming_session["websocket_verify_token"] or stored_session.get("websocket_verify_token")
+    merged_session["browser_user_data_dir"] = incoming_session["browser_user_data_dir"] or stored_session.get("browser_user_data_dir")
+    merged_session["browser_profile_directory"] = incoming_session["browser_profile_directory"] or stored_session.get("browser_profile_directory")
+    merged_session["browser_executable_path"] = incoming_session["browser_executable_path"] or stored_session.get("browser_executable_path")
+    merged_session["browser_channel"] = incoming_session["browser_channel"] or stored_session.get("browser_channel")
+    merged_session["browser_headless"] = incoming_session["browser_headless"] or stored_session.get("browser_headless", False)
+    merged_session["browser_chat_url"] = incoming_session["browser_chat_url"] or stored_session.get("browser_chat_url")
+    merged_session["browser_capture_timeout_ms"] = incoming_session["browser_capture_timeout_ms"] or stored_session.get("browser_capture_timeout_ms")
+    merged_session["browser_connect_over_cdp"] = incoming_session["browser_connect_over_cdp"] or stored_session.get("browser_connect_over_cdp", False)
+    merged_session["browser_cdp_url"] = incoming_session["browser_cdp_url"] or stored_session.get("browser_cdp_url")
+    merged_session["browser_auto_start_debug_browser"] = incoming_session["browser_auto_start_debug_browser"] or stored_session.get("browser_auto_start_debug_browser", False)
+    merged_session["browser_debugging_port"] = incoming_session["browser_debugging_port"] or stored_session.get("browser_debugging_port")
 
     if not merged_session.get("cookies") and not merged_session.get("authorization") and request.session_id not in SESSION_STORE:
         raise HTTPException(status_code=400, detail="Session material is missing for the provided session_id")
@@ -313,20 +346,8 @@ def resolve_session_material(request: SessionMaterialRequest) -> dict[str, Any]:
 
 
 
-def build_client(session_material: dict[str, Any]) -> ChatGPT:
-    return ChatGPT(
-        proxy=session_material.get("proxy"),
-        cookies=session_material.get("cookies"),
-        authorization=session_material.get("authorization"),
-        thinking_mode=session_material.get("thinking_mode", "instant"),
-        model_name=session_material.get("model_name", "auto"),
-        transport_mode=session_material.get("transport_mode", "authenticated"),
-        allow_anon_fallback=session_material.get("allow_anon_fallback", False),
-        endpoint_overrides=session_material.get("endpoint_overrides"),
-        extra_headers=session_material.get("extra_headers"),
-        websocket_url=session_material.get("websocket_url"),
-        websocket_verify_token=session_material.get("websocket_verify_token"),
-    )
+def build_client(session_material: dict[str, Any]) -> ChatTransport:
+    return build_transport(session_material)
 
 
 
@@ -356,7 +377,7 @@ def chat_detail_payload(chat: dict[str, Any]) -> dict[str, Any]:
 
 
 
-def update_chat_transport_diagnostics(chat: dict[str, Any], client: ChatGPT) -> None:
+def update_chat_transport_diagnostics(chat: dict[str, Any], client: ChatTransport) -> None:
     diagnostics = client.get_debug_summary().get("request_diagnostics", {})
     chat["last_transport_diagnostics"] = dict(diagnostics)
     verification = chat.setdefault("verification", {})
@@ -491,7 +512,7 @@ def delete_chat_from_db(chat_id: str) -> None:
 
 
 
-def get_chat_client(chat_id: str, chat: dict[str, Any]) -> ChatGPT:
+def get_chat_client(chat_id: str, chat: dict[str, Any]) -> ChatTransport:
     client = CHAT_CLIENTS.get(chat_id)
     if client is None:
         client = build_client(chat["session_material"])
@@ -546,14 +567,12 @@ async def create_conversation(request: ConversationRequest):
 
     try:
         client = build_client(session_material)
-        if request.image:
-            answer: str = client.ask_question(request.message, request.image)
-        else:
-            answer = client.ask_question(request.message)
+        result = client.send_message(request.message, request.image, new_conversation=True)
 
         return {
             "status": "success",
-            "result": answer,
+            "result": result.text,
+            "transport_details": result.transport_details,
         }
     except HTTPException:
         raise
@@ -680,23 +699,23 @@ async def stream_chat_message(chat_id: str, request: SendMessageRequest) -> Stre
         assistant_parts: list[str] = []
         try:
             yield sse_event({"type": "user", "message": user_message})
-            if request.image or not chat.get("remote_conversation_started", False):
-                chunk_iter = client.stream_question(request.message, request.image)
+            is_new_conversation = bool(request.image or not chat.get("remote_conversation_started", False))
+            if is_new_conversation:
                 chat["remote_conversation_started"] = True
-            else:
-                chunk_iter = client.hold_conversation_stream(request.message)
+            chunk_iter = client.stream_message(request.message, request.image, new_conversation=is_new_conversation)
 
             for chunk in chunk_iter:
                 assistant_parts.append(chunk)
                 yield sse_event({"type": "chunk", "content": chunk})
 
-            chat["remote_conversation_id"] = client.data.get("conversation_id")
-            chat["remote_parent_message_id"] = client.data.get("parent_message_id")
+            result = client.get_last_result()
+            chat["remote_conversation_id"] = result.remote_conversation_id
+            chat["remote_parent_message_id"] = result.remote_parent_message_id
             update_chat_transport_diagnostics(chat, client)
             assistant_message = {
                 "id": str(uuid4()),
                 "role": "assistant",
-                "content": "".join(assistant_parts),
+                "content": result.text or "".join(assistant_parts),
                 "created_at": utc_now_iso(),
                 "image": False,
             }
@@ -735,21 +754,19 @@ async def send_chat_message(chat_id: str, request: SendMessageRequest) -> dict[s
     update_chat_title(chat, request.message)
 
     try:
-        if request.image or not chat.get("remote_conversation_started", False):
-            answer = client.ask_question(request.message, request.image)
+        is_new_conversation = bool(request.image or not chat.get("remote_conversation_started", False))
+        result = client.send_message(request.message, request.image, new_conversation=is_new_conversation)
+        if is_new_conversation:
             chat["remote_conversation_started"] = True
-        else:
-            client.hold_conversation(request.message, new=False)
-            answer = client.response
 
-        chat["remote_conversation_id"] = client.data.get("conversation_id")
-        chat["remote_parent_message_id"] = client.data.get("parent_message_id")
+        chat["remote_conversation_id"] = result.remote_conversation_id
+        chat["remote_parent_message_id"] = result.remote_parent_message_id
         update_chat_transport_diagnostics(chat, client)
 
         assistant_message = {
             "id": str(uuid4()),
             "role": "assistant",
-            "content": answer,
+            "content": result.text,
             "created_at": utc_now_iso(),
             "image": False,
         }

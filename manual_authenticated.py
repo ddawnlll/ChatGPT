@@ -3,6 +3,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from transport_runtime import ChatTransport, build_transport
 from wrapper import ChatGPT
 
 IDENTITY_COOKIE_PREFIXES = (
@@ -24,6 +25,17 @@ def load_json(path: str = "session.json") -> dict:
         return {}
     with session_path.open("r", encoding="utf-8") as handle:
         return load(handle)
+
+
+def merge_browser_settings(session_data: dict, browser_settings_path: str = "browser-settings.json") -> dict:
+    merged = dict(session_data)
+    browser_settings = load_json(browser_settings_path)
+    if not isinstance(browser_settings, dict):
+        return merged
+    for key, value in browser_settings.items():
+        if key not in merged or merged.get(key) in (None, "", False):
+            merged[key] = value
+    return merged
 
 
 def parse_netscape_cookies_txt(path: str = "cookies.txt") -> dict[str, str]:
@@ -99,7 +111,28 @@ def extract_websocket_url_from_har(path: str) -> str | None:
     return websocket_urls[-1] if websocket_urls else None
 
 
-def build_authenticated_client(session_data: dict, cookies: dict[str, str]) -> ChatGPT:
+def build_authenticated_client(session_data: dict, cookies: dict[str, str]) -> ChatTransport:
+    transport_mode = (session_data.get("transport_mode") or "authenticated").strip().lower()
+    if transport_mode == "playwright":
+        return build_transport(
+            {
+                "transport_mode": "playwright",
+                "browser_user_data_dir": session_data.get("browser_user_data_dir") or session_data.get("user_data_dir"),
+                "browser_profile_directory": session_data.get("browser_profile_directory") or session_data.get("profile_directory"),
+                "browser_executable_path": session_data.get("browser_executable_path") or session_data.get("executable_path"),
+                "browser_channel": session_data.get("browser_channel"),
+                "browser_headless": bool(session_data.get("browser_headless", False)),
+                "browser_chat_url": session_data.get("browser_chat_url"),
+                "browser_capture_timeout_ms": session_data.get("browser_capture_timeout_ms"),
+                "browser_connect_over_cdp": bool(session_data.get("browser_connect_over_cdp", False)),
+                "browser_cdp_url": session_data.get("browser_cdp_url"),
+                "browser_auto_start_debug_browser": bool(session_data.get("browser_auto_start_debug_browser", False)),
+                "browser_debugging_port": session_data.get("browser_debugging_port"),
+                "thinking_mode": session_data.get("thinking_mode", "extended"),
+                "model_name": session_data.get("model_name", "auto"),
+            }
+        )
+
     authorization = session_data.get("authorization")
     websocket_url = session_data.get("websocket_url")
     websocket_verify_token = session_data.get("websocket_verify_token")
@@ -116,19 +149,23 @@ def build_authenticated_client(session_data: dict, cookies: dict[str, str]) -> C
                 f"[auth-manual] websocket_url_missing_from_har path={har_path} "
                 "(HAR exports often omit websocket frames/URLs; run npm run discover:ws or set session.json:websocket_url manually)"
             )
-    return ChatGPT(
-        cookies=cookies,
-        authorization=authorization,
-        thinking_mode=session_data.get("thinking_mode", "extended"),
-        model_name=session_data.get("model_name", "auto"),
-        transport_mode="authenticated",
-        allow_anon_fallback=bool(session_data.get("allow_anon_fallback", False)),
-        websocket_url=websocket_url,
-        websocket_verify_token=websocket_verify_token,
+    return build_transport(
+        {
+            "cookies": cookies,
+            "authorization": authorization,
+            "thinking_mode": session_data.get("thinking_mode", "extended"),
+            "model_name": session_data.get("model_name", "auto"),
+            "transport_mode": "authenticated",
+            "allow_anon_fallback": bool(session_data.get("allow_anon_fallback", False)),
+            "websocket_url": websocket_url,
+            "websocket_verify_token": websocket_verify_token,
+        }
     )
 
 
-def attach_http_tracing(client: ChatGPT, conversation_timeout_seconds: int | None = None) -> None:
+def attach_http_tracing(client: ChatTransport, conversation_timeout_seconds: int | None = None) -> None:
+    if not hasattr(client, "session") or not getattr(client, "session", None) or not hasattr(client.session, "post"):
+        return
     original_post = client.session.post
 
     def traced_post(url: str, *args: Any, **kwargs: Any):
@@ -163,7 +200,9 @@ def attach_http_tracing(client: ChatGPT, conversation_timeout_seconds: int | Non
     client.session.post = traced_post
 
 
-def attach_stage_tracing(client: ChatGPT) -> None:
+def attach_stage_tracing(client: ChatTransport) -> None:
+    if not isinstance(client, ChatGPT):
+        return
     stage_names = [
         '_authenticated_prepare_conversation',
         '_authenticated_chat_requirements',
@@ -195,12 +234,24 @@ def attach_stage_tracing(client: ChatGPT) -> None:
         setattr(client, name, make_wrapper(name, original))
 
 
+def load_discovered_cookies(path: str = "session.discovered.json") -> dict[str, str]:
+    payload = load_json(path)
+    cookies = payload.get("cookies")
+    return cookies if isinstance(cookies, dict) else {}
+
+
 def main() -> None:
-    session_data = load_json("session.json")
+    raw_session = load_json("session.json")
+    session_data = merge_browser_settings(raw_session, raw_session.get("browser_settings_path", "browser-settings.json"))
+    transport_mode = (session_data.get("transport_mode") or "authenticated").strip().lower()
     all_cookies = parse_netscape_cookies_txt("cookies.txt")
+    if not all_cookies:
+        discovery_path = session_data.get("websocket_discovery_path", "session.discovered.json")
+        all_cookies = load_discovered_cookies(discovery_path)
     selected_cookies = select_authenticated_cookies(all_cookies)
     cookie_summary = summarize_cookies(selected_cookies)
 
+    print(f"[auth-manual] transport_mode={transport_mode}")
     print(f"[auth-manual] selected_cookie_count={cookie_summary['count']}")
     print(f"[auth-manual] cookie_names={', '.join(cookie_summary['names']) or '-'}")
     print(
@@ -211,10 +262,29 @@ def main() -> None:
         f"has_cf_clearance={cookie_summary['has_cf_clearance']}"
     )
 
-    if not selected_cookies:
+    if transport_mode != "playwright" and not selected_cookies:
         raise RuntimeError("No ChatGPT/OpenAI authenticated cookies were found in cookies.txt")
 
+    if transport_mode == "playwright":
+        print(
+            f"[auth-manual] playwright_profile user_data_dir={session_data.get('browser_user_data_dir') or session_data.get('user_data_dir')} "
+            f"profile_directory={session_data.get('browser_profile_directory') or session_data.get('profile_directory')}"
+        )
+        print(
+            f"[auth-manual] playwright_cdp connect_over_cdp={bool(session_data.get('browser_connect_over_cdp', False))} "
+            f"cdp_url={session_data.get('browser_cdp_url')} auto_start_debug_browser={bool(session_data.get('browser_auto_start_debug_browser', False))} "
+            f"debugging_port={session_data.get('browser_debugging_port')}"
+        )
+
     client = build_authenticated_client(session_data, selected_cookies)
+    manual_started = perf_counter()
+    if hasattr(client, "event_callback"):
+        def _log_playwright_event(event: dict[str, Any]):
+            local_elapsed = perf_counter() - manual_started
+            stage = event.get("stage")
+            elapsed_ms = event.get("elapsed_ms")
+            print(f"[auth-manual] playwright_event local_elapsed={local_elapsed:.2f}s transport_elapsed_ms={elapsed_ms} stage={stage} payload={event}")
+        client.event_callback = _log_playwright_event
     attach_http_tracing(client, conversation_timeout_seconds=session_data.get('conversation_timeout_seconds'))
     attach_stage_tracing(client)
     print(f"[auth-manual] session_status={client.get_session_status()}")
@@ -226,10 +296,11 @@ def main() -> None:
 
     try:
         started = perf_counter()
-        response = client.ask_question(message)
+        result = client.send_message(message, None, new_conversation=True)
         print(f"[auth-manual] total_elapsed={perf_counter() - started:.2f}s")
+        print(f"[auth-manual] transport_details={result.transport_details}")
         print("[auth-manual] response_start")
-        print(response)
+        print(result.text)
         print("[auth-manual] response_end")
     except Exception as exc:
         print(f"[auth-manual] request_failed={exc}")
