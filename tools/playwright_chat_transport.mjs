@@ -97,12 +97,13 @@ function emit(event) {
 }
 
 const COMPOSER_SELECTORS = [
-  '#prompt-textarea',
-  'textarea[placeholder*="Message"]',
-  'textarea',
+  '#prompt-textarea[contenteditable="true"]',
   'div[contenteditable="true"][role="textbox"]',
   'div[contenteditable="true"][data-lexical-editor="true"]',
   'div[contenteditable="true"]',
+  '#prompt-textarea',
+  'textarea[placeholder*="Message"]',
+  'textarea',
 ]
 
 async function findComposer(page) {
@@ -112,7 +113,28 @@ async function findComposer(page) {
     for (let i = 0; i < count; i += 1) {
       const candidate = locator.nth(i)
       const visible = await candidate.isVisible().catch(() => false)
-      if (visible) {
+      if (!visible) continue
+
+      const box = await candidate.boundingBox().catch(() => null)
+      if (!box || box.width < 4 || box.height < 4) {
+        emit({
+          type: 'status',
+          stage: 'composer_candidate_rejected_zero_box',
+          selector,
+          index: i,
+        })
+        continue
+      }
+
+      const disabled = await candidate.evaluate((node) => {
+        return Boolean(
+          node.disabled ||
+          node.getAttribute('aria-disabled') === 'true' ||
+          node.getAttribute('aria-hidden') === 'true'
+        )
+      }).catch(() => false)
+
+      if (!disabled) {
         return { locator: candidate, selector, index: i }
       }
     }
@@ -244,44 +266,345 @@ async function ensureComposerContext(page, targetUrl, newConversation) {
   return await waitForComposerInteractive(page, 15000)
 }
 
+async function typeComposerTextWithKeyboard(page, composer, message) {
+  await composer.locator.scrollIntoViewIfNeeded().catch(() => {})
+  await composer.locator.click({ timeout: 1500 }).catch(() => {})
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
+  await page.keyboard.press('Backspace').catch(() => {})
+
+  const chunkSize = 1200
+  for (let i = 0; i < message.length; i += chunkSize) {
+    await page.keyboard.insertText(message.slice(i, i + chunkSize))
+    await delay(20)
+  }
+
+  let enteredText = ''
+  try {
+    enteredText = await composer.locator.inputValue({ timeout: 1000 })
+  } catch {
+    enteredText = await composer.locator.innerText({ timeout: 1000 }).catch(() => '')
+  }
+
+  return enteredText
+}
+
+async function setComposerText(page, composer, message) {
+  const result = await composer.locator.evaluate((node, value) => {
+    const text = String(value || '')
+
+    function fire(target, type) {
+      target.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }))
+    }
+
+    function fireInput(target, insertedText) {
+      try {
+        target.dispatchEvent(new InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          data: insertedText,
+          inputType: 'insertText',
+        }))
+      } catch {}
+      try {
+        target.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          cancelable: true,
+          data: insertedText,
+          inputType: 'insertText',
+        }))
+      } catch {
+        fire(target, 'input')
+      }
+    }
+
+    node.focus()
+
+    if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+      const proto = node instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype
+
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+      if (descriptor?.set) {
+        descriptor.set.call(node, text)
+      } else {
+        node.value = text
+      }
+
+      try {
+        if (typeof node.setSelectionRange === 'function') {
+          node.setSelectionRange(text.length, text.length)
+        }
+      } catch {}
+
+      fireInput(node, text)
+      fire(node, 'change')
+
+      return {
+        ok: true,
+        mode: 'textarea',
+        length: node.value.length,
+        text: node.value,
+      }
+    }
+
+    if (node.isContentEditable) {
+      node.textContent = text
+      fireInput(node, text)
+      fire(node, 'change')
+
+      return {
+        ok: true,
+        mode: 'contenteditable',
+        length: node.innerText.length,
+        text: node.innerText,
+      }
+    }
+
+    return {
+      ok: false,
+      mode: 'unknown',
+      length: 0,
+      text: '',
+      tag: node.tagName,
+    }
+  }, message).catch((error) => ({
+    ok: false,
+    mode: 'evaluate_failed',
+    length: 0,
+    text: '',
+    error: String(error?.message || error),
+  }))
+
+  if (!result.ok || result.length === 0) {
+    await composer.locator.click({ timeout: 1000 }).catch(() => {})
+    await page.keyboard.insertText(message)
+  }
+
+  let enteredText = ''
+  try {
+    enteredText = await composer.locator.inputValue({ timeout: 1000 })
+  } catch {
+    enteredText = await composer.locator.innerText({ timeout: 1000 }).catch(() => '')
+  }
+
+  return {
+    ...result,
+    enteredText,
+    enteredLength: enteredText.length,
+  }
+}
+
+async function triggerPromptSend(page, composer) {
+  const sendState = await composer.locator.evaluate((node) => {
+    function isVisible(el) {
+      if (!el) return false
+      const style = window.getComputedStyle(el)
+      const rect = el.getBoundingClientRect()
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+    }
+
+    function isEnabled(el) {
+      return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+    }
+
+    const selectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label*="Send" i]',
+      'button[aria-label*="Submit" i]',
+      '[data-testid="composer-send-button"]',
+      'button[type="submit"]',
+    ]
+
+    const form = node.closest('form')
+    const roots = [form, node.parentElement, document]
+    let matchedButton = null
+    let matchedSelector = null
+
+    for (const root of roots) {
+      if (!root) continue
+      for (const selector of selectors) {
+        const button = root.querySelector(selector)
+        if (button && isEnabled(button)) {
+          matchedButton = button
+          matchedSelector = selector
+          break
+        }
+      }
+      if (matchedButton) break
+    }
+
+    return {
+      hasEnabledButton: Boolean(matchedButton),
+      selector: matchedSelector,
+      formPresent: Boolean(form),
+      ariaLabel: matchedButton?.getAttribute('aria-label') || '',
+      disabled: matchedButton ? Boolean(matchedButton.disabled || matchedButton.getAttribute('aria-disabled') === 'true') : null,
+    }
+  }).catch(() => ({ hasEnabledButton: false, selector: null, formPresent: false, ariaLabel: '', disabled: null }))
+
+  emit({ type: 'status', stage: 'send_button_state', ...sendState })
+
+  if (sendState.hasEnabledButton) {
+    const clicked = await composer.locator.evaluate((node) => {
+      function isVisible(el) {
+        if (!el) return false
+        const style = window.getComputedStyle(el)
+        const rect = el.getBoundingClientRect()
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      }
+
+      function isEnabled(el) {
+        return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+      }
+
+      const selectors = [
+        'button[data-testid="send-button"]',
+        'button[aria-label*="Send" i]',
+        'button[aria-label*="Submit" i]',
+        '[data-testid="composer-send-button"]',
+        'button[type="submit"]',
+      ]
+
+      const form = node.closest('form')
+      const roots = [form, node.parentElement, document]
+      for (const root of roots) {
+        if (!root) continue
+        for (const selector of selectors) {
+          const button = root.querySelector(selector)
+          if (button && isEnabled(button)) {
+            try { button.click() } catch {}
+            return { method: 'dom_button_click', selector }
+          }
+        }
+      }
+
+      if (form) {
+        try {
+          if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit()
+            return { method: 'form_request_submit', selector: null }
+          }
+        } catch {}
+        try {
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+          return { method: 'form_submit_event', selector: null }
+        } catch {}
+      }
+
+      return { method: 'none', selector: null }
+    }).catch(() => ({ method: 'none', selector: null }))
+
+    emit({ type: 'status', stage: 'send_trigger_method', ...clicked })
+    if (clicked.method !== 'none') return
+  }
+
+  const submittedByForm = await page.evaluate(() => {
+    const composer =
+      document.querySelector('#prompt-textarea') ||
+      document.querySelector('div[contenteditable="true"][role="textbox"]') ||
+      document.querySelector('div[contenteditable="true"]') ||
+      document.querySelector('textarea')
+
+    const form = composer?.closest('form')
+    if (!form) return false
+
+    try {
+      form.dispatchEvent(new SubmitEvent('submit', {
+        bubbles: true,
+        cancelable: true,
+        submitter: null,
+      }))
+      return true
+    } catch {
+      return false
+    }
+  }).catch(() => false)
+
+  if (submittedByForm) {
+    emit({ type: 'status', stage: 'send_trigger_method', method: 'form_submit_event', selector: null })
+    return
+  }
+
+  await composer.locator.focus().catch(() => {})
+  await page.keyboard.press('Enter').catch(() => {})
+  emit({ type: 'status', stage: 'send_trigger_method', method: 'keyboard_enter', selector: null })
+}
+
 async function sendPrompt(page, message, targetUrl, newConversation) {
   const composer = await ensureComposerContext(page, targetUrl, newConversation)
   emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
 
   const activateComposer = async (locator) => {
-    await locator.scrollIntoViewIfNeeded().catch(() => {})
-    await locator.focus().catch(() => {})
-    await locator.click({ timeout: 1500 }).catch(async () => {
-      await locator.evaluate((node) => {
-        if (node && typeof node.focus === 'function') node.focus()
-      }).catch(() => {})
-    })
+    emit({ type: 'status', stage: 'composer_activation_start' })
+
+    emit({ type: 'status', stage: 'composer_activation_dom_prepare_start' })
+    await locator.evaluate((node) => {
+      if (!node) return
+      try {
+        if (typeof node.scrollIntoView === 'function') {
+          node.scrollIntoView({ block: 'center', inline: 'nearest' })
+        }
+      } catch {}
+      try {
+        if (typeof node.focus === 'function') node.focus()
+      } catch {}
+      try {
+        if (typeof node.click === 'function') node.click()
+      } catch {}
+    }).catch(() => {})
+    emit({ type: 'status', stage: 'composer_activation_dom_prepare_done' })
+
+    emit({ type: 'status', stage: 'composer_activation_bbox_start' })
+    const box = await locator.boundingBox().catch(() => null)
+    emit({ type: 'status', stage: 'composer_activation_bbox_done', has_box: Boolean(box) })
+
+    if (box) {
+      emit({ type: 'status', stage: 'composer_activation_mouse_click_start' })
+      await page.mouse.click(
+        box.x + Math.min(box.width / 2, Math.max(8, box.width - 8)),
+        box.y + Math.min(box.height / 2, Math.max(8, box.height - 8)),
+      ).catch(() => {})
+      emit({ type: 'status', stage: 'composer_activation_mouse_click_done' })
+    }
+
+    emit({ type: 'status', stage: 'composer_activation_done' })
   }
 
   // Loop to type and send, retrying if the message doesn't send or type correctly
   let promptSent = false
   for (let attempt = 1; attempt <= 3; attempt++) {
+    emit({ type: 'status', stage: 'prompt_attempt_start', attempt })
     await activateComposer(composer.locator)
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {})
-    await page.keyboard.press('Backspace').catch(() => {})
 
-    if (composer.selector.includes('textarea')) {
-      await composer.locator.fill('').catch(() => {})
-      await composer.locator.fill(message).catch(async () => {
-        await page.keyboard.insertText(message)
-      })
-    } else {
-      await page.keyboard.insertText(message)
+    emit({ type: 'status', stage: 'before_prompt_injection', selector: composer.selector, index: composer.index, attempt })
+
+    let enteredText = await typeComposerTextWithKeyboard(page, composer, message)
+
+    let typed = {
+      ok: enteredText.trim().length > 0,
+      mode: 'keyboard_insertText',
+      length: enteredText.length,
+      enteredText,
+      enteredLength: enteredText.length,
     }
 
-    let enteredText = ''
-    try {
-      enteredText = await composer.locator.inputValue()
-    } catch {
-      enteredText = await composer.locator.innerText().catch(() => '')
+    if (!typed.ok) {
+      typed = await setComposerText(page, composer, message)
+      enteredText = typed.enteredText || ''
     }
-    emit({ type: 'status', stage: 'prompt_entered', attempt, prompt_length: enteredText.length })
-    
+
+    emit({
+      type: 'status',
+      stage: 'prompt_entered',
+      attempt,
+      prompt_length: enteredText.length,
+      composer_mode: typed.mode,
+      typed_length: typed.length,
+      entered_length: typed.enteredLength,
+      typed_ok: typed.ok,
+    })
+
     // If it completely failed to type, retry the whole typing block
     if (enteredText.trim().length === 0 && message.trim().length > 0) {
       await delay(500)
@@ -289,22 +612,10 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
     }
 
     // Wait a tiny bit for React state to register the input
-    await delay(100)
-    
-    const sendButton = page.locator('button[data-testid="send-button"], button[aria-label*="Send" i]').first()
-    
-    if (await sendButton.isVisible().catch(() => false)) {
-      // Ensure the button isn't disabled before clicking
-      const isDisabled = await sendButton.isDisabled().catch(() => false)
-      if (!isDisabled) {
-        await sendButton.click({ force: true, timeout: 1000 }).catch(async () => page.keyboard.press('Enter'))
-      } else {
-        await page.keyboard.press('Enter')
-      }
-    } else {
-      await page.keyboard.press('Enter')
-    }
-    
+    await delay(150)
+
+    await triggerPromptSend(page, composer)
+
     // Wait briefly for the composer to clear or the stop button to appear.
     let sentSignal = false
     for (let i = 0; i < 4; i++) {
@@ -336,7 +647,7 @@ async function sendPrompt(page, message, targetUrl, newConversation) {
       emit({ type: 'status', stage: 'send_retry', attempt })
     }
   }
-  
+
   if (!promptSent) {
     emit({ type: 'status', stage: 'send_failed_but_continuing' })
   } else {
@@ -564,11 +875,36 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
       })
     }
 
-    timeoutHandle = setTimeout(() => {
+    timeoutHandle = setTimeout(async () => {
+      let fallbackRawText = lastRawText
+
+      try {
+        const fallbackState = await findLatestAssistantLocator(page, baselineAssistant)
+        if (fallbackState?.locator) {
+          const extracted = await extractAssistantText(fallbackState.locator)
+          if (extracted) fallbackRawText = extracted
+        }
+      } catch {}
+
+      const fallbackText = normalizeAssistantText(fallbackRawText || lastNormalizedText)
+
+      if (fallbackText && !isIgnorableAssistantText(fallbackText)) {
+        const finalDelta = computeAppendDelta(lastNormalizedText, fallbackText)
+        if (finalDelta) emit({ type: 'chunk', content: finalDelta })
+        lastNormalizedText = fallbackText
+        lastRawText = fallbackRawText
+      }
+
+      emit({
+        type: 'status',
+        stage: 'assistant_timeout_dom_fallback',
+        fallback_length: fallbackText.length,
+      })
+
       finish({
         text: lastNormalizedText,
         timedOut: true,
-        placeholderOnly: isPlaceholderOnly(lastRawText),
+        placeholderOnly: isPlaceholderOnly(lastRawText || lastNormalizedText),
       })
     }, timeoutMs)
 
@@ -765,8 +1101,33 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null) {
       function scheduleCompletionCheck() {
         clearTimeout(idleTimer)
         idleTimer = setTimeout(() => {
-          if (!observedText) return
-          if (stopButtonVisible()) return
+          if (stopped) return
+
+          const state = latestAssistantState()
+
+          if (state?.rawText && state.rawText !== lastSeenRawText) {
+            lastSeenRawText = state.rawText
+            observedText = true
+
+            window.__chatgptProxyAssistantStreamEvent({
+              kind: 'text',
+              rawText: state.rawText,
+              selector: state.selector,
+              count: state.count,
+              isNewMessage: state.isNewMessage,
+            })
+          }
+
+          if (!observedText) {
+            scheduleCompletionCheck()
+            return
+          }
+
+          if (stopButtonVisible()) {
+            scheduleCompletionCheck()
+            return
+          }
+
           sendDone('assistant_text_idle_and_stop_hidden')
         }, idleMs)
       }
@@ -970,6 +1331,13 @@ async function handleRequest(request) {
     await sendPrompt(globalPage, request.message, targetUrl, Boolean(request.new_conversation))
     emit({ type: 'status', stage: 'awaiting_assistant_stream', baseline_assistant: baselineAssistant })
     const streamResult = await streamAssistantText(globalPage, Number(request.capture_timeout_ms || 120000), baselineAssistant)
+    emit({
+      type: 'status',
+      stage: 'stream_result_collected',
+      text_length: String(streamResult.text || '').length,
+      timed_out: streamResult.timedOut,
+      placeholder_only: streamResult.placeholderOnly,
+    })
     const text = streamResult.text
     const finalUi = await detectLoggedInUi(globalPage)
     if (streamResult.timedOut) {
