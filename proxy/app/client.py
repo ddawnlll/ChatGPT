@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from json import dumps
 from typing import Any, AsyncIterator
+from uuid import uuid4
 
 from transport_runtime import ChatTransport, build_transport
 
@@ -73,41 +76,69 @@ def build_session_material(model_id: str) -> dict[str, Any]:
     return session_material
 
 
+def fingerprint_messages(messages: list[dict[str, Any]]) -> str:
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        normalized.append({
+            "role": str(message.get("role", "")).strip(),
+            "content": message.get("content"),
+        })
+    if not normalized:
+        return ""
+    return sha256(dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 class RuntimeClient:
     def __init__(self, model_id: str):
         self.model_id = model_id
 
-    def _get_transport(self, conversation_id: str | None) -> tuple[ChatTransport, bool, ConversationState | None]:
+    def _resolve_state(self, conversation_id: str | None, messages: list[dict[str, Any]]) -> tuple[str | None, ConversationState | None]:
         if conversation_id:
-            state = conversation_store.get(conversation_id)
-            if state and state.transport is not None:
-                return state.transport, False, state
+            return conversation_id, conversation_store.get(conversation_id)
+
+        history_messages = messages[:-1] if len(messages) > 1 else []
+        history_alias = fingerprint_messages(history_messages)
+        if history_alias:
+            state = conversation_store.get_by_history_alias(history_alias)
+            if state is not None:
+                return state.conversation_id, state
+        return None, None
+
+    def _get_transport(self, conversation_id: str | None, messages: list[dict[str, Any]]) -> tuple[ChatTransport, bool, ConversationState | None, str | None]:
+        resolved_conversation_id, state = self._resolve_state(conversation_id, messages)
+        if state and state.transport is not None:
+            return state.transport, False, state, resolved_conversation_id
 
         transport = build_transport(build_session_material(self.model_id))
-        if conversation_id:
-            state = conversation_store.get(conversation_id) or ConversationState(conversation_id=conversation_id)
-            state.transport = transport
-            conversation_store.put(state)
-            return transport, True, state
-        return transport, True, None
+        effective_conversation_id = resolved_conversation_id or conversation_id or f"proxy-{uuid4().hex}"
+        state = state or ConversationState(conversation_id=effective_conversation_id)
+        state.transport = transport
+        conversation_store.put(state)
+        return transport, True, state, effective_conversation_id
+
+    def _update_state_after_response(self, state: ConversationState | None, messages: list[dict[str, Any]], assistant_text: str, remote_conversation_id: str | None, remote_parent_message_id: str | None) -> None:
+        if state is None:
+            return
+        state.data["remote_conversation_id"] = remote_conversation_id
+        state.data["remote_parent_message_id"] = remote_parent_message_id
+        transcript_alias = fingerprint_messages([*messages, {"role": "assistant", "content": assistant_text}])
+        conversation_store.bind_history_alias(transcript_alias, state.conversation_id)
+        conversation_store.put(state)
 
     def complete_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None) -> str:
         prompt = extract_latest_user_text(messages)
         if not prompt:
             raise ValueError("No user message content was found")
-        transport, new_conversation, state = self._get_transport(conversation_id)
+        transport, new_conversation, state, _effective_conversation_id = self._get_transport(conversation_id, messages)
         result = transport.send_message(prompt, None, new_conversation=new_conversation)
-        if state is not None:
-            state.data["remote_conversation_id"] = result.remote_conversation_id
-            state.data["remote_parent_message_id"] = result.remote_parent_message_id
-            conversation_store.put(state)
+        self._update_state_after_response(state, messages, result.text, result.remote_conversation_id, result.remote_parent_message_id)
         return result.text
 
     async def stream_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None) -> AsyncIterator[str]:
         prompt = extract_latest_user_text(messages)
         if not prompt:
             raise ValueError("No user message content was found")
-        transport, new_conversation, state = self._get_transport(conversation_id)
+        transport, new_conversation, state, _effective_conversation_id = self._get_transport(conversation_id, messages)
         chunks: list[str] = []
         for chunk in transport.stream_message(prompt, None, new_conversation=new_conversation):
             text = str(chunk or "")
@@ -115,12 +146,8 @@ class RuntimeClient:
                 continue
             chunks.append(text)
             yield text
-        if state is not None:
-            result = transport.get_last_result()
-            state.data["remote_conversation_id"] = result.remote_conversation_id
-            state.data["remote_parent_message_id"] = result.remote_parent_message_id
-            state.data["response_preview"] = "".join(chunks)[:200]
-            conversation_store.put(state)
+        result = transport.get_last_result()
+        self._update_state_after_response(state, messages, result.text or "".join(chunks), result.remote_conversation_id, result.remote_parent_message_id)
 
 
 def complete_chat(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None) -> str:

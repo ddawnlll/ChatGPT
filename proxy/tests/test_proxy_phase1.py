@@ -166,6 +166,31 @@ def test_conversation_reuse_uses_existing_transport_and_marks_follow_up(monkeypa
     assert stub.transports[0].calls == [("first", True), ("second", False)]
 
 
+def test_history_based_conversation_reuse_supports_pi_style_full_history(monkeypatch):
+    stub = BuildTransportStub()
+    monkeypatch.setattr(proxy_client, "build_transport", stub)
+    client = make_client()
+
+    first = client.post("/v1/chat/completions", json={"model": "chatgpt-playwright", "messages": [{"role": "user", "content": "first"}]})
+    assert first.status_code == 200
+    assistant_reply = first.json()["choices"][0]["message"]["content"]
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": assistant_reply},
+                {"role": "user", "content": "second"},
+            ],
+        },
+    )
+    assert second.status_code == 200
+    assert len(stub.transports) == 1
+    assert stub.transports[0].calls == [("first", True), ("second", False)]
+
+
 def test_streaming_formatter_emits_done():
     async def gen():
         yield "hello"

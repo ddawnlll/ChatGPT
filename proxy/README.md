@@ -201,6 +201,7 @@ Once the proxy works, pi should be able to use it with a custom provider config 
 - `proxy/docs/implementation/phase-1-openai-compatible-proxy-foundation.md`
 - `proxy/docs/implementation/phase-2-direct-chatgpt-runtime-integration.md`
 - `proxy/docs/implementation/phase-3-pi-provider-validation.md`
+- `proxy/docs/implementation/pi-provider-setup.md`
 - `proxy/docs/implementation/reuse-from-perplexity-proxy.md`
 
 These docs define the plan, reuse inventory, and implementation boundaries.
