@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from json import dumps, loads
 from pathlib import Path
@@ -7,6 +9,8 @@ from subprocess import PIPE, Popen
 from typing import Any, Iterator, Protocol
 
 from wrapper import ChatGPT
+
+logger = logging.getLogger("chatgpt_proxy.transport")
 
 
 @dataclass
@@ -119,6 +123,7 @@ class PlaywrightTransport:
             "transport": {
                 "mode": "playwright",
                 "browser": {
+                    "browser_type": self.session_material.get("browser_type") or "firefox",
                     "user_data_dir": self.session_material.get("browser_user_data_dir") or self.session_material.get("user_data_dir"),
                     "profile_directory": self.session_material.get("browser_profile_directory") or self.session_material.get("profile_directory"),
                     "executable_path": self.session_material.get("browser_executable_path") or self.session_material.get("executable_path"),
@@ -154,19 +159,29 @@ class PlaywrightTransport:
         return self._last_result
 
     def _run(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[dict[str, Any]]:
+        project_root = Path(__file__).resolve().parent
+        browser_cache = project_root / "bin" / "browsers"
+
+        env = os.environ.copy()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_cache)
+        env["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+
         process = Popen(
-            ["node", self._script_path()],
+            ["bun", self._script_path()],
             stdin=PIPE,
             stdout=PIPE,
             stderr=PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
         payload = dumps(self._request_payload(message, image, new_conversation=new_conversation))
         assert process.stdin is not None
         process.stdin.write(payload)
         process.stdin.close()
 
+        logger.info(f"[playwright-transport] spawned node process pid={process.pid}")
+        
         saw_output = False
         assert process.stdout is not None
         for line in process.stdout:
@@ -174,6 +189,7 @@ class PlaywrightTransport:
             if not line:
                 continue
             saw_output = True
+            logger.info(f"[playwright-transport] node_stdout: {line}")
             event = loads(line)
             if callable(self.event_callback):
                 try:
@@ -183,7 +199,12 @@ class PlaywrightTransport:
             yield event
 
         stderr = process.stderr.read().strip() if process.stderr is not None else ""
+        if stderr:
+            logger.error(f"[playwright-transport] node_stderr: {stderr}")
+
         return_code = process.wait()
+        logger.info(f"[playwright-transport] node_process_exited return_code={return_code}")
+
         if return_code not in {0, None}:
             if stderr:
                 self.request_diagnostics["playwright_stderr"] = stderr[:1000]

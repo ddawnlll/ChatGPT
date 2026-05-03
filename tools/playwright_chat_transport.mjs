@@ -1,8 +1,76 @@
 #!/usr/bin/env node
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import process from 'node:process'
 import { spawn } from 'node:child_process'
-import { chromium } from 'playwright'
+import path from 'node:path'
+import { createRequire } from 'node:module'
+import { chromium, firefox, webkit } from 'playwright'
+
+const require = createRequire(import.meta.url)
+
+function getPlaywrightVersion() {
+  try {
+    return require('playwright/package.json').version
+  } catch {
+    return null
+  }
+}
+
+function getBrowserTypeName(browser) {
+  return String(browser.browser_type || 'firefox').toLowerCase()
+}
+
+function getBrowserType(browser) {
+  const type = getBrowserTypeName(browser)
+
+  if (type === 'firefox') return firefox
+  if (type === 'webkit') return webkit
+  if (type === 'chromium' || type === 'chrome') return chromium
+
+  throw new Error(`Unsupported browser_type: ${type}`)
+}
+
+// System browser detection — no Playwright-managed browsers needed
+const SYSTEM_BROWSER_CANDIDATES = [
+  { type: 'chromium', path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' },
+  { type: 'chromium', path: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' },
+  { type: 'chromium', path: '/Applications/Chromium.app/Contents/MacOS/Chromium' },
+  { type: 'firefox',  path: '/Applications/Firefox.app/Contents/MacOS/firefox' },
+]
+
+function findSystemBrowser() {
+  for (const candidate of SYSTEM_BROWSER_CANDIDATES) {
+    try { if (fsSync.statSync(candidate.path).isFile()) return candidate } catch {}
+  }
+  return null
+}
+
+function buildLaunchArgs(browser) {
+  const type = getBrowserTypeName(browser)
+
+  if (type === 'firefox' || type === 'webkit') {
+    return []
+  }
+
+  // Chromium args — disable automation detection flags
+  return [
+    '--password-store=basic',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-blink-features=AutomationControlled',
+  ]
+}
+
+function resolveExecutablePath(browser) {
+  if (browser.executable_path) return browser.executable_path
+  // Fall back to system browser detection
+  const system = findSystemBrowser()
+  if (system) return system.path
+  // Last resort: let Playwright try its own
+  const browserType = getBrowserType(browser)
+  return browserType.executablePath()
+}
 
 async function readStdinJson() {
   const chunks = []
@@ -353,7 +421,7 @@ function isIgnorableAssistantText(text) {
     /^(thinking|analyzing|reasoning)\.?$/i.test(normalized) ||
     /^hello!?\s+what.?s on your mind today\??$/i.test(normalized) ||
     /^ready when you are\.?$/i.test(normalized) ||
-    /^how can i help(?:,.*)?\??$/i.test(normalized)
+    /^how can i help(?:,.*)?\\??$/i.test(normalized)
   )
 }
 
@@ -425,18 +493,49 @@ async function waitForCdp(url, timeoutMs = 30000) {
 }
 
 async function startDebugBrowser(browser, targetUrl) {
-  const executable = browser.executable_path
-  if (!executable) throw new Error('browser_executable_path is required when auto-starting the debug browser')
+  const browserTypeName = getBrowserTypeName(browser)
+
+  if (browserTypeName !== 'chromium') {
+    throw new Error('startDebugBrowser/CDP auto-start is only supported for Chromium')
+  }
+
+  const executable = resolveExecutablePath(browser)
+
+  emit({
+    type: 'status',
+    stage: 'starting_debug_browser_resolved',
+    executable,
+    browser_type: browserTypeName,
+    playwright_version: getPlaywrightVersion(),
+    playwright_browsers_path: process.env.PLAYWRIGHT_BROWSERS_PATH || null,
+  })
+
   const args = [
     `--remote-debugging-port=${browser.debugging_port || 9222}`,
+    '--password-store=basic',
+    '--no-first-run',
+    '--no-default-browser-check',
   ]
-  if (browser.user_data_dir) args.push(`--user-data-dir=${browser.user_data_dir}`)
-  if (browser.profile_directory) args.push(`--profile-directory=${browser.profile_directory}`)
+
+  if (browser.profile_directory) {
+    args.push(`--profile-directory=${browser.profile_directory}`)
+  }
+
+  if (browser.user_data_dir) {
+    args.push(`--user-data-dir=${browser.user_data_dir}`)
+  }
+
   args.push(targetUrl || 'https://chatgpt.com/')
+
   const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',
+    env: {
+      ...process.env,
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: process.env.OBJC_DISABLE_INITIALIZE_FORK_SAFETY || 'YES',
+    },
   })
+
   child.unref()
 }
 
@@ -464,9 +563,17 @@ async function pickBestExistingPage(contexts, targetUrl) {
 }
 
 async function openOrAttachBrowser(browser, targetUrl) {
+  const browserTypeName = getBrowserTypeName(browser)
+  const browserType = getBrowserType(browser)
+
+  // CDP is Chromium-only
+  if (browserTypeName !== 'chromium' && browser.connect_over_cdp) {
+    throw new Error('connect_over_cdp is only supported for Chromium. Disable CDP when using Firefox.')
+  }
+
   if (browser.connect_over_cdp) {
     const cdpUrl = browser.cdp_url || `http://127.0.0.1:${browser.debugging_port || 9222}`
-    emit({ type: 'status', stage: 'connecting_over_cdp', cdp_url: cdpUrl })
+    emit({ type: 'status', stage: 'connecting_over_cdp', cdp_url: cdpUrl, browser_type: browserTypeName })
     let ready = await waitForCdp(cdpUrl, 2000)
     if (!ready && browser.auto_start_debug_browser) {
       emit({ type: 'status', stage: 'starting_debug_browser', cdp_url: cdpUrl })
@@ -488,16 +595,49 @@ async function openOrAttachBrowser(browser, targetUrl) {
     return { browserHandle: attachedBrowser, context, page, attachedViaCdp: true }
   }
 
+  // Persistent context launch (works for all browser types)
   const launchOptions = {
     headless: Boolean(browser.headless),
     viewport: { width: 1440, height: 960 },
-    args: browser.profile_directory ? [`--profile-directory=${browser.profile_directory}`] : [],
+    args: buildLaunchArgs(browser),
   }
-  if (browser.executable_path) launchOptions.executablePath = browser.executable_path
-  else if (browser.channel) launchOptions.channel = browser.channel
-  const context = await chromium.launchPersistentContext(browser.user_data_dir, launchOptions)
+
+  if (browser.executable_path) {
+    launchOptions.executablePath = browser.executable_path
+  }
+
+  // `channel` is Chromium-only. Do not use channel for Firefox.
+  if (browserTypeName === 'chromium' && browser.channel) {
+    launchOptions.channel = browser.channel
+  }
+
+  // Firefox stealth prefs (only needed if using Playwright's patched Firefox)
+  if (browserTypeName === 'firefox' && !launchOptions.executablePath) {
+    launchOptions.firefoxUserPrefs = {
+      'dom.webdriver.enabled': false,
+      'marionette.enabled': false,
+    }
+  }
+
+  emit({
+    type: 'status',
+    stage: 'launching_persistent_context',
+    browser_type: browserTypeName,
+    executable_path: launchOptions.executablePath || 'playwright-default',
+    playwright_version: getPlaywrightVersion(),
+    user_data_dir: browser.user_data_dir || null,
+    args: launchOptions.args,
+  })
+
+  const context = await browserType.launchPersistentContext(browser.user_data_dir, launchOptions)
   const page = context.pages()[0] || await context.newPage()
-  return { browserHandle: null, context, page, attachedViaCdp: false }
+
+  return {
+    browserHandle: null,
+    context,
+    page,
+    attachedViaCdp: false,
+  }
 }
 
 function buildConversationUrl(targetUrl, remoteConversationId) {
@@ -540,7 +680,8 @@ async function main() {
   const request = await readStdinJson()
   const transport = request.transport || {}
   const browser = transport.browser || {}
-  emit({ type: 'status', stage: browser.connect_over_cdp ? 'opening_browser_via_cdp' : 'launching_browser', transport_mode: 'playwright' })
+  const browserTypeName = getBrowserTypeName(browser)
+  emit({ type: 'status', stage: browser.connect_over_cdp ? 'opening_browser_via_cdp' : 'launching_browser', transport_mode: 'playwright', browser_type: browserTypeName })
   const { browserHandle, context, page, attachedViaCdp } = await openOrAttachBrowser(browser, request.url || 'https://chatgpt.com/')
   try {
     page.on('websocket', (ws) => emit({ type: 'status', stage: 'websocket_created', websocket_url: ws.url() }))
@@ -577,6 +718,7 @@ async function main() {
         ui_before_send: ui,
         ui_after_send: finalUi,
         transport_mode: 'playwright',
+        browser_type: browserTypeName,
         browser: {
           user_data_dir: browser.user_data_dir,
           profile_directory: browser.profile_directory || null,

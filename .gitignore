@@ -13,4 +13,9 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
-data/*.sqlite3
+data/
+!data/.gitkeep
+bin/browsers/
+.DS_Store
+*.log
+

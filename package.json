@@ -1,15 +1,15 @@
 {
   "scripts": {
-    "discover:ws": "node tools/discover_authenticated_ws.mjs",
-    "discover:session": "node tools/extract_authenticated_session.mjs",
-    "transport:playwright": "node tools/playwright_chat_transport.mjs",
-    "test:frontend:playwright": "node tools/test_frontend_playwright_streaming.mjs"
+    "discover:ws": "bun tools/discover_authenticated_ws.mjs",
+    "discover:session": "bun tools/extract_authenticated_session.mjs",
+    "transport:playwright": "bun tools/playwright_chat_transport.mjs",
+    "test:frontend:playwright": "bun tools/test_frontend_playwright_streaming.mjs"
   },
   "dependencies": {
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "playwright": "^1.54.2"
+    "playwright": "1.59.1"
   }
 }
