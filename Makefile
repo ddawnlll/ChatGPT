@@ -28,7 +28,7 @@ diag:
 
 kill-browser:
 	@echo "Killing browser processes..."
-	@pkill -f "Google Chrome for Testing" || true
+	@pkill -f "Google Chrome" || true
 	@pkill -f "Chromium" || true
 	@echo "Done!"
 

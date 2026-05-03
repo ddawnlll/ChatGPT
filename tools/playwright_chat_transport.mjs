@@ -55,15 +55,16 @@ function buildLaunchArgs(browser) {
     return []
   }
 
-  // Chromium args
+  // Chromium args — essential flags to mimic a normal browser while allowing Playwright CDP over pipes
   return [
+    `--user-data-dir=${browser.user_data_dir || ''}`,
+    '--remote-debugging-pipe',
     '--password-store=basic',
     '--no-first-run',
     '--no-default-browser-check',
     '--remote-allow-origins=*',
-    '--hide-crash-restore-bubble',
-    '--disable-session-crashed-bubble',
-    '--disable-infobars',
+    '--disable-blink-features=AutomationControlled',
+    'about:blank'
   ]
 }
 
@@ -617,13 +618,7 @@ async function handleRequest(request) {
         headless: Boolean(browser.headless),
         viewport: { width: 1440, height: 960 },
         args: buildLaunchArgs(browser),
-        ignoreDefaultArgs: [
-          '--enable-automation',
-          '--no-sandbox',
-          '--disable-breakpad',
-          '--disable-infobars',
-          '--disable-background-networking',
-        ],
+        ignoreDefaultArgs: true, // Drop all Playwright bot-detection flags completely!
       }
 
       if (browser.executable_path) {
