@@ -3,6 +3,7 @@ from subprocess import run
 from time import perf_counter
 
 import manual_authenticated as shared
+from wrapper.paths import get_default_browser_executable_path, get_default_browser_user_data_dir
 
 
 def refresh_hybrid_session_material(session_data: dict) -> dict:
@@ -14,10 +15,10 @@ def refresh_hybrid_session_material(session_data: dict) -> dict:
         discovery_path,
         "--url",
         session_data.get("browser_chat_url", "https://chatgpt.com/"),
-        "--executable-path",
-        session_data.get("browser_executable_path") or session_data.get("executable_path") or "/usr/bin/chromium",
+        "--channel",
+        session_data.get("browser_channel") or "",
         "--user-data-dir",
-        session_data.get("browser_user_data_dir") or session_data.get("user_data_dir") or str(Path.home() / ".config/chromium"),
+        session_data.get("browser_user_data_dir") or session_data.get("user_data_dir") or get_default_browser_user_data_dir(),
         "--profile-directory",
         session_data.get("browser_profile_directory") or session_data.get("profile_directory") or "Default",
         "--cdp-url",
@@ -31,7 +32,12 @@ def refresh_hybrid_session_material(session_data: dict) -> dict:
         command.append("--no-cdp")
 
     print(f"[auth-hybrid] extractor_start command={' '.join(command)}")
-    completed = run(command, check=False)
+    import os
+    env = os.environ.copy()
+    project_root = Path(__file__).parent.resolve()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(project_root / "bin" / "browsers")
+    
+    completed = run(command, check=False, env=env)
     print(f"[auth-hybrid] extractor_done returncode={completed.returncode}")
     if completed.returncode != 0:
         raise RuntimeError(f"Hybrid extractor failed with return code {completed.returncode}")

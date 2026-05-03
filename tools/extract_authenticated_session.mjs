@@ -1,19 +1,53 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises'
 import process from 'node:process'
+import os from 'node:os'
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { chromium } from 'playwright'
+import { getDefaultExecutablePath, getDefaultUserDataDir } from './paths.mjs'
+
+const require = createRequire(import.meta.url)
+
+function getPlaywrightVersion() {
+  try {
+    return require('playwright/package.json').version
+  } catch {
+    return null
+  }
+}
+
+function resolveExecutablePath(browser) {
+  if (browser.executable_path) return browser.executable_path
+  return chromium.executablePath()
+}
+
+function buildSafeBrowserArgs(options, includeRemoteDebugging = false) {
+  const args = [
+    '--password-store=basic',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  if (includeRemoteDebugging) {
+    args.unshift(`--remote-debugging-port=${options.debuggingPort || 9222}`)
+  }
+  if (options.profileDirectory) {
+    args.push(`--profile-directory=${options.profileDirectory}`)
+  }
+  return args
+}
 
 function parseArgs(argv) {
   const options = {
     output: 'session.discovered.json',
     url: 'https://chatgpt.com/',
-    executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || '/usr/bin/chromium',
-    userDataDir: process.env.CHROMIUM_USER_DATA_DIR || `${process.env.HOME || ''}/.config/chromium`,
+    executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || getDefaultExecutablePath(),
+    channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || '',
+    userDataDir: process.env.CHROMIUM_USER_DATA_DIR || getDefaultUserDataDir(),
     profileDirectory: process.env.CHROMIUM_PROFILE_DIRECTORY || 'Default',
-    connectOverCdp: true,
+    connectOverCdp: false,
     cdpUrl: 'http://127.0.0.1:9222',
-    autoStartDebugBrowser: true,
+    autoStartDebugBrowser: false,
     debuggingPort: 9222,
     timeoutMs: 30000,
   }
@@ -24,6 +58,7 @@ function parseArgs(argv) {
     if (arg === '--output' && next) options.output = next, i += 1
     else if (arg === '--url' && next) options.url = next, i += 1
     else if (arg === '--executable-path' && next) options.executablePath = next, i += 1
+    else if (arg === '--channel' && next) options.channel = next, i += 1
     else if (arg === '--user-data-dir' && next) options.userDataDir = next, i += 1
     else if (arg === '--profile-directory' && next) options.profileDirectory = next, i += 1
     else if (arg === '--cdp-url' && next) options.cdpUrl = next, i += 1
@@ -38,6 +73,7 @@ Options:
   --output <path>
   --url <url>
   --executable-path <path>
+  --channel <name>
   --user-data-dir <path>
   --profile-directory <name>
   --cdp-url <url>
@@ -69,11 +105,20 @@ async function waitForCdp(url, timeoutMs = 30000) {
 }
 
 async function startDebugBrowser(options) {
-  const args = [`--remote-debugging-port=${options.debuggingPort}`]
+  const executable = resolveExecutablePath({ executable_path: options.executablePath })
+  const args = buildSafeBrowserArgs(options, true)
   if (options.userDataDir) args.push(`--user-data-dir=${options.userDataDir}`)
-  if (options.profileDirectory) args.push(`--profile-directory=${options.profileDirectory}`)
   args.push(options.url)
-  const child = spawn(options.executablePath, args, { detached: true, stdio: 'ignore' })
+  
+  log(`starting_debug_browser executable=${executable}`)
+  const child = spawn(executable, args, { 
+    detached: true, 
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: process.env.OBJC_DISABLE_INITIALIZE_FORK_SAFETY || 'YES',
+    }
+  })
   child.unref()
 }
 
@@ -82,7 +127,6 @@ async function openBrowser(options) {
     log(`connecting_over_cdp url=${options.cdpUrl}`)
     let ready = await waitForCdp(options.cdpUrl, 2000)
     if (!ready && options.autoStartDebugBrowser) {
-      log(`starting_debug_browser executable=${options.executablePath} user_data_dir=${options.userDataDir} profile_directory=${options.profileDirectory}`)
       await startDebugBrowser(options)
       ready = await waitForCdp(options.cdpUrl, options.timeoutMs)
     }
@@ -94,12 +138,22 @@ async function openBrowser(options) {
     return { browser, context, page, attachedViaCdp: true }
   }
 
-  const context = await chromium.launchPersistentContext(options.userDataDir, {
-    executablePath: options.executablePath,
+  const executablePath = resolveExecutablePath({ executable_path: options.executablePath })
+  const launchOptions = {
+    executablePath,
     headless: false,
     viewport: { width: 1440, height: 960 },
-    args: options.profileDirectory ? [`--profile-directory=${options.profileDirectory}`] : [],
-  })
+    args: buildSafeBrowserArgs(options, false),
+    env: {
+      ...process.env,
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: process.env.OBJC_DISABLE_INITIALIZE_FORK_SAFETY || 'YES',
+    }
+  }
+  
+  if (options.channel) launchOptions.channel = options.channel
+
+  log(`launching_persistent_context executable=${executablePath} user_data_dir=${options.userDataDir}`)
+  const context = await chromium.launchPersistentContext(options.userDataDir, launchOptions)
   const page = context.pages()[0] || await context.newPage()
   return { browser: null, context, page, attachedViaCdp: false }
 }

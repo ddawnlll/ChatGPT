@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -21,6 +22,7 @@ from .tools_shim import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("chatgpt_proxy.router")
 
 
 def openai_error(message: str, status_code: int, code: str | None = None) -> HTTPException:
@@ -90,6 +92,7 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest, raw_request: Request):
+    logger.info("Received chat completions request for model: %s", request.model)
     if not request.messages:
         raise openai_error("messages must not be empty", 400, "invalid_messages")
 

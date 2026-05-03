@@ -46,7 +46,7 @@ def test_build_transport_returns_playwright_transport_for_playwright_mode():
             "transport_mode": "playwright",
             "browser_user_data_dir": "/tmp/profile",
             "browser_profile_directory": "Default",
-            "browser_executable_path": "/usr/bin/chromium",
+            "browser_executable_path": "/usr/bin/chrome",
         }
     )
 
@@ -60,7 +60,7 @@ def test_playwright_transport_send_message_consumes_jsonl_events(monkeypatch):
             "transport_mode": "playwright",
             "browser_user_data_dir": "/tmp/profile",
             "browser_profile_directory": "Default",
-            "browser_executable_path": "/usr/bin/chromium",
+            "browser_executable_path": "/usr/bin/chrome",
         }
     )
 

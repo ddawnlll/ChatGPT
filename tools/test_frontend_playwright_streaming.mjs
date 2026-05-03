@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import process from 'node:process'
+import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { chromium } from 'playwright'
+import { getDefaultExecutablePath } from './paths.mjs'
 
 const FRONTEND_URL = 'http://127.0.0.1:3000'
 const CHAT_ID = 'chat-1'
@@ -30,7 +32,15 @@ async function main() {
 
   try {
     await waitForHttp(FRONTEND_URL)
-    const browser = await chromium.launch({ headless: true, executablePath: '/usr/bin/chromium' })
+    const browser = await chromium.launch({ 
+      headless: true, 
+      channel: 'chrome',
+      args: [
+        '--password-store=basic',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    })
     const page = await browser.newPage()
 
     await page.addInitScript(({ chatId }) => {

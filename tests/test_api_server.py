@@ -134,10 +134,10 @@ def test_resolve_session_material_accepts_playwright_browser_fields():
     request = api_server.ConversationRequest(
         message="hello",
         transport_mode="playwright",
-        browser_user_data_dir="/tmp/chromium",
+        browser_user_data_dir="/tmp/chrome",
         browser_profile_directory="Default",
-        browser_executable_path="/usr/bin/chromium",
-        browser_channel="chromium",
+        browser_executable_path="/usr/bin/chrome",
+        browser_channel="chrome",
         browser_headless=True,
         browser_chat_url="https://chatgpt.com/",
         browser_capture_timeout_ms=12345,
@@ -149,10 +149,10 @@ def test_resolve_session_material_accepts_playwright_browser_fields():
 
     resolved = api_server.resolve_session_material(request)
     assert resolved["transport_mode"] == "playwright"
-    assert resolved["browser_user_data_dir"] == "/tmp/chromium"
+    assert resolved["browser_user_data_dir"] == "/tmp/chrome"
     assert resolved["browser_profile_directory"] == "Default"
-    assert resolved["browser_executable_path"] == "/usr/bin/chromium"
-    assert resolved["browser_channel"] == "chromium"
+    assert resolved["browser_executable_path"] == "/usr/bin/chrome"
+    assert resolved["browser_channel"] == "chrome"
     assert resolved["browser_headless"] is True
     assert resolved["browser_chat_url"] == "https://chatgpt.com/"
     assert resolved["browser_capture_timeout_ms"] == 12345

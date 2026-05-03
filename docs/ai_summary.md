@@ -28,6 +28,37 @@ secondary_artifact: decompiled_js_reference
 ### output
 - returns assistant response text parsed from ChatGPT SSE/event-stream style response.
 
+## file_tree
+
+```text
+.
+├── Makefile                           # High-level entrypoints for setup, shell, and starting servers
+├── api_server.py                      # Original FastAPI backend exposing non-standard /conversation endpoints
+├── transport_runtime.py               # Abstracted chat interfaces unifying authenticated, playwright, and proxy streams
+├── manual*.py                         # Various CLI test entrypoints (simple, authenticated, hybrid)
+├── requirements.txt                   # Auto-generated python dependencies
+├── wrapper/                           # Core Reverse-Engineered Web Client
+│   ├── chatgpt.py                     # Main ChatGPT HTTP wrapper maintaining session headers and parsing SSE
+│   ├── paths.py                       # Cross-platform resolution of local Playwright browsers and isolated profiles
+│   ├── reverse/                       # Logic imitating anti-bot JS challenges (Turnstile, PoW)
+│   ├── IP_Info/                       # Fakes IP/Timezone telemetry matching the expected client metrics
+│   └── logger.py / runtime.py         # Utils for console output and exception wrappers
+├── tools/                             # Playwright JS/Python Automation Scripts
+│   ├── setup_browser.py               # Pulls/forces Playwright Chromium binaries to bypass MacOS/Gatekeeper limits
+│   ├── setup_pi_provider.py           # Merges the proxy endpoint into `~/.pi/agent/models.json`
+│   ├── playwright_chat_transport.mjs  # A robust headless JS client injecting scripts to bypass Turnstile natively
+│   ├── extract_authenticated_session.mjs # Drives Chrome to capture initial WS/Auth cookies
+│   └── paths.mjs                      # JS companion to wrapper/paths.py for local browser resolution
+├── proxy/                             # OpenAI-Compatible Backend Server
+│   ├── app/                           # Full FastAPI structure translating /v1/chat/completions into local Web calls
+│   └── ai_summary.md                  # Dedicated proxy architecture overview
+├── docs/                              # Project Design and Summaries
+│   ├── ai_summary.md                  # This semantic context summary
+│   └── implementation/                # Detailed guides for proxy validation and authenticated session transport
+├── frontend/                          # Local web UI built in React / Vite connecting to api_server.py
+└── tests/                             # Pytest suite validating token patching, HTTP formats, and proxy parsing
+```
+
 ## request_flow
 1. instantiate curl_cffi session impersonating chrome.
 2. load https://chatgpt.com to collect cookies and build client metadata.

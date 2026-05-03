@@ -37,8 +37,8 @@ def test_refresh_hybrid_session_material_runs_extractor(monkeypatch, tmp_path, c
         {
             "websocket_discovery_path": str(discovery_file),
             "browser_chat_url": "https://chatgpt.com/",
-            "browser_executable_path": "/usr/bin/chromium",
-            "browser_user_data_dir": "/tmp/chromium",
+            "browser_executable_path": "/usr/bin/chrome",
+            "browser_user_data_dir": "/tmp/chrome",
             "browser_profile_directory": "Default",
             "browser_cdp_url": "http://127.0.0.1:9222",
             "browser_debugging_port": 9222,

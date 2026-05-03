@@ -58,6 +58,8 @@ class RequestLoggingMiddleware:
 
 
 async def api_key_middleware(request: Request, call_next):
+    # DUMP ALL INCOMING REQUESTS FOR DEBUGGING
+    logger.info("INCOMING REQUEST: %s %s", request.method, request.url.path)
     if request.url.path in API_KEY_EXEMPT_PATHS or not request.url.path.startswith("/v1/"):
         return await call_next(request)
 
@@ -74,6 +76,17 @@ async def api_key_middleware(request: Request, call_next):
 
     return await call_next(request)
 
+
+import logging
+import sys
+
+# Configure root logger to ensure everything prints to console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger("chatgpt_proxy")
 
 def create_app() -> FastAPI:
     app = FastAPI(

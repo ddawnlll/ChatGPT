@@ -147,9 +147,9 @@ def test_build_authenticated_client_supports_playwright_transport(monkeypatch):
     client = auth_manual.build_authenticated_client(
         {
             "transport_mode": "playwright",
-            "browser_user_data_dir": "/tmp/chromium",
+            "browser_user_data_dir": "/tmp/chrome",
             "browser_profile_directory": "Default",
-            "browser_executable_path": "/usr/bin/chromium",
+            "browser_executable_path": "/usr/bin/chrome",
             "browser_connect_over_cdp": True,
             "browser_cdp_url": "http://127.0.0.1:9222",
             "browser_auto_start_debug_browser": True,
@@ -159,7 +159,7 @@ def test_build_authenticated_client_supports_playwright_transport(monkeypatch):
     )
 
     assert client.transport_mode == "playwright"
-    assert captured["browser_user_data_dir"] == "/tmp/chromium"
+    assert captured["browser_user_data_dir"] == "/tmp/chrome"
     assert captured["browser_profile_directory"] == "Default"
     assert captured["browser_connect_over_cdp"] is True
     assert captured["browser_cdp_url"] == "http://127.0.0.1:9222"
@@ -170,7 +170,7 @@ def test_build_authenticated_client_supports_playwright_transport(monkeypatch):
 def test_merge_browser_settings_fills_missing_session_fields(tmp_path):
     browser_settings = tmp_path / "browser-settings.json"
     browser_settings.write_text(json.dumps({
-        "browser_user_data_dir": "/tmp/chromium",
+        "browser_user_data_dir": "/tmp/chrome",
         "browser_profile_directory": "Default",
         "browser_connect_over_cdp": True,
     }), encoding="utf-8")
@@ -180,7 +180,7 @@ def test_merge_browser_settings_fills_missing_session_fields(tmp_path):
         str(browser_settings),
     )
 
-    assert merged["browser_user_data_dir"] == "/tmp/chromium"
+    assert merged["browser_user_data_dir"] == "/tmp/chrome"
     assert merged["browser_profile_directory"] == "Default"
     assert merged["browser_connect_over_cdp"] is True
 

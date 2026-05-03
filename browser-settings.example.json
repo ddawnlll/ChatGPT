@@ -1,7 +1,7 @@
 {
-  "browser_user_data_dir": "/home/your-user/.config/chromium",
+  "browser_user_data_dir": "",
   "browser_profile_directory": "Default",
-  "browser_executable_path": "/usr/bin/chromium",
+  "browser_executable_path": "",
   "browser_connect_over_cdp": true,
   "browser_cdp_url": "http://127.0.0.1:9222",
   "browser_auto_start_debug_browser": true,

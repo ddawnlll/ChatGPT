@@ -2,7 +2,29 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
+import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { chromium } from 'playwright'
+import { getDefaultExecutablePath } from './paths.mjs'
+
+const require = createRequire(import.meta.url)
+
+function resolveExecutablePath(options) {
+  if (options.executablePath) return options.executablePath
+  return chromium.executablePath()
+}
+
+function buildSafeBrowserArgs(options) {
+  const args = [
+    '--password-store=basic',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  if (options.profileDirectory) {
+    args.push(`--profile-directory=${options.profileDirectory}`)
+  }
+  return args
+}
 
 function parseArgs(argv) {
   const options = {
@@ -10,7 +32,7 @@ function parseArgs(argv) {
     message: 'Reply with the single word: pong',
     output: 'session.discovered.json',
     cookies: 'cookies.txt',
-    channel: 'chrome',
+    channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || '',
     headless: false,
     loginTimeoutMs: 180_000,
     captureTimeoutMs: 120_000,
@@ -18,7 +40,7 @@ function parseArgs(argv) {
     profileDirectory: '',
     writeSessionJson: false,
     sessionPath: 'session.json',
-    executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || '',
+    executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || getDefaultExecutablePath(),
   }
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -60,7 +82,7 @@ Options:
   --headless                   Run headless (not recommended for login)
   --login-timeout-ms <ms>      Wait time for prompt UI/login
   --capture-timeout-ms <ms>    Wait time for websocket/handoff capture
-  --channel <name>             Browser channel (default: chrome)
+  --channel <name>             Browser channel (default: )
   --executable-path <path>     Use a system Chromium/Chrome binary
 `)
 }
@@ -281,14 +303,20 @@ async function main() {
     throw new Error(`Real profile user data dir does not exist: ${options.userDataDir}`)
   }
 
+  const executablePath = resolveExecutablePath(options)
   const launchOptions = {
+    executablePath,
     headless: options.headless,
     viewport: { width: 1440, height: 960 },
-    args: options.profileDirectory ? [`--profile-directory=${options.profileDirectory}`] : [],
+    args: buildSafeBrowserArgs(options),
+    env: {
+      ...process.env,
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: process.env.OBJC_DISABLE_INITIALIZE_FORK_SAFETY || 'YES',
+    }
   }
-  if (options.executablePath) launchOptions.executablePath = options.executablePath
-  else if (options.channel) launchOptions.channel = options.channel
+  if (options.channel) launchOptions.channel = options.channel
 
+  console.log(`[discover-ws] launching executablePath=${executablePath}`)
   const context = await chromium.launchPersistentContext(options.userDataDir, launchOptions)
 
   try {
@@ -358,7 +386,7 @@ async function main() {
         stream_handoff_found: meta.stream_handoff_found || state.stream_handoff_found,
       })
       state.reached_handoff_stage = Boolean(state.stream_handoff_found || state.handoff_topic_id || state.resume_sse_topic_id)
-      console.log(`[discover-ws] conversation_response handoff=${state.stream_handoff_found} conversation_id=${state.conversation_id ?? '-'} topic=${state.handoff_topic_id ?? state.resume_sse_topic_id ?? '-'}`)
+      console.log(`[discover-ws] conversation_response status=${response.status()} handoff=${state.stream_handoff_found} conversation_id=${state.conversation_id ?? '-'} topic=${state.handoff_topic_id ?? state.resume_sse_topic_id ?? '-'}`)
     })
 
     await page.goto(options.url, { waitUntil: 'domcontentloaded' })
