@@ -617,7 +617,13 @@ async function handleRequest(request) {
         headless: Boolean(browser.headless),
         viewport: { width: 1440, height: 960 },
         args: buildLaunchArgs(browser),
-        ignoreDefaultArgs: ['--enable-automation'],
+        ignoreDefaultArgs: [
+          '--enable-automation',
+          '--no-sandbox',
+          '--disable-breakpad',
+          '--disable-infobars',
+          '--disable-background-networking',
+        ],
       }
 
       if (browser.executable_path) {
