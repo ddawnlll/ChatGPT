@@ -116,6 +116,8 @@ def request_requires_write_tool(messages: list[dict[str, Any]], tools: list[dict
     tool_names = {tool.get("function", {}).get("name") for tool in (tools or []) if isinstance(tool, dict) and isinstance(tool.get("function"), dict)}
     if "write" not in tool_names:
         return False
+    if any(str(message.get("role", "")).strip().lower() == "tool" for message in messages if isinstance(message, dict)):
+        return False
     latest_user_text = extract_latest_user_text(messages).lower()
     if not latest_user_text:
         return False

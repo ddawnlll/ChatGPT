@@ -608,3 +608,52 @@ print(\"smoke ok\")
     assert "Recovery rule:" in recovery_prompt
     assert "The current task requires the write tool." in recovery_prompt
     assert "exactly one fenced code block inside <write_content>" in recovery_prompt
+
+
+
+def test_write_required_prompt_is_not_reapplied_after_tool_result(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured["prompt_override"] = kwargs.get("prompt_override")
+        return ("<final_response>write done.</final_response>", "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": 'Create app/smoke_server.py. Use write. The file content must be exactly:\nprint("smoke ok")'},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_test",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": '{"path":"app/smoke_server.py","content":"print(\\"smoke ok\\")\\n"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_test", "content": "wrote app/smoke_server.py"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "write", "description": "Write file", "parameters": {}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    prompt_override = captured["prompt_override"]
+    assert "Request classification: write_required." not in prompt_override
+    assert "Emit exactly one write tool_call on this turn." not in prompt_override
