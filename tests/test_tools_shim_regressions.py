@@ -107,7 +107,36 @@ find app -print | sed 's|[^/]*/|  |g; s|  \([^ ]\)|├── \1|'
     assert action.tool_name == "bash"
     assert action.tool_arguments == {
         "timeout": 10,
-        "command": "find app -print | sed 's|[^/]*/|  |g; s|  \\([^ ]\\)|├── \\1|'",
+        "command": "find app -print | sed 's|[^/]*/|  |g; s|  \\([^ ]\\)|├── \\1|'\n",
+    }
+
+
+
+def test_parse_xml_bash_tool_call_with_command_content_sidecar():
+    text = """
+<tool_call>
+<name>bash</name>
+<arguments>
+<timeout>10</timeout>
+</arguments>
+</tool_call>
+<command_content>
+```bash
+python - <<'PY'
+if True:
+    print("ok")
+PY
+```
+</command_content>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "bash"
+    assert action.tool_arguments == {
+        "timeout": 10,
+        "command": "python - <<'PY'\nif True:\n    print(\"ok\")\nPY\n",
     }
 
 

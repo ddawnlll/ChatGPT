@@ -342,6 +342,21 @@ def _build_planning_prompt(*, messages: list[dict[str, Any]], tools: list[dict[s
         "&lt;/arguments&gt;\n"
         "&lt;/tool_call&gt;\n\n"
         "For bash, put the exact shell command inside <command>...</command>. Do not JSON-escape shell commands.\n"
+        "For multiline bash, heredocs, or embedded Python, prefer this sidecar form:\n"
+        "&lt;tool_call&gt;\n"
+        "&lt;name&gt;bash&lt;/name&gt;\n"
+        "&lt;arguments&gt;\n"
+        "&lt;timeout&gt;10&lt;/timeout&gt;\n"
+        "&lt;/arguments&gt;\n"
+        "&lt;/tool_call&gt;\n"
+        "&lt;command_content&gt;\n"
+        "```bash\n"
+        "python - <<'PY'\n"
+        "print('hello')\n"
+        "PY\n"
+        "```\n"
+        "&lt;/command_content&gt;\n"
+        "Use exactly one fenced code block inside <command_content> and keep indentation exact.\n"
         "For edit, use an edits array. Do not put XML inside a JSON string. Preferred XML pattern:\n"
         "&lt;tool_call&gt;\n"
         "&lt;name&gt;edit&lt;/name&gt;\n"
@@ -445,6 +460,32 @@ def build_final_after_tools_prompt(messages: list[dict[str, Any]], tools: list[d
 
 
 
+def build_tool_failure_recovery_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ShimDecision:
+    transcript_parts = _compact_transcript_parts(messages)
+    transcript = "\n\n".join(transcript_parts).strip()
+    latest_user_text = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip().lower() != "user":
+            continue
+        latest_user_text = _stringify_content(message.get("content")).strip()
+        if latest_user_text:
+            break
+    prompt = (
+        "The previous pi tool call failed. Do not claim it succeeded.\n"
+        "More tool calls are allowed on this turn.\n"
+        "Use the failure output as evidence and recover safely.\n"
+        "If an edit oldText did not match, inspect the exact target region with read/grep/bash before retrying the edit.\n"
+        "If a multiline bash command failed due to formatting or indentation, retry using <command_content> with exactly one fenced bash block.\n"
+        "Only emit <final_response> if you are blocked and explain the blocker, or if the task is truly complete.\n\n"
+        f"Latest user task:\n{latest_user_text or '(empty)'}\n\n"
+        f"Recent compact context:\n{transcript or '(empty)'}"
+    )
+    return ShimDecision(prompt=prompt, tools=tools or [], agent_mode=True)
+
+
+
 def build_task_continuation_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, tool_round_count: int, max_tool_rounds: int) -> ShimDecision:
     transcript_parts = _compact_transcript_parts(messages)
     transcript = "\n\n".join(transcript_parts).strip()
@@ -477,6 +518,7 @@ def build_task_continuation_prompt(messages: list[dict[str, Any]], tools: list[d
 _TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FINAL_TAG_RE = re.compile(r"<final_response>\s*(.*?)\s*</final_response>", re.DOTALL | re.IGNORECASE)
 _WRITE_CONTENT_RE = re.compile(r"<write_content>(.*?)</write_content>", re.DOTALL | re.IGNORECASE)
+_COMMAND_CONTENT_RE = re.compile(r"<command_content>(.*?)</command_content>", re.DOTALL | re.IGNORECASE)
 _AFTER_TOOLS_RE = re.compile(r"<after_tools>\s*(.*?)\s*</after_tools>", re.DOTALL | re.IGNORECASE)
 _AFTER_TOOLS_ON_SUCCESS_RE = re.compile(r"<on_success>\s*(.*?)\s*</on_success>", re.DOTALL | re.IGNORECASE)
 _AFTER_TOOLS_ON_FAILURE_RE = re.compile(r"<on_failure>\s*(.*?)\s*</on_failure>", re.DOTALL | re.IGNORECASE)
@@ -551,6 +593,21 @@ def _normalize_python_dunder_markdown(content: str) -> str:
     return re.sub(r"\*\*([A-Za-z_][A-Za-z0-9_]*)\*\*", r"__\1__", content)
 
 
+def _clean_command_content(content: str, *, require_fence: bool) -> tuple[str | None, str | None]:
+    cleaned = content.replace("\r\n", "\n").replace("\r", "\n")
+    if require_fence:
+        fenced, fence_error = _unwrap_single_markdown_fence(cleaned)
+        if fence_error is not None:
+            return None, fence_error.replace("write_content", "command_content")
+        cleaned = fenced if fenced is not None else cleaned
+    elif cleaned.startswith("\n"):
+        cleaned = cleaned[1:]
+    if cleaned and not cleaned.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, None
+
+
+
 def _clean_write_content(path: str, content: str, *, require_fence: bool) -> tuple[str | None, str | None]:
     cleaned = content.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -589,6 +646,19 @@ def _validate_write_arguments(arguments: dict[str, Any], *, require_fence: bool)
                 parse_error=f"python write content failed syntax validation at line {exc.lineno}: {exc.msg}",
             )
     arguments["content"] = cleaned
+    return None
+
+
+
+def _validate_bash_arguments(arguments: dict[str, Any], *, require_fence: bool) -> ParsedAssistantAction | None:
+    command = arguments.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="bash tool call missing command")
+    cleaned, clean_error = _clean_command_content(command, require_fence=require_fence)
+    if clean_error is not None:
+        return ParsedAssistantAction(kind="invalid_tool", parse_error=clean_error)
+    assert cleaned is not None
+    arguments["command"] = cleaned
     return None
 
 
@@ -771,6 +841,19 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
         invalid = _validate_write_arguments(arguments, require_fence=require_fence)
         if invalid is not None:
             return invalid
+    if name == "bash":
+        require_fence = False
+        if "command" not in arguments:
+            command_content_match = _COMMAND_CONTENT_RE.search(raw)
+            if command_content_match:
+                command = command_content_match.group(1)
+                if command.startswith("\n"):
+                    command = command[1:]
+                arguments["command"] = command
+                require_fence = True
+        invalid = _validate_bash_arguments(arguments, require_fence=require_fence)
+        if invalid is not None:
+            return invalid
     if name == "edit":
         invalid = _validate_edit_arguments(arguments)
         if invalid is not None:
@@ -802,6 +885,18 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
                     arguments = {**arguments, "content": content}
                     require_fence = True
                 invalid = _validate_write_arguments(arguments, require_fence=require_fence)
+                if invalid is not None:
+                    return invalid
+            if name == "bash":
+                require_fence = False
+                command_match = _COMMAND_CONTENT_RE.search(raw)
+                if command_match:
+                    command = command_match.group(1)
+                    if command.startswith("\n"):
+                        command = command[1:]
+                    arguments = {**arguments, "command": command}
+                    require_fence = True
+                invalid = _validate_bash_arguments(arguments, require_fence=require_fence)
                 if invalid is not None:
                     return invalid
             if name == "edit":

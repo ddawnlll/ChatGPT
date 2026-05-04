@@ -488,6 +488,42 @@ def test_pi_cli_implementation_task_fixes_failed_tests_before_final(monkeypatch,
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_edit_oldtext_mismatch_recovers_with_inspection_and_fix(monkeypatch, tmp_path):
+    requests: list[dict[str, Any]] = []
+    step = {"value": 0}
+    app_dir = tmp_path / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "server5.py").write_text(
+        'body {\n    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;\n}\n\nh1 {\n    font-family: Georgia, "Times New Roman", serif;\n}\n',
+        encoding="utf-8",
+    )
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs)
+        step["value"] += 1
+        current = step["value"]
+        if current == 1:
+            return ('<tool_call>{"name":"edit","arguments":{"path":"app/server5.py","edits":[{"oldText":"font-family: serif;","newText":"font-family: Inter, sans-serif;"}]}}</tool_call>', "conv-edit-recover")
+        if current == 2:
+            return ('<tool_call>{"name":"read","arguments":{"path":"app/server5.py"}}</tool_call>', "conv-edit-recover")
+        if current == 3:
+            return ('<tool_call>{"name":"edit","arguments":{"path":"app/server5.py","edits":[{"oldText":"font-family: Georgia, \\\"Times New Roman\\\", serif;","newText":"font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \\\"Segoe UI\\\", sans-serif;"}]}}</tool_call>', "conv-edit-recover")
+        return ("<final_response>Updated app/server5.py after inspecting the exact serif declaration.</final_response>", "conv-edit-recover")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "You are the implementation agent. Continue and complete this continuation task. Edit fonts in app/server5.py, update them to sans-serif instead of serif, and inspect the exact target text before retrying if an edit fails.", tools="read,edit")
+
+    assert result.returncode == 0, result.stderr
+    assert "Updated app/server5.py after inspecting the exact serif declaration." in result.stdout
+    assert "Updated app/server5.py." not in result.stdout
+    assert 'Georgia, "Times New Roman", serif' not in (tmp_path / 'app' / 'server5.py').read_text(encoding='utf-8')
+    assert len(requests) == 4
+    assert any("The previous pi tool call failed. Do not claim it succeeded." in str(call.get("prompt_override", "")) for call in requests[1:3])
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
 def test_pi_cli_regression_multiturn_session_does_not_reuse_stale_write_fastpath(monkeypatch, tmp_path):
     requests: list[dict[str, Any]] = []
     phase = {"step": 0}

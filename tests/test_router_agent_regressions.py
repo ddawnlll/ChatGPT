@@ -388,6 +388,38 @@ print(\"hello\")
 
 
 
+def test_failed_edit_result_does_not_local_final_and_uses_recovery_prompt(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"read","arguments":{"path":"app/server5.py"}}</tool_call>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "edit fonts, update them to sans-serif instead of serif"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_edit", "type": "function", "function": {"name": "edit", "arguments": '{"path":"app/server5.py","edits":[{"oldText":"font-family: Georgia, \\\"Times New Roman\\\", serif;","newText":"font-family: Inter, sans-serif;"}]}'}}]},
+                {"role": "tool", "tool_call_id": "call_edit", "content": 'Could not find edits[0] in app/server5.py. The oldText must match exactly including all whitespace and newlines.'},
+            ],
+            "tools": [{"type": "function", "function": {"name": "edit", "description": "Edit file", "parameters": {}}}, {"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
+    assert "The previous pi tool call failed. Do not claim it succeeded." in captured["prompt_override"]
+    assert "If an edit oldText did not match" in captured["prompt_override"]
+
+
+
 def test_agent_edit_with_xml_edits_string_returns_valid_array(monkeypatch):
     def fake_complete_chat_turn(**kwargs):
         return (
@@ -423,6 +455,48 @@ def test_agent_edit_with_xml_edits_string_returns_valid_array(monkeypatch):
         "path": "app/server4.py",
         "edits": [{"oldText": "PORT = 8000", "newText": "PORT = 8090"}],
     }
+
+
+
+def test_agent_bash_with_command_content_block_returns_command(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            """
+<tool_call>
+<name>bash</name>
+<arguments>
+<timeout>10</timeout>
+</arguments>
+</tool_call>
+<command_content>
+```bash
+python - <<'PY'
+if True:
+    print(\"ok\")
+PY
+```
+</command_content>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "run a multiline python command"}],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    args = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    parsed = json.loads(args)
+    assert parsed["command"] == "python - <<'PY'\nif True:\n    print(\"ok\")\nPY\n"
 
 
 
@@ -1241,7 +1315,7 @@ def test_task_mode_failed_test_command_continues_through_model(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert "Continue the implementation task" in captured["prompt_override"]
+    assert "The previous pi tool call failed. Do not claim it succeeded." in captured["prompt_override"]
     assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "edit"
 
 

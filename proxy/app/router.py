@@ -19,6 +19,7 @@ from .tools_shim import (
     build_openai_tool_call,
     build_pi_agent_prompt,
     build_task_continuation_prompt,
+    build_tool_failure_recovery_prompt,
     build_tool_repair_prompt,
     count_tool_rounds,
     is_implementation_task,
@@ -272,8 +273,37 @@ def _looks_like_successful_tool_result(messages: list[dict[str, Any]]) -> bool:
         return False
     _assistant_message, tool_messages = block
     combined = "\n".join(str(message.get("content", "")) for message in tool_messages).lower()
-    failure_markers = ("error", "failed", "traceback", "exception", "no such file", "not found", "permission denied")
+    failure_markers = (
+        "error",
+        "failed",
+        "failure",
+        "traceback",
+        "exception",
+        "no such file",
+        "not found",
+        "permission denied",
+        "could not find",
+        "couldn't find",
+        "oldtext must match",
+        "must match exactly",
+        "no changes made",
+        "0 replacements",
+        "command exited with code 1",
+        "exit code 1",
+        "exited with code",
+        "indentationerror",
+        "syntaxerror",
+    )
     return not any(marker in combined for marker in failure_markers)
+
+
+
+def should_continue_after_failed_tool(messages: list[dict[str, Any]]) -> bool:
+    summary = _extract_single_terminal_tool_summary(messages)
+    if summary is None or _looks_like_successful_tool_result(messages):
+        return False
+    tool_name, _arguments = summary
+    return tool_name in {"edit", "bash", "write"}
 
 
 
@@ -347,6 +377,8 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
     if is_placeholder_transport_artifact(text):
         return text, ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder transport artifact")
     if not allow_tool_calls and action_tool_calls(action):
+        if should_continue_after_failed_tool(dumped_messages):
+            return text, action
         return text, ParsedAssistantAction(kind="invalid_tool", parse_error="tool calls are not allowed after tool results")
     if action.kind == "final" and is_tool_access_refusal_text(text):
         recovery_prompt = build_tool_access_recovery_prompt(prompt_override or extract_latest_user_text(dumped_messages), require_write=require_write)
@@ -407,7 +439,11 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
             _resolved_conversation_id, resolved_state = resolve_conversation_state(model=request.model, messages=dumped_messages, conversation_id=conversation_id)
             if settings.agent_after_tools_plan_enabled:
                 pending_after_tools_plan = get_pending_after_tools_plan(resolved_state, dumped_messages)
-            if task_mode and tool_round_count < max_tool_rounds:
+            if should_continue_after_failed_tool(dumped_messages):
+                allow_tool_calls = True
+                decision = build_tool_failure_recovery_prompt(dumped_messages, request.tools)
+                prompt_override = decision.prompt
+            elif task_mode and tool_round_count < max_tool_rounds:
                 allow_tool_calls = True
                 decision = build_task_continuation_prompt(dumped_messages, request.tools, tool_round_count, max_tool_rounds)
                 prompt_override = decision.prompt

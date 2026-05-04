@@ -11,6 +11,7 @@ import {
   detectPageInterruptionStateFromText,
   extractToolCallText,
   extractWriteContentText,
+  extractCommandContentText,
   isWriteToolCall,
   extractToolCallWithWriteContent,
   isPromptExampleToolCall,
@@ -118,6 +119,29 @@ describe('playwright transport helper extraction', () => {
       '</write_content>',
     ].join('\n')
 
+    expect(normalizeAssistantText(raw)).toBe(raw)
+    expect(chooseBetterAssistantText('', raw)).toBe(raw)
+  })
+
+  test('normalizeAssistantText preserves fenced command_content for bash calls', () => {
+    const raw = [
+      '<tool_call>',
+      '<name>bash</name>',
+      '<arguments>',
+      '<timeout>10</timeout>',
+      '</arguments>',
+      '</tool_call>',
+      '<command_content>',
+      '```bash',
+      "python - <<'PY'",
+      'if True:',
+      '    print("ok")',
+      'PY',
+      '```',
+      '</command_content>',
+    ].join('\n')
+
+    expect(extractCommandContentText(raw)).toContain('if True:')
     expect(normalizeAssistantText(raw)).toBe(raw)
     expect(chooseBetterAssistantText('', raw)).toBe(raw)
   })

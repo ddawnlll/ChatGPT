@@ -1102,24 +1102,44 @@ function extractWriteContentText(text) {
   return match ? match[0].trim() : null
 }
 
+function extractCommandContentText(text) {
+  const match = String(text || '').match(/<command_content>\s*[\s\S]*?\s*<\/command_content>/i)
+  return match ? match[0].trim() : null
+}
+
 function isWriteToolCall(text) {
   const raw = String(text || '')
   return /<name>\s*write\s*<\/name>/i.test(raw) || /"name"\s*:\s*"write"/i.test(raw)
 }
 
-function extractToolCallWithWriteContent(text) {
+function isBashToolCall(text) {
+  const raw = String(text || '')
+  return /<name>\s*bash\s*<\/name>/i.test(raw) || /"name"\s*:\s*"bash"/i.test(raw)
+}
+
+function extractToolCallWithSidecarContent(text) {
   const raw = String(text || '')
   const toolCall = extractToolCallText(raw)
   if (!toolCall) return null
 
+  const toolCallIndex = raw.lastIndexOf(toolCall)
+  const trailingText = toolCallIndex >= 0 ? raw.slice(toolCallIndex + toolCall.length) : raw
+
   if (isWriteToolCall(toolCall)) {
-    const toolCallIndex = raw.lastIndexOf(toolCall)
-    const trailingText = toolCallIndex >= 0 ? raw.slice(toolCallIndex + toolCall.length) : raw
     const writeContent = extractWriteContentText(trailingText)
     if (writeContent) return `${toolCall}\n${writeContent}`
   }
 
+  if (isBashToolCall(toolCall)) {
+    const commandContent = extractCommandContentText(trailingText)
+    if (commandContent) return `${toolCall}\n${commandContent}`
+  }
+
   return toolCall
+}
+
+function extractToolCallWithWriteContent(text) {
+  return extractToolCallWithSidecarContent(text)
 }
 
 function isPromptExampleToolCall(text) {
@@ -1161,7 +1181,7 @@ function hasIncompleteTaggedResponse(text) {
 
 function normalizeAssistantText(text) {
   const raw = String(text || '').replace(/\r/g, '')
-  const taggedToolCall = extractToolCallWithWriteContent(raw)
+  const taggedToolCall = extractToolCallWithSidecarContent(raw)
   if (taggedToolCall !== null && !isPromptExampleToolCall(taggedToolCall) && !isPlaceholderToolCallText(taggedToolCall)) return taggedToolCall
   const taggedFinal = extractFinalResponseText(raw)
   if (taggedFinal !== null) return taggedFinal
@@ -1238,8 +1258,8 @@ function chooseBetterAssistantText(primary, fallback) {
   const primaryNormalized = normalizeAssistantText(primary)
   const fallbackNormalized = normalizeAssistantText(fallback)
 
-  const primaryExtractedToolCall = extractToolCallWithWriteContent(primary)
-  const fallbackExtractedToolCall = extractToolCallWithWriteContent(fallback)
+  const primaryExtractedToolCall = extractToolCallWithSidecarContent(primary)
+  const fallbackExtractedToolCall = extractToolCallWithSidecarContent(fallback)
   const primaryHasToolCallTag = primaryExtractedToolCall !== null && !isPromptExampleToolCall(primaryExtractedToolCall) && !isPlaceholderToolCallText(primaryExtractedToolCall)
   const fallbackHasToolCallTag = fallbackExtractedToolCall !== null && !isPromptExampleToolCall(fallbackExtractedToolCall) && !isPlaceholderToolCallText(fallbackExtractedToolCall)
   const primaryHasFinalTag = extractFinalResponseText(primary) !== null
@@ -1999,6 +2019,7 @@ export {
   extractFinalResponseText,
   extractToolCallText,
   extractWriteContentText,
+  extractCommandContentText,
   isWriteToolCall,
   extractToolCallWithWriteContent,
   isPromptExampleToolCall,
@@ -2031,6 +2052,7 @@ export default {
   extractAllFinalResponseTexts,
   extractToolCallText,
   extractWriteContentText,
+  extractCommandContentText,
   isWriteToolCall,
   extractToolCallWithWriteContent,
   extractAllToolCallTexts,
