@@ -30,9 +30,16 @@ def _find_free_port() -> int:
 
 
 @contextmanager
-def running_proxy_server(monkeypatch: pytest.MonkeyPatch, complete_chat_turn_impl: Callable[..., tuple[str, str | None]]):
+def running_proxy_server(
+    monkeypatch: pytest.MonkeyPatch,
+    complete_chat_turn_impl: Callable[..., tuple[str, str | None]],
+    *,
+    complete_chat_impl: Callable[..., str] | None = None,
+):
     conversation_store.clear()
     monkeypatch.setattr(router_module, "complete_chat_turn", complete_chat_turn_impl)
+    if complete_chat_impl is not None:
+        monkeypatch.setattr(router_module, "complete_chat", complete_chat_impl)
 
     port = _find_free_port()
     app = create_app()
@@ -144,6 +151,40 @@ def test_pi_cli_rejects_incomplete_final_response_tag(monkeypatch, tmp_path):
     assert result.returncode != 0
     combined = f"{result.stdout}\n{result.stderr}"
     assert "incomplete final_response tag" in combined or "malformed_tool_call" in combined
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_first_turn_malformed_tool_call_is_repaired_and_tool_executes(monkeypatch, tmp_path):
+    requests: list[list[dict[str, Any]]] = []
+
+    def fake_complete_chat_turn(**kwargs):
+        messages = kwargs["messages"]
+        requests.append(messages)
+        if any(message.get("role") == "tool" for message in messages):
+            return ("<final_response>read done.</final_response>", "conv-pi-repair")
+        return ('<tool_call>{"name":"read","arguments":{"path":"sample.txt" "timeout":10}}</tool_call>', "conv-pi-repair")
+
+    def fake_complete_chat(**kwargs):
+        return """
+<tool_call>
+<name>read</name>
+<arguments>
+<path>sample.txt</path>
+</arguments>
+</tool_call>
+"""
+
+    (tmp_path / "sample.txt").write_text("alpha\n", encoding="utf-8")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn, complete_chat_impl=fake_complete_chat) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Read sample.txt", tools="read")
+
+    assert result.returncode == 0, result.stderr
+    assert "read done." in result.stdout
+    assert len(requests) >= 2
+    assert any(message.get("role") == "tool" and "alpha" in str(message.get("content", "")) for message in requests[-1])
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")

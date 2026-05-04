@@ -234,6 +234,7 @@ These cover:
 - router and SSE regressions for pi-agent-compatible requests
 - mocked pi tool contract tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - real pi CLI integration tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- real pi CLI regression coverage for first-turn malformed tool-call recovery after a fresh proxy start
 - fake Playwright daemon protocol tests
 - JS helper tests for `tools/playwright_chat_transport.mjs`
 

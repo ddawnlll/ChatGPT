@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   extractAllFinalResponseTexts,
+  extractAllToolCallTexts,
   extractFinalResponseText,
+  extractToolCallText,
+  hasIncompleteTaggedResponse,
   normalizeAssistantText,
   chooseBetterAssistantText,
   computeAppendDelta,
@@ -29,10 +32,31 @@ describe('playwright transport helper extraction', () => {
     expect(normalizeAssistantText(raw)).toBe('Ready.')
   })
 
+  test('extractToolCallText prefers last tool_call block', () => {
+    const raw = [
+      '<tool_call><name>read</name><arguments><path>a</path></arguments></tool_call>',
+      '<tool_call><name>bash</name><arguments><command>pwd</command></arguments></tool_call>',
+    ].join('\n')
+    expect(extractToolCallText(raw)).toContain('<name>bash</name>')
+    expect(extractAllToolCallTexts(raw)).toHaveLength(2)
+  })
+
+  test('normalizeAssistantText returns empty string for incomplete tool tag and full text for complete tool call', () => {
+    expect(normalizeAssistantText('<')).toBe('')
+    expect(hasIncompleteTaggedResponse('<')).toBe(true)
+    const full = '<tool_call><name>bash</name><arguments><command>tree app</command></arguments></tool_call>'
+    expect(normalizeAssistantText(full)).toBe(full)
+  })
+
   test('chooseBetterAssistantText prefers tagged final response over thinking placeholder', () => {
     expect(
       chooseBetterAssistantText('Thinking', '<final_response>Ready.</final_response>'),
     ).toBe('Ready.')
+  })
+
+  test('chooseBetterAssistantText prefers complete tool call over partial capture', () => {
+    const full = '<tool_call><name>bash</name><arguments><command>tree app 2>/dev/null || find app -print | sort</command><timeout>10</timeout></arguments></tool_call>'
+    expect(chooseBetterAssistantText('<', full)).toBe(full)
   })
 
   test('computeAppendDelta emits replacement when earlier text diverges strongly', () => {

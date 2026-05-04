@@ -812,6 +812,12 @@ function extractAllFinalResponseTexts(text) {
     .filter(Boolean)
 }
 
+function extractAllToolCallTexts(text) {
+  return Array.from(String(text || '').matchAll(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/gi))
+    .map((match) => String(match[0] || '').trim())
+    .filter(Boolean)
+}
+
 async function extractPageFinalResponseText(page, baselineText = '') {
   const baselineMatches = extractAllFinalResponseTexts(baselineText)
 
@@ -836,6 +842,30 @@ async function extractPageFinalResponseText(page, baselineText = '') {
   return ''
 }
 
+async function extractPageToolCallText(page, baselineText = '') {
+  const baselineMatches = extractAllToolCallTexts(baselineText)
+
+  try {
+    const html = await page.locator('body').evaluate((node) => node.innerHTML).catch(() => '')
+    const htmlMatches = extractAllToolCallTexts(html)
+    if (htmlMatches.length > baselineMatches.length) return htmlMatches[htmlMatches.length - 1]
+    if (htmlMatches.length && htmlMatches.join('\n') !== baselineMatches.join('\n')) return htmlMatches[htmlMatches.length - 1]
+  } catch (err) {
+    emitError('page_tool_call_html_extract_failed', err)
+  }
+
+  try {
+    const text = await page.locator('body').innerText().catch(() => '')
+    const textMatches = extractAllToolCallTexts(text)
+    if (textMatches.length > baselineMatches.length) return textMatches[textMatches.length - 1]
+    if (textMatches.length && textMatches.join('\n') !== baselineMatches.join('\n')) return textMatches[textMatches.length - 1]
+  } catch (err) {
+    emitError('page_tool_call_text_extract_failed', err)
+  }
+
+  return ''
+}
+
 async function waitForAssistantResultFallback(page, baselineAssistant, baselinePageText, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs
   let bestText = ''
@@ -846,12 +876,15 @@ async function waitForAssistantResultFallback(page, baselineAssistant, baselineP
       const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
       const domText = latestAssistant?.locator ? String(await extractAssistantText(latestAssistant.locator) || '').trim() : ''
       const pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
+      const pageToolCallText = String(await extractPageToolCallText(page, baselinePageText) || '').trim()
 
       let candidate = chooseBetterAssistantText(bestText, domText).trim()
       candidate = chooseBetterAssistantText(candidate, pageFinalResponseText).trim()
+      candidate = chooseBetterAssistantText(candidate, pageToolCallText).trim()
 
-      if (candidate && !isIgnorableAssistantText(candidate)) {
-        if (candidate === pageFinalResponseText) bestSource = 'page_final_response'
+      if (candidate && !isIgnorableAssistantText(candidate) && !hasIncompleteTaggedResponse(candidate)) {
+        if (candidate === pageToolCallText) bestSource = 'page_tool_call'
+        else if (candidate === pageFinalResponseText) bestSource = 'page_final_response'
         else if (candidate === domText) bestSource = 'assistant_dom'
         else bestSource = 'combined'
         return { text: candidate, source: bestSource }
@@ -915,10 +948,31 @@ function extractFinalResponseText(text) {
   return String(matches[matches.length - 1][1] || '').trim()
 }
 
+function extractToolCallText(text) {
+  const matches = extractAllToolCallTexts(text)
+  if (!matches.length) return null
+  return matches[matches.length - 1]
+}
+
+function hasIncompleteTaggedResponse(text) {
+  const raw = String(text || '').trim().toLowerCase()
+  if (!raw) return false
+  if (raw === '<' || raw === '</' || raw === '>') return true
+  if (raw.includes('<tool_call') && !extractToolCallText(raw)) return true
+  if (raw.includes('<final') && extractFinalResponseText(raw) === null) return true
+  if ((raw.startsWith('<tool') || raw.startsWith('<name') || raw.startsWith('<arguments') || raw.startsWith('<command') || raw.startsWith('<final')) && !extractToolCallText(raw) && extractFinalResponseText(raw) === null) {
+    return true
+  }
+  return false
+}
+
 function normalizeAssistantText(text) {
   const raw = String(text || '').replace(/\r/g, '')
+  const taggedToolCall = extractToolCallText(raw)
+  if (taggedToolCall !== null) return taggedToolCall
   const taggedFinal = extractFinalResponseText(raw)
   if (taggedFinal !== null) return taggedFinal
+  if (hasIncompleteTaggedResponse(raw)) return ''
 
   const cleanedLines = raw
     .split('\n')
@@ -984,11 +1038,20 @@ function chooseBetterAssistantText(primary, fallback) {
   const primaryNormalized = normalizeAssistantText(primary)
   const fallbackNormalized = normalizeAssistantText(fallback)
 
+  const primaryHasToolCallTag = extractToolCallText(primary) !== null
+  const fallbackHasToolCallTag = extractToolCallText(fallback) !== null
   const primaryHasFinalTag = extractFinalResponseText(primary) !== null
   const fallbackHasFinalTag = extractFinalResponseText(fallback) !== null
 
+  if (fallbackHasToolCallTag && !primaryHasToolCallTag) return fallbackNormalized
+  if (primaryHasToolCallTag && !fallbackHasToolCallTag) return primaryNormalized
   if (fallbackHasFinalTag && !primaryHasFinalTag) return fallbackNormalized
   if (primaryHasFinalTag && !fallbackHasFinalTag) return primaryNormalized
+
+  const primaryIncomplete = hasIncompleteTaggedResponse(primary)
+  const fallbackIncomplete = hasIncompleteTaggedResponse(fallback)
+  if (primaryIncomplete && !fallbackIncomplete) return fallbackNormalized
+  if (fallbackIncomplete && !primaryIncomplete) return primaryNormalized
 
   const primaryIgnorable = isIgnorableAssistantText(primaryNormalized)
   const fallbackIgnorable = isIgnorableAssistantText(fallbackNormalized)
@@ -1480,8 +1543,10 @@ async function handleRequest(request) {
         domFallbackText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
       }
       pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
+      const pageToolCallText = String(await extractPageToolCallText(page, baselinePageText) || '').trim()
       finalText = chooseBetterAssistantText(finalText, domFallbackText).trim()
       finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
+      finalText = chooseBetterAssistantText(finalText, pageToolCallText).trim()
       emit({
         type: 'status',
         stage: 'assistant_dom_reconciled_after_stream',
@@ -1490,9 +1555,12 @@ async function handleRequest(request) {
         stream_length: String(streamed?.text || '').trim().length,
         dom_length: domFallbackText.length,
         page_final_length: pageFinalResponseText.length,
+        page_tool_call_length: pageToolCallText.length,
         chosen_length: finalText.length,
         dom_has_final_response_tag: extractFinalResponseText(domFallbackText) !== null,
+        dom_has_tool_call_tag: extractToolCallText(domFallbackText) !== null,
         page_has_final_response_tag: Boolean(pageFinalResponseText),
+        page_has_tool_call_tag: Boolean(pageToolCallText),
       })
     } catch (err) {
       emitError('assistant_dom_reconcile_after_stream_failed', err)
@@ -1647,7 +1715,10 @@ export {
   getAssistantSnapshot,
   findLatestAssistantLocator,
   extractAllFinalResponseTexts,
+  extractAllToolCallTexts,
   extractFinalResponseText,
+  extractToolCallText,
+  hasIncompleteTaggedResponse,
   normalizeAssistantText,
   computeAppendDelta,
   isIgnorableAssistantText,
@@ -1668,6 +1739,9 @@ export default {
   normalizeAssistantText,
   extractFinalResponseText,
   extractAllFinalResponseTexts,
+  extractToolCallText,
+  extractAllToolCallTexts,
+  hasIncompleteTaggedResponse,
   chooseBetterAssistantText,
   CONFIG,
 }
