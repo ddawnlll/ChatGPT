@@ -167,7 +167,7 @@ def build_tool_access_recovery_prompt(base_prompt: str, *, require_write: bool) 
         prompt += (
             "The current task requires the write tool.\n"
             "Emit exactly one write tool_call now.\n"
-            "Include the file path in <path> and the exact file body in <write_content>.\n"
+            "Include the file path in <path> and wrap the exact file body in exactly one fenced code block inside <write_content>.\n"
             "Do not emit <final_response>.\n"
         )
     else:
@@ -183,7 +183,14 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
         conversation_id=conversation_id,
         prompt_override=prompt_override,
     )
+    logger.warning("assistant_raw_text_before_parse=%r", text)
     action = parse_assistant_action(text)
+    logger.warning(
+        "assistant_parsed_action kind=%s tool_name=%s parse_error=%r",
+        getattr(action, "kind", None),
+        getattr(action, "tool_name", None),
+        getattr(action, "parse_error", None),
+    )
     if is_placeholder_transport_artifact(text):
         return text, ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder transport artifact")
     if action.kind == "final" and is_tool_access_refusal_text(text):
@@ -194,7 +201,14 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
             conversation_id=effective_conversation_id,
             prompt_override=recovery_prompt,
         )
+        logger.warning("assistant_recovered_raw_text_before_parse=%r", recovered_text)
         recovered_action = parse_assistant_action(recovered_text)
+        logger.warning(
+            "assistant_recovered_parsed_action kind=%s tool_name=%s parse_error=%r",
+            getattr(recovered_action, "kind", None),
+            getattr(recovered_action, "tool_name", None),
+            getattr(recovered_action, "parse_error", None),
+        )
         return recovered_text, recovered_action
     if should_retry_malformed_tool_call(action):
         repair_prompt = build_tool_repair_prompt(text, action.parse_error)
@@ -204,7 +218,14 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
             conversation_id=effective_conversation_id,
             prompt_override=repair_prompt,
         )
+        logger.warning("assistant_repaired_raw_text_before_parse=%r", repaired_text)
         repaired_action = parse_assistant_action(repaired_text)
+        logger.warning(
+            "assistant_repaired_parsed_action kind=%s tool_name=%s parse_error=%r",
+            getattr(repaired_action, "kind", None),
+            getattr(repaired_action, "tool_name", None),
+            getattr(repaired_action, "parse_error", None),
+        )
         return repaired_text, repaired_action
     return text, action
 
@@ -234,7 +255,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                 "The user's current task requires the write tool.\n"
                 "Emit exactly one write tool_call on this turn.\n"
                 "Do not answer with prose or claim you lack tool access.\n"
-                "Put the destination file path in <path> and the exact file body in <write_content>.\n"
+                "Put the destination file path in <path> and wrap the exact file body in exactly one fenced code block inside <write_content>.\n"
                 "Do not emit <final_response> on this turn.\n"
             )
         if request.parallel_tool_calls is True:

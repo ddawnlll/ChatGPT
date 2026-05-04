@@ -331,7 +331,9 @@ def test_agent_write_with_write_content_block_returns_content(monkeypatch):
 </arguments>
 </tool_call>
 <write_content>
+```python
 print(\"hello\")
+```
 </write_content>
 """,
             "conv-test",
@@ -372,9 +374,9 @@ def test_agent_write_with_write_content_invalid_python_returns_syntax_error_with
 
     def fake_complete_chat_turn(**kwargs):
         calls.append(("turn", kwargs))
-        # This intentionally includes <write_content> but invalid Python.
-        # The expected failure is syntax validation, not missing content,
-        # and write failures must not trigger repair prompts.
+        # This intentionally includes <write_content> with one fenced block
+        # but invalid Python. The expected failure is syntax validation,
+        # not missing content, and write failures must not trigger repair prompts.
         return (
             """
 <tool_call>
@@ -384,9 +386,11 @@ def test_agent_write_with_write_content_invalid_python_returns_syntax_error_with
 </arguments>
 </tool_call>
 <write_content>
+```python
 class A:
 def broken(self):
 pass
+```
 </write_content>
 """,
             "conv-test",
@@ -514,7 +518,9 @@ def test_agent_prompt_marks_write_required_requests(monkeypatch):
 </arguments>
 </tool_call>
 <write_content>
+```python
 print(\"smoke ok\")
+```
 </write_content>
 """,
             "conv-test",
@@ -543,6 +549,7 @@ print(\"smoke ok\")
     assert "Request classification: write_required." in prompt_override
     assert "Emit exactly one write tool_call on this turn." in prompt_override
     assert "Do not answer with prose or claim you lack tool access." in prompt_override
+    assert "exactly one fenced code block inside <write_content>" in prompt_override
 
 
 
@@ -567,7 +574,9 @@ def test_agent_retries_tool_access_refusal_with_stronger_write_prompt(monkeypatc
 </arguments>
 </tool_call>
 <write_content>
+```python
 print(\"smoke ok\")
+```
 </write_content>
 """
         )
@@ -598,3 +607,4 @@ print(\"smoke ok\")
     recovery_prompt = [kwargs["prompt_override"] for kind, kwargs in calls if kind == "recovery"][0]
     assert "Recovery rule:" in recovery_prompt
     assert "The current task requires the write tool." in recovery_prompt
+    assert "exactly one fenced code block inside <write_content>" in recovery_prompt

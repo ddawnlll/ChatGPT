@@ -751,7 +751,8 @@ async function extractAssistantText(locator) {
 
       if (tag === 'pre') {
         const codeEl = el.querySelector('code')
-        const code = (codeEl?.textContent || el.textContent || '').trimEnd()
+        const rawCode = codeEl?.innerText || el.innerText || codeEl?.textContent || el.textContent || ''
+        const code = String(rawCode).replace(/\r/g, '').trimEnd()
         const langMatch = (codeEl?.className || '').match(/language-([\w+-]+)/i)
         return `\n\n\`\`\`${langMatch ? langMatch[1] : ''}\n${code}\n\`\`\`\n\n`
       }
@@ -1383,7 +1384,8 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null, op
           if (el.getAttribute('role') === 'button' || el.getAttribute('aria-label')) return ''
           if (tag === 'pre') {
             const codeEl = el.querySelector('code')
-            const code = (codeEl?.textContent || el.textContent || '').trimEnd()
+            const rawCode = codeEl?.innerText || el.innerText || codeEl?.textContent || el.textContent || ''
+            const code = String(rawCode).replace(/\r/g, '').trimEnd()
             const lang = (codeEl?.className || '').match(/language-([\w+-]+)/i)?.[1] || ''
             return `\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n`
           }

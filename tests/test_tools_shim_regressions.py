@@ -111,14 +111,16 @@ find app -print | sed 's|[^/]*/|  |g; s|  \([^ ]\)|├── \1|'
     }
 
 
-def test_parse_xml_write_tool_call_with_raw_content():
+def test_parse_xml_write_tool_call_with_fenced_content_argument():
     text = """
 <tool_call>
 <name>write</name>
 <arguments>
 <path>app/test.py</path>
 <content>
+```python
 print(\"hello world\")
+```
 </content>
 </arguments>
 </tool_call>
@@ -134,7 +136,7 @@ print(\"hello world\")
     }
 
 
-def test_parse_xml_write_tool_call_with_separate_write_content_block():
+def test_parse_xml_write_tool_call_with_separate_fenced_write_content_block():
     text = """
 <tool_call>
 <name>write</name>
@@ -143,6 +145,7 @@ def test_parse_xml_write_tool_call_with_separate_write_content_block():
 </arguments>
 </tool_call>
 <write_content>
+```python
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -154,6 +157,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     pass
+```
 </write_content>
 """
 
@@ -166,7 +170,7 @@ if __name__ == "__main__":
     assert 'self.wfile.write(b"Hello from server.py\\n")' in action.tool_arguments["content"]
 
 
-def test_parse_xml_write_rejects_unindented_python_write_content():
+def test_parse_xml_write_rejects_multiple_fenced_blocks():
     text = """
 <tool_call>
 <name>write</name>
@@ -175,11 +179,42 @@ def test_parse_xml_write_rejects_unindented_python_write_content():
 </arguments>
 </tool_call>
 <write_content>
+```python
+body = b"hello"
+```
+
+def run():
+server = None
+
+```python
+server.serve_forever()
+```
+</write_content>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error is not None
+    assert "exactly one fenced code block" in action.parse_error
+
+
+def test_parse_xml_write_rejects_unindented_fenced_python_write_content():
+    text = """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+```python
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class SimpleHandler(BaseHTTPRequestHandler):
 def do_GET(self):
 self.send_response(200)
+```
 </write_content>
 """
 
@@ -252,6 +287,8 @@ def test_prompt_prefers_write_content_block_and_skips_internal_repair_prompt():
     assert "&lt;write_content&gt;" in prompt
     assert "Do not put file content inside JSON." in prompt
     assert "Do not put file content inside <content>." in prompt
+    assert "exactly one fenced markdown code block" in prompt
+    assert "```python" in prompt
     assert "Create server.py" in prompt
     assert "Your previous response was malformed and could not be executed as a tool call." not in prompt
     assert "Malformed previous response to repair:" not in prompt
@@ -285,9 +322,11 @@ def test_invalid_python_write_is_not_retryable():
 </arguments>
 </tool_call>
 <write_content>
+```python
 class A:
 def broken(self):
 pass
+```
 </write_content>
 """
     )

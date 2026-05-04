@@ -33,7 +33,13 @@ def browser_client():
 @pytest.mark.skipif(os.environ.get("RUN_BROWSER_E2E") != "1", reason="set RUN_BROWSER_E2E=1 to run real browser smoke tests")
 def test_real_browser_write_tool_call_preserves_write_content(browser_client: TestClient):
     user_id = f"browser-write-smoke-{uuid4().hex}"
-    prompt = 'Create app/smoke_server.py. Use write. The file content must be exactly:\nprint("smoke ok")'
+    prompt = (
+        "Create app/smoke_server.py using write. "
+        "Return exactly one write tool call. "
+        "Inside <write_content>, put exactly one ```python fenced code block. "
+        "The file content inside the fence must be exactly:\n"
+        'print("smoke ok")'
+    )
 
     last_choice = None
     last_debug = None

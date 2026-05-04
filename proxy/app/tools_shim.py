@@ -217,11 +217,18 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "&lt;/arguments&gt;\n"
         "&lt;/tool_call&gt;\n"
         "&lt;write_content&gt;\n"
+        "```python\n"
         "RAW FILE CONTENT\n"
+        "```\n"
         "&lt;/write_content&gt;\n"
-        "Do not put file content inside JSON.\n"
-        "Do not put file content inside <content>.\n"
-        "Do not markdown-fence file content.\n"
+        "Rules for write_content:\n"
+        "- Put the entire file content inside exactly one fenced markdown code block.\n"
+        "- Do not split the file across multiple code blocks.\n"
+        "- Do not put any file content outside the fenced block.\n"
+        "- Use the correct language fence when known, for example ```python for .py files.\n"
+        "- The content inside the fenced block must be the exact file content.\n"
+        "- Do not put file content inside JSON.\n"
+        "- Do not put file content inside <content>.\n"
         "For simple arguments like path or timeout, use separate XML tags inside <arguments>.\n\n"
         "2) Legacy compatibility format (allowed but less reliable for string-heavy arguments, example escaped so it is not mistaken for your answer):\n"
         "&lt;tool_call&gt;{\"name\":\"read\",\"arguments\":{\"path\":\"app/main.py\"}}&lt;/tool_call&gt;\n\n"
@@ -234,8 +241,8 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "Preserve indentation exactly as it should appear in the file.\n"
         "If writing Python, every class/function body must be correctly indented and syntactically valid Python.\n"
         "For Python write_content:\n"
-        "- Use 4-space indentation.\n"
-        "- Do not use markdown formatting.\n"
+        "- Use 4-space indentation inside the fenced block.\n"
+        "- Use exactly one ```python fenced block wrapping the whole file.\n"
         "- Use __name__ and __main__ literally when needed.\n"
         "- Before emitting, mentally verify ast.parse would pass.\n"
         "Do not rewrite code into markdown, bullet points, or prose.\n"
@@ -272,36 +279,81 @@ def _decode_loose_string(value: str) -> str:
         return text.replace(r"\n", "\n").replace(r"\t", "\t").replace(r'\"', '"').replace(r"\\", "\\")
 
 
-def _strip_markdown_fences(content: str) -> str:
-    lines = content.splitlines()
-    cleaned = [line for line in lines if not line.strip().startswith("```")]
-    return "\n".join(cleaned)
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(```|~~~)([A-Za-z0-9_.+-]+)?[ \t]*$")
+
+
+def _unwrap_single_markdown_fence(content: str) -> tuple[str | None, str | None]:
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    if text.startswith("\n"):
+        text = text[1:]
+
+    lines = text.splitlines(keepends=True)
+
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+
+    if first is None or last is None:
+        return "", None
+
+    fence_lines = [
+        i for i, line in enumerate(lines)
+        if _FENCE_LINE_RE.match(line.strip())
+    ]
+
+    if not fence_lines:
+        return None, "write_content must contain exactly one fenced code block"
+
+    if fence_lines != [first, last]:
+        return None, "write_content must contain exactly one fenced code block wrapping the entire file content"
+
+    start = _FENCE_LINE_RE.match(lines[first].strip())
+    end = _FENCE_LINE_RE.match(lines[last].strip())
+
+    if not start or not end or start.group(1) != end.group(1):
+        return None, "write_content fenced code block has mismatched fence markers"
+
+    inner = "".join(lines[first + 1:last])
+
+    if any(_FENCE_LINE_RE.match(line.strip()) for line in inner.splitlines()):
+        return None, "write_content contains multiple fenced code blocks; use exactly one block"
+
+    return inner, None
 
 
 def _normalize_python_dunder_markdown(content: str) -> str:
     return re.sub(r"\*\*([A-Za-z_][A-Za-z0-9_]*)\*\*", r"__\1__", content)
 
 
-def _clean_write_content(path: str, content: str) -> str:
+def _clean_write_content(path: str, content: str, *, require_fence: bool) -> tuple[str | None, str | None]:
     cleaned = content.replace("\r\n", "\n").replace("\r", "\n")
-    if cleaned.startswith("\n"):
+
+    if require_fence:
+        fenced, fence_error = _unwrap_single_markdown_fence(cleaned)
+        if fence_error is not None:
+            return None, fence_error
+        cleaned = fenced if fenced is not None else cleaned
+    elif cleaned.startswith("\n"):
         cleaned = cleaned[1:]
-    cleaned = _strip_markdown_fences(cleaned)
+
     if Path(path).suffix == ".py":
         cleaned = _normalize_python_dunder_markdown(cleaned)
     if cleaned and not cleaned.endswith("\n"):
         cleaned += "\n"
-    return cleaned
+    return cleaned, None
 
 
-def _validate_write_arguments(arguments: dict[str, Any]) -> ParsedAssistantAction | None:
+def _validate_write_arguments(arguments: dict[str, Any], *, require_fence: bool) -> ParsedAssistantAction | None:
     path = arguments.get("path")
     content = arguments.get("content")
     if not isinstance(path, str):
         return ParsedAssistantAction(kind="invalid_tool", parse_error="write tool call missing path")
     if not isinstance(content, str):
         return ParsedAssistantAction(kind="invalid_tool", parse_error="write tool call missing content")
-    cleaned = _clean_write_content(path, content)
+    cleaned, clean_error = _clean_write_content(path, content, require_fence=require_fence)
+    if clean_error is not None:
+        return ParsedAssistantAction(kind="invalid_tool", parse_error=clean_error)
+    assert cleaned is not None
     if Path(path).suffix == ".py":
         try:
             ast.parse(cleaned)
@@ -329,7 +381,7 @@ def _recover_write_payload(payload: str, full_text: str) -> ParsedAssistantActio
         if content.startswith("\n"):
             content = content[1:]
         arguments = {"path": _decode_loose_string(path_match.group(1)), "content": content}
-        invalid = _validate_write_arguments(arguments)
+        invalid = _validate_write_arguments(arguments, require_fence=True)
         if invalid is not None:
             return invalid
         return ParsedAssistantAction(
@@ -356,7 +408,7 @@ def _recover_write_payload(payload: str, full_text: str) -> ParsedAssistantActio
     end = max(end_positions)
     content = remainder[:end]
     arguments = {"path": _decode_loose_string(path_match.group(1)), "content": _decode_loose_string(content)}
-    invalid = _validate_write_arguments(arguments)
+    invalid = _validate_write_arguments(arguments, require_fence=False)
     if invalid is not None:
         return invalid
     return ParsedAssistantAction(
@@ -405,6 +457,7 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
             arguments[key] = _coerce_xml_arg_value(key, value)
 
     if name == "write":
+        require_fence = isinstance(arguments.get("content"), str)
         if "content" not in arguments:
             write_content_match = _WRITE_CONTENT_RE.search(raw)
             if write_content_match:
@@ -412,6 +465,7 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
                 if content.startswith("\n"):
                     content = content[1:]
                 arguments["content"] = content
+                require_fence = True
 
         if "content" not in arguments:
             content_match = re.search(r"<content>(.*?)</content>", payload, re.DOTALL | re.IGNORECASE)
@@ -420,8 +474,9 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
                 if content.startswith("\n"):
                     content = content[1:]
                 arguments["content"] = content
+                require_fence = True
 
-        invalid = _validate_write_arguments(arguments)
+        invalid = _validate_write_arguments(arguments, require_fence=require_fence)
         if invalid is not None:
             return invalid
 
@@ -439,6 +494,7 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
                 return ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder tool name")
             if name == "write":
                 path = arguments.get("path")
+                require_fence = False
                 if isinstance(arguments.get("filename"), str) and not isinstance(path, str):
                     arguments = {**arguments, "path": arguments["filename"]}
                     arguments.pop("filename", None)
@@ -448,7 +504,8 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
                     if content.startswith("\n"):
                         content = content[1:]
                     arguments = {**arguments, "content": content}
-                invalid = _validate_write_arguments(arguments)
+                    require_fence = True
+                invalid = _validate_write_arguments(arguments, require_fence=require_fence)
                 if invalid is not None:
                     return invalid
             return ParsedAssistantAction(kind="tool", tool_name=name, tool_arguments=arguments)
@@ -584,12 +641,14 @@ def build_tool_repair_prompt(bad_response: str, parse_error: str | None) -> str:
         "<path>path/to/file</path>\n"
         "</arguments>\n"
         "</tool_call>\n"
-        "<write_content>\nRAW FILE CONTENT HERE\n</write_content>\n\n"
+        "<write_content>\n```python\nRAW FILE CONTENT HERE\n```\n</write_content>\n\n"
         "Rules:\n"
-        "- Output raw file contents only inside <write_content>.\n"
+        "- Output the entire file only inside <write_content>.\n"
+        "- Wrap the entire file in exactly one fenced markdown code block.\n"
+        "- Do not split the file across multiple code blocks.\n"
+        "- Do not put any file content outside the fenced block.\n"
         "- Do not put write file content inside JSON.\n"
         "- Do not put write file content inside <content>.\n"
-        "- No markdown fences.\n"
         "- Preserve indentation exactly.\n"
         "- If Python, ensure syntactically valid indentation and valid __name__ == \"__main__\" style dunder usage.\n"
         "- Do not include <final_response>.\n"

@@ -87,15 +87,34 @@ describe('playwright transport helper extraction', () => {
   test('normalizeAssistantText keeps only the last write tool call with its matching write_content', () => {
     const raw = [
       '<tool_call><name>write</name><arguments><path>old.py</path></arguments></tool_call>',
-      '<write_content>print("old")</write_content>',
+      '<write_content>```python\nprint("old")\n```</write_content>',
       '<tool_call><name>write</name><arguments><path>new.py</path></arguments></tool_call>',
-      '<write_content>print("new")</write_content>',
+      '<write_content>```python\nprint("new")\n```</write_content>',
     ].join('\n')
 
     expect(normalizeAssistantText(raw)).toBe([
       '<tool_call><name>write</name><arguments><path>new.py</path></arguments></tool_call>',
-      '<write_content>print("new")</write_content>',
+      '<write_content>```python\nprint("new")\n```</write_content>',
     ].join('\n'))
+  })
+
+  test('normalizeAssistantText preserves fenced write_content for write calls', () => {
+    const raw = [
+      '<tool_call>',
+      '<name>write</name>',
+      '<arguments>',
+      '<path>app/server.py</path>',
+      '</arguments>',
+      '</tool_call>',
+      '<write_content>',
+      '```python',
+      'print("smoke ok")',
+      '```',
+      '</write_content>',
+    ].join('\n')
+
+    expect(normalizeAssistantText(raw)).toBe(raw)
+    expect(chooseBetterAssistantText('', raw)).toBe(raw)
   })
 
   test('isPromptExampleToolCall rejects prompt template examples', () => {
