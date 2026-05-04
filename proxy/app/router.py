@@ -93,7 +93,90 @@ def is_placeholder_transport_artifact(text: str) -> bool:
 
 
 
-def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None) -> tuple[str, Any]:
+def extract_latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role", "")).strip().lower() != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"].strip())
+            text = "\n".join(part for part in parts if part).strip()
+            if text:
+                return text
+    return ""
+
+
+
+def request_requires_write_tool(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> bool:
+    tool_names = {tool.get("function", {}).get("name") for tool in (tools or []) if isinstance(tool, dict) and isinstance(tool.get("function"), dict)}
+    if "write" not in tool_names:
+        return False
+    latest_user_text = extract_latest_user_text(messages).lower()
+    if not latest_user_text:
+        return False
+    write_signals = (
+        "create ",
+        "write ",
+        "create file",
+        "write file",
+        "save ",
+        "make file",
+        ".py",
+        ".js",
+        ".ts",
+        ".json",
+        ".md",
+    )
+    return any(signal in latest_user_text for signal in write_signals)
+
+
+
+def is_tool_access_refusal_text(text: str) -> bool:
+    raw = str(text or "").strip().lower().replace("’", "'").replace("`", "'")
+    return any(
+        token in raw
+        for token in (
+            "i don't have access",
+            "i do not have access",
+            "i can't access",
+            "i cannot access",
+            "no access to the",
+            "no access to pi",
+            "don't have access to the pi",
+            "cannot create",
+            "can't create",
+        )
+    )
+
+
+
+def build_tool_access_recovery_prompt(base_prompt: str, *, require_write: bool) -> str:
+    prompt = base_prompt.rstrip()
+    prompt += (
+        "\n\nRecovery rule:\n"
+        "Your previous reply incorrectly claimed you lacked tool access. That was wrong.\n"
+        "In this environment, you DO have access through the provided pi tools.\n"
+        "Do not output prose, apologies, or access disclaimers on this turn.\n"
+    )
+    if require_write:
+        prompt += (
+            "The current task requires the write tool.\n"
+            "Emit exactly one write tool_call now.\n"
+            "Include the file path in <path> and the exact file body in <write_content>.\n"
+            "Do not emit <final_response>.\n"
+        )
+    else:
+        prompt += "If the user's task requires a tool, emit the needed tool_call now.\n"
+    return prompt
+
+
+
+def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None, require_write: bool = False) -> tuple[str, Any]:
     text, effective_conversation_id = complete_chat_turn(
         model=model,
         messages=dumped_messages,
@@ -103,6 +186,16 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
     action = parse_assistant_action(text)
     if is_placeholder_transport_artifact(text):
         return text, ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder transport artifact")
+    if action.kind == "final" and is_tool_access_refusal_text(text):
+        recovery_prompt = build_tool_access_recovery_prompt(prompt_override or extract_latest_user_text(dumped_messages), require_write=require_write)
+        recovered_text = complete_chat(
+            model=model,
+            messages=dumped_messages,
+            conversation_id=effective_conversation_id,
+            prompt_override=recovery_prompt,
+        )
+        recovered_action = parse_assistant_action(recovered_text)
+        return recovered_text, recovered_action
     if should_retry_malformed_tool_call(action):
         repair_prompt = build_tool_repair_prompt(text, action.parse_error)
         repaired_text = complete_chat(
@@ -130,9 +223,20 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
     dumped_messages = [message.model_dump() for message in request.messages]
     agent_mode = is_pi_agent_request(request.tools)
     prompt_override = None
+    require_write = False
     if agent_mode:
         decision = build_pi_agent_prompt(dumped_messages, request.tools)
         prompt_override = decision.prompt
+        require_write = request_requires_write_tool(dumped_messages, request.tools)
+        if require_write:
+            prompt_override += (
+                "\n\nRequest classification: write_required.\n"
+                "The user's current task requires the write tool.\n"
+                "Emit exactly one write tool_call on this turn.\n"
+                "Do not answer with prose or claim you lack tool access.\n"
+                "Put the destination file path in <path> and the exact file body in <write_content>.\n"
+                "Do not emit <final_response> on this turn.\n"
+            )
         if request.parallel_tool_calls is True:
             prompt_override += (
                 "\n\nRequest option: parallel_tool_calls=true.\n"
@@ -155,6 +259,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                         dumped_messages=dumped_messages,
                         conversation_id=conversation_id,
                         prompt_override=prompt_override,
+                        require_write=require_write,
                     )
                 except ValueError as exc:
                     yield sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_messages"}})
@@ -226,6 +331,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                 dumped_messages=dumped_messages,
                 conversation_id=conversation_id,
                 prompt_override=prompt_override,
+                require_write=require_write,
             )
         else:
             text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id, prompt_override=prompt_override)

@@ -47,7 +47,7 @@ def test_fake_playwright_daemon_failed_result_raises_runtime_error(monkeypatch, 
         transport.send_message("hello")
 
 
-def test_fake_playwright_daemon_replace_event_is_ignored_for_streaming(monkeypatch, playwright_transport, daemon_events):
+def test_fake_playwright_daemon_replace_event_is_forwarded_for_streaming(monkeypatch, playwright_transport, daemon_events):
     transport = playwright_transport
 
     monkeypatch.setattr(
@@ -69,7 +69,7 @@ def test_fake_playwright_daemon_replace_event_is_ignored_for_streaming(monkeypat
     )
 
     chunks = list(transport.stream_message("hello"))
-    assert chunks == []
+    assert chunks == ["Ready."]
     assert transport.get_last_result().text == "Ready."
 
 

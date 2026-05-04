@@ -123,3 +123,35 @@ def test_playwright_transport_stream_message_yields_chunks_and_stores_result(mon
     result = transport.get_last_result()
     assert result.text == "playwright"
     assert result.remote_parent_message_id == "msg-stream"
+
+
+
+def test_playwright_transport_stream_message_yields_replace_events(monkeypatch):
+    transport = PlaywrightTransport({"transport_mode": "playwright", "browser_user_data_dir": "/tmp/profile"})
+
+    monkeypatch.setattr(
+        transport,
+        "_run",
+        lambda message, image=None, new_conversation=True: iter(
+            [
+                {"type": "chunk", "content": "Think"},
+                {"type": "replace", "content": "Ready."},
+                {
+                    "type": "result",
+                    "success": True,
+                    "text": "Ready.",
+                    "remote_conversation_id": "conv-replace",
+                    "remote_parent_message_id": "msg-replace",
+                    "transport_details": {"ui_logged_in_likely": True},
+                    "verification_hints": {"remote_conversation_exists": True},
+                },
+            ]
+        ),
+    )
+
+    chunks = list(transport.stream_message("hello"))
+
+    assert chunks == ["Think", "Ready."]
+    result = transport.get_last_result()
+    assert result.text == "Ready."
+    assert result.remote_parent_message_id == "msg-replace"

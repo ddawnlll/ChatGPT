@@ -253,6 +253,7 @@ class PlaywrightTransport:
 
     def stream_message(self, message: str, image: str | None = None, *, new_conversation: bool = True) -> Iterator[str]:
         final_payload: dict[str, Any] | None = None
+        streamed_text = ""
         for event in self._run(message, image, new_conversation=new_conversation):
             event_type = event.get("type")
             if event_type == "status":
@@ -265,7 +266,13 @@ class PlaywrightTransport:
             elif event_type == "chunk":
                 chunk = event.get("content") or ""
                 if chunk:
+                    streamed_text += chunk
                     yield chunk
+            elif event_type == "replace":
+                replacement = event.get("content") or ""
+                streamed_text = replacement
+                if replacement:
+                    yield replacement
             elif event_type == "result":
                 final_payload = event
         if not final_payload:

@@ -881,7 +881,7 @@ async function waitForAssistantResultFallback(page, baselineAssistant, baselineP
       const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
       const domText = latestAssistant?.locator ? String(await extractAssistantText(latestAssistant.locator) || '').trim() : ''
       const pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
-      const assistantToolCallText = extractToolCallText(domText) || ''
+      const assistantToolCallText = extractToolCallWithWriteContent(domText) || ''
 
       let candidate = chooseBetterAssistantText(bestText, domText).trim()
       if (!candidate || hasIncompleteTaggedResponse(candidate)) {
@@ -963,6 +963,31 @@ function extractToolCallText(text) {
   return matches[matches.length - 1]
 }
 
+function extractWriteContentText(text) {
+  const match = String(text || '').match(/<write_content>\s*[\s\S]*?\s*<\/write_content>/i)
+  return match ? match[0].trim() : null
+}
+
+function isWriteToolCall(text) {
+  const raw = String(text || '')
+  return /<name>\s*write\s*<\/name>/i.test(raw) || /"name"\s*:\s*"write"/i.test(raw)
+}
+
+function extractToolCallWithWriteContent(text) {
+  const raw = String(text || '')
+  const toolCall = extractToolCallText(raw)
+  if (!toolCall) return null
+
+  if (isWriteToolCall(toolCall)) {
+    const toolCallIndex = raw.lastIndexOf(toolCall)
+    const trailingText = toolCallIndex >= 0 ? raw.slice(toolCallIndex + toolCall.length) : raw
+    const writeContent = extractWriteContentText(trailingText)
+    if (writeContent) return `${toolCall}\n${writeContent}`
+  }
+
+  return toolCall
+}
+
 function isPromptExampleToolCall(text) {
   const raw = String(text || '').toLowerCase()
   return (
@@ -1002,7 +1027,7 @@ function hasIncompleteTaggedResponse(text) {
 
 function normalizeAssistantText(text) {
   const raw = String(text || '').replace(/\r/g, '')
-  const taggedToolCall = extractToolCallText(raw)
+  const taggedToolCall = extractToolCallWithWriteContent(raw)
   if (taggedToolCall !== null && !isPromptExampleToolCall(taggedToolCall) && !isPlaceholderToolCallText(taggedToolCall)) return taggedToolCall
   const taggedFinal = extractFinalResponseText(raw)
   if (taggedFinal !== null) return taggedFinal
@@ -1079,8 +1104,8 @@ function chooseBetterAssistantText(primary, fallback) {
   const primaryNormalized = normalizeAssistantText(primary)
   const fallbackNormalized = normalizeAssistantText(fallback)
 
-  const primaryExtractedToolCall = extractToolCallText(primary)
-  const fallbackExtractedToolCall = extractToolCallText(fallback)
+  const primaryExtractedToolCall = extractToolCallWithWriteContent(primary)
+  const fallbackExtractedToolCall = extractToolCallWithWriteContent(fallback)
   const primaryHasToolCallTag = primaryExtractedToolCall !== null && !isPromptExampleToolCall(primaryExtractedToolCall) && !isPlaceholderToolCallText(primaryExtractedToolCall)
   const fallbackHasToolCallTag = fallbackExtractedToolCall !== null && !isPromptExampleToolCall(fallbackExtractedToolCall) && !isPlaceholderToolCallText(fallbackExtractedToolCall)
   const primaryHasFinalTag = extractFinalResponseText(primary) !== null
@@ -1607,7 +1632,7 @@ async function handleRequest(request) {
         domFallbackText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
       }
       pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
-      const assistantToolCallText = extractToolCallText(domFallbackText) || ''
+      const assistantToolCallText = extractToolCallWithWriteContent(domFallbackText) || ''
       finalText = chooseBetterAssistantText(finalText, domFallbackText).trim()
       if (!finalText || hasIncompleteTaggedResponse(finalText)) {
         finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
@@ -1626,7 +1651,7 @@ async function handleRequest(request) {
         assistant_tool_call_length: assistantToolCallText.length,
         chosen_length: finalText.length,
         dom_has_final_response_tag: extractFinalResponseText(domFallbackText) !== null,
-        dom_has_tool_call_tag: extractToolCallText(domFallbackText) !== null,
+        dom_has_tool_call_tag: extractToolCallWithWriteContent(domFallbackText) !== null,
         page_has_final_response_tag: Boolean(pageFinalResponseText),
         assistant_tool_call_is_prompt_example: Boolean(assistantToolCallText && isPromptExampleToolCall(assistantToolCallText)),
       })
@@ -1786,6 +1811,9 @@ export {
   extractAllToolCallTexts,
   extractFinalResponseText,
   extractToolCallText,
+  extractWriteContentText,
+  isWriteToolCall,
+  extractToolCallWithWriteContent,
   isPromptExampleToolCall,
   isPlaceholderToolCallText,
   hasIncompleteTaggedResponse,
@@ -1810,6 +1838,9 @@ export default {
   extractFinalResponseText,
   extractAllFinalResponseTexts,
   extractToolCallText,
+  extractWriteContentText,
+  isWriteToolCall,
+  extractToolCallWithWriteContent,
   extractAllToolCallTexts,
   isPromptExampleToolCall,
   hasIncompleteTaggedResponse,

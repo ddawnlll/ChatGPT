@@ -5,6 +5,9 @@ import {
   extractAllToolCallTexts,
   extractFinalResponseText,
   extractToolCallText,
+  extractWriteContentText,
+  isWriteToolCall,
+  extractToolCallWithWriteContent,
   isPromptExampleToolCall,
   isPlaceholderToolCallText,
   hasIncompleteTaggedResponse,
@@ -59,6 +62,40 @@ describe('playwright transport helper extraction', () => {
   test('chooseBetterAssistantText prefers complete tool call over partial capture', () => {
     const full = '<tool_call><name>bash</name><arguments><command>tree app 2>/dev/null || find app -print | sort</command><timeout>10</timeout></arguments></tool_call>'
     expect(chooseBetterAssistantText('<', full)).toBe(full)
+  })
+
+  test('write tool helpers preserve adjacent write_content blocks', () => {
+    const raw = [
+      '<tool_call>',
+      '<name>write</name>',
+      '<arguments>',
+      '<path>app/server.py</path>',
+      '</arguments>',
+      '</tool_call>',
+      '<write_content>',
+      'print("hello")',
+      '</write_content>',
+    ].join('\n')
+
+    expect(extractWriteContentText(raw)).toContain('print("hello")')
+    expect(isWriteToolCall(raw)).toBe(true)
+    expect(extractToolCallWithWriteContent(raw)).toBe(raw)
+    expect(normalizeAssistantText(raw)).toBe(raw)
+    expect(chooseBetterAssistantText('', raw)).toBe(raw)
+  })
+
+  test('normalizeAssistantText keeps only the last write tool call with its matching write_content', () => {
+    const raw = [
+      '<tool_call><name>write</name><arguments><path>old.py</path></arguments></tool_call>',
+      '<write_content>print("old")</write_content>',
+      '<tool_call><name>write</name><arguments><path>new.py</path></arguments></tool_call>',
+      '<write_content>print("new")</write_content>',
+    ].join('\n')
+
+    expect(normalizeAssistantText(raw)).toBe([
+      '<tool_call><name>write</name><arguments><path>new.py</path></arguments></tool_call>',
+      '<write_content>print("new")</write_content>',
+    ].join('\n'))
   })
 
   test('isPromptExampleToolCall rejects prompt template examples', () => {

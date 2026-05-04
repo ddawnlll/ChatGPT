@@ -24,6 +24,7 @@ CRITICAL_TEST_FILES = [
 ]
 BROWSER_TEST_FILES = [
     "tests/test_real_browser_smoke.py",
+    "tests/test_real_browser_write_smoke.py",
 ]
 JS_TEST_TARGET = "tools/playwright_transport_helpers.test.mjs"
 

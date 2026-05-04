@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from proxy.app import router as router_module
@@ -267,6 +269,164 @@ def test_agent_does_not_repair_placeholder_transport_artifact(monkeypatch):
     assert "placeholder transport artifact" in payload["error"]["message"]
 
 
+def test_agent_does_not_repair_write_missing_content(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        return (
+            """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+""",
+            "conv-test",
+        )
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("repair", kwargs))
+        return "<final_response>should not happen</final_response>"
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "write server.py"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "description": "Write file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 502
+    assert not any(kind == "repair" for kind, _kwargs in calls)
+    payload = response.json()
+    assert payload["error"]["code"] == "malformed_tool_call"
+    assert "write tool call missing content" in payload["error"]["message"]
+
+
+def test_agent_write_with_write_content_block_returns_content(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+print(\"hello\")
+</write_content>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "write server.py"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "description": "Write file",
+                        "parameters": {},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    args = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    parsed = json.loads(args)
+    assert parsed["path"] == "server.py"
+    assert parsed["content"] == 'print("hello")\n'
+
+
+
+def test_agent_write_with_write_content_invalid_python_returns_syntax_error_without_repair(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        # This intentionally includes <write_content> but invalid Python.
+        # The expected failure is syntax validation, not missing content,
+        # and write failures must not trigger repair prompts.
+        return (
+            """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+class A:
+def broken(self):
+pass
+</write_content>
+""",
+            "conv-test",
+        )
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("repair", kwargs))
+        return "<final_response>should not happen</final_response>"
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "write server.py"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "description": "Write file",
+                        "parameters": {},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 502
+    assert not any(kind == "repair" for kind, _kwargs in calls)
+    payload = response.json()
+    assert payload["error"]["code"] == "malformed_tool_call"
+    assert "python write content failed syntax validation" in payload["error"]["message"]
+
+
+
 def test_agent_retries_malformed_tool_call_and_returns_repaired_tool(monkeypatch):
     calls = []
 
@@ -337,3 +497,104 @@ def test_agent_prompt_includes_request_tool_hints(monkeypatch):
     assert "batch independent read-only inspection tool calls" in prompt_override
     assert "tool_choice=required" in prompt_override
     assert "must emit at least one tool_call" in prompt_override
+
+
+
+def test_agent_prompt_marks_write_required_requests(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured["prompt_override"] = kwargs.get("prompt_override")
+        return (
+            """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/smoke_server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+print(\"smoke ok\")
+</write_content>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": 'Create app/smoke_server.py. Use write. The file content must be exactly:\nprint("smoke ok")'}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "write", "description": "Write file", "parameters": {}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    prompt_override = captured["prompt_override"]
+    assert "Request classification: write_required." in prompt_override
+    assert "Emit exactly one write tool_call on this turn." in prompt_override
+    assert "Do not answer with prose or claim you lack tool access." in prompt_override
+
+
+
+def test_agent_retries_tool_access_refusal_with_stronger_write_prompt(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        return (
+            "I don't have access to the pi write tool in this chat, so I can't create app/smoke_server.py in your local workspace here.",
+            "conv-test",
+        )
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("recovery", kwargs))
+        return (
+            """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/smoke_server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+print(\"smoke ok\")
+</write_content>
+"""
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": 'Create app/smoke_server.py. Use write. The file content must be exactly:\nprint("smoke ok")'}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "write", "description": "Write file", "parameters": {}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    assert any(kind == "recovery" for kind, _kwargs in calls)
+    recovery_prompt = [kwargs["prompt_override"] for kind, kwargs in calls if kind == "recovery"][0]
+    assert "Recovery rule:" in recovery_prompt
+    assert "The current task requires the write tool." in recovery_prompt

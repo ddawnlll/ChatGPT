@@ -11,6 +11,12 @@ from typing import Any
 MAX_TOOL_RESULT_CHARS = 3000
 MAX_TRANSCRIPT_MESSAGES = 8
 MAX_TOTAL_TRANSCRIPT_CHARS = 12000
+REPAIR_PROMPT_PREFIX = "Your previous response was malformed and could not be executed as a tool call."
+_INTERNAL_REPAIR_MARKERS = (
+    REPAIR_PROMPT_PREFIX,
+    "Re-emit the answer as exactly one corrected tool response.",
+    "Malformed previous response to repair:",
+)
 
 PI_TOOL_NAMES = frozenset({"read", "write", "edit", "bash", "grep", "find", "ls"})
 
@@ -110,6 +116,17 @@ def _truncate_middle(text: str, limit: int) -> str:
 
 
 
+def _is_internal_repair_text(content: str) -> bool:
+    normalized = str(content or "").strip()
+    return any(marker in normalized for marker in _INTERNAL_REPAIR_MARKERS)
+
+
+
+def _is_internal_repair_prompt(role: str, content: str) -> bool:
+    return role == "user" and _is_internal_repair_text(content)
+
+
+
 def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
     relevant = messages[-MAX_TRANSCRIPT_MESSAGES:]
     parts: list[str] = []
@@ -118,6 +135,8 @@ def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
             continue
         role = str(message.get("role", "")).strip() or "unknown"
         content = _stringify_content(message.get("content"))
+        if _is_internal_repair_prompt(role, content):
+            continue
         if role == "assistant" and message.get("tool_calls"):
             rendered = json.dumps(message.get("tool_calls"), ensure_ascii=False)
             parts.append("assistant_tool_calls: " + _truncate_middle(rendered, 2000))
@@ -190,7 +209,19 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "&lt;/arguments&gt;\n"
         "&lt;/tool_call&gt;\n\n"
         "For bash, put the exact shell command inside <command>...</command>. Do not JSON-escape shell commands.\n"
-        "For write, put the exact file content inside <content>...</content>. Do not markdown-fence file content.\n"
+        "For write, always use this exact pattern:\n"
+        "&lt;tool_call&gt;\n"
+        "&lt;name&gt;write&lt;/name&gt;\n"
+        "&lt;arguments&gt;\n"
+        "&lt;path&gt;path/to/file&lt;/path&gt;\n"
+        "&lt;/arguments&gt;\n"
+        "&lt;/tool_call&gt;\n"
+        "&lt;write_content&gt;\n"
+        "RAW FILE CONTENT\n"
+        "&lt;/write_content&gt;\n"
+        "Do not put file content inside JSON.\n"
+        "Do not put file content inside <content>.\n"
+        "Do not markdown-fence file content.\n"
         "For simple arguments like path or timeout, use separate XML tags inside <arguments>.\n\n"
         "2) Legacy compatibility format (allowed but less reliable for string-heavy arguments, example escaped so it is not mistaken for your answer):\n"
         "&lt;tool_call&gt;{\"name\":\"read\",\"arguments\":{\"path\":\"app/main.py\"}}&lt;/tool_call&gt;\n\n"
@@ -202,6 +233,11 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "Do not include prose outside the tags.\n"
         "Preserve indentation exactly as it should appear in the file.\n"
         "If writing Python, every class/function body must be correctly indented and syntactically valid Python.\n"
+        "For Python write_content:\n"
+        "- Use 4-space indentation.\n"
+        "- Do not use markdown formatting.\n"
+        "- Use __name__ and __main__ literally when needed.\n"
+        "- Before emitting, mentally verify ast.parse would pass.\n"
         "Do not rewrite code into markdown, bullet points, or prose.\n"
         "Do not emit a final_response immediately after a tool_call for the same task. After tool execution, wait for the next turn.\n"
         "Do not include explanations outside those tags.\n\n"
@@ -248,6 +284,8 @@ def _normalize_python_dunder_markdown(content: str) -> str:
 
 def _clean_write_content(path: str, content: str) -> str:
     cleaned = content.replace("\r\n", "\n").replace("\r", "\n")
+    if cleaned.startswith("\n"):
+        cleaned = cleaned[1:]
     cleaned = _strip_markdown_fences(cleaned)
     if Path(path).suffix == ".py":
         cleaned = _normalize_python_dunder_markdown(cleaned)
@@ -367,9 +405,22 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
             arguments[key] = _coerce_xml_arg_value(key, value)
 
     if name == "write":
-        content_match = re.search(r"<content>\s*(.*?)\s*</content>", payload, re.DOTALL | re.IGNORECASE)
-        if content_match:
-            arguments["content"] = content_match.group(1)
+        if "content" not in arguments:
+            write_content_match = _WRITE_CONTENT_RE.search(raw)
+            if write_content_match:
+                content = write_content_match.group(1)
+                if content.startswith("\n"):
+                    content = content[1:]
+                arguments["content"] = content
+
+        if "content" not in arguments:
+            content_match = re.search(r"<content>(.*?)</content>", payload, re.DOTALL | re.IGNORECASE)
+            if content_match:
+                content = content_match.group(1)
+                if content.startswith("\n"):
+                    content = content[1:]
+                arguments["content"] = content
+
         invalid = _validate_write_arguments(arguments)
         if invalid is not None:
             return invalid
@@ -494,12 +545,20 @@ def should_retry_malformed_tool_call(action: ParsedAssistantAction) -> bool:
     if action.kind != "invalid_tool":
         return False
     error = (action.parse_error or "").lower()
+    if any(
+        token in error
+        for token in (
+            "write tool call missing content",
+            "write tool call missing path",
+            "python write content failed syntax validation",
+        )
+    ):
+        return False
     if not error:
         return True
     return any(
         token in error
         for token in (
-            "write",
             "syntax validation",
             "expecting",
             "delimiter",
@@ -515,14 +574,21 @@ def should_retry_malformed_tool_call(action: ParsedAssistantAction) -> bool:
 def build_tool_repair_prompt(bad_response: str, parse_error: str | None) -> str:
     detail = parse_error or "unknown malformed tool call"
     return (
-        "Your previous response was malformed and could not be executed as a tool call.\n"
+        f"{REPAIR_PROMPT_PREFIX}\n"
         f"Validation error: {detail}\n\n"
         "Re-emit the answer as exactly one corrected tool response.\n"
-        "If the intended tool is write, use this safer format:\n"
-        "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"path/to/file\"}}</tool_call>\n"
+        "If the intended tool is write, use this exact safer format:\n"
+        "<tool_call>\n"
+        "<name>write</name>\n"
+        "<arguments>\n"
+        "<path>path/to/file</path>\n"
+        "</arguments>\n"
+        "</tool_call>\n"
         "<write_content>\nRAW FILE CONTENT HERE\n</write_content>\n\n"
         "Rules:\n"
         "- Output raw file contents only inside <write_content>.\n"
+        "- Do not put write file content inside JSON.\n"
+        "- Do not put write file content inside <content>.\n"
         "- No markdown fences.\n"
         "- Preserve indentation exactly.\n"
         "- If Python, ensure syntactically valid indentation and valid __name__ == \"__main__\" style dunder usage.\n"

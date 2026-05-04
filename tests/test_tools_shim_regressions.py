@@ -1,4 +1,4 @@
-from proxy.app.tools_shim import build_pi_agent_prompt, parse_assistant_action
+from proxy.app.tools_shim import build_pi_agent_prompt, build_tool_repair_prompt, parse_assistant_action, should_retry_malformed_tool_call
 
 
 def test_parse_final_response_prefers_last_non_placeholder():
@@ -134,6 +134,63 @@ print(\"hello world\")
     }
 
 
+def test_parse_xml_write_tool_call_with_separate_write_content_block():
+    text = """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Hello from server.py\\n")
+
+if __name__ == "__main__":
+    pass
+</write_content>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "write"
+    assert action.tool_arguments is not None
+    assert action.tool_arguments["path"] == "server.py"
+    assert 'self.wfile.write(b"Hello from server.py\\n")' in action.tool_arguments["content"]
+
+
+def test_parse_xml_write_rejects_unindented_python_write_content():
+    text = """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class SimpleHandler(BaseHTTPRequestHandler):
+def do_GET(self):
+self.send_response(200)
+</write_content>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error is not None
+    assert "python write content failed syntax validation" in action.parse_error
+
+
+
 def test_parse_multiple_xml_tool_calls_returns_tools_kind():
     text = """
 <tool_call><name>find</name><arguments><path>.</path><pattern>*.py</pattern></arguments></tool_call>
@@ -180,3 +237,62 @@ def test_repo_analysis_prompt_forces_tool_inspection():
     assert "analyze the repo" in prompt
     assert "ls" in prompt
     assert "bash" in prompt
+
+
+def test_prompt_prefers_write_content_block_and_skips_internal_repair_prompt():
+    decision = build_pi_agent_prompt(
+        [
+            {"role": "user", "content": "Create server.py"},
+            {"role": "user", "content": build_tool_repair_prompt("bad", "write tool call missing content")},
+        ],
+        [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+    )
+
+    prompt = decision.prompt
+    assert "&lt;write_content&gt;" in prompt
+    assert "Do not put file content inside JSON." in prompt
+    assert "Do not put file content inside <content>." in prompt
+    assert "Create server.py" in prompt
+    assert "Your previous response was malformed and could not be executed as a tool call." not in prompt
+    assert "Malformed previous response to repair:" not in prompt
+
+
+def test_write_missing_content_is_not_retryable():
+    action = parse_assistant_action(
+        """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+"""
+    )
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error == "write tool call missing content"
+    assert should_retry_malformed_tool_call(action) is False
+
+
+
+def test_invalid_python_write_is_not_retryable():
+    action = parse_assistant_action(
+        """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+class A:
+def broken(self):
+pass
+</write_content>
+"""
+    )
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error is not None
+    assert "python write content failed syntax validation" in action.parse_error
+    assert should_retry_malformed_tool_call(action) is False
