@@ -233,6 +233,7 @@ These cover:
 - parser regressions in `proxy/app/tools_shim.py`
 - router and SSE regressions for pi-agent-compatible requests
 - mocked pi tool contract tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- real pi CLI integration tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - fake Playwright daemon protocol tests
 - JS helper tests for `tools/playwright_chat_transport.mjs`
 

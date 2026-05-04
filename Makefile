@@ -36,6 +36,7 @@ test-proxy:
 test-pi-contract:
 	.venv/bin/pytest \
 		tests/test_pi_tool_contract_e2e.py \
+		tests/test_pi_agent_cli_e2e.py \
 		tests/test_fake_playwright_daemon.py \
 		tests/test_fake_playwright_daemon_process.py \
 		-q

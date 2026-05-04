@@ -115,6 +115,10 @@ proxy/
 - protects: `proxy/app/router.py`, `proxy/app/tools_shim.py`, `proxy/app/models.py`
 - purpose: exercises realistic pi-style tool requests for `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, then checks OpenAI-compatible tool-call responses and follow-up final responses
 
+### tests/test_pi_agent_cli_e2e.py
+- protects: full pi-to-proxy integration path using the real `pi` CLI against `proxy/app/router.py`
+- purpose: verifies actual pi built-in tool execution loops for `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, plus direct final-response handling, using a live uvicorn proxy instance with mocked upstream model behavior
+
 ### tests/test_fake_playwright_daemon.py
 - protects: `transport_runtime.py`
 - purpose: validates Python-side Playwright transport handling of status/chunk/result/error event sequences without launching a real daemon
