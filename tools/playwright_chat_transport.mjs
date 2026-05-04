@@ -252,12 +252,58 @@ async function waitForComposerInteractive(page, timeoutMs = CONFIG.composerTimeo
 // ---------------------------------------------------------------------------
 // Page-state helpers
 // ---------------------------------------------------------------------------
+function detectPageInterruptionStateFromText(title, bodyText) {
+  const safeTitle = String(title || '')
+  const safeBodyText = String(bodyText || '')
+
+  const isChallenge = (
+    /just a moment/i.test(safeTitle) ||
+    /verify you are human/i.test(safeBodyText) ||
+    /checking your browser/i.test(safeBodyText) ||
+    /enable javascript/i.test(safeBodyText) ||
+    /cloudflare/i.test(safeBodyText)
+  )
+
+  const isRateLimited = (
+    /too many requests/i.test(safeBodyText) ||
+    /rate limit/i.test(safeBodyText) ||
+    /429/i.test(safeTitle)
+  )
+
+  const isConversationError = /unable to load conversation/i.test(safeBodyText)
+
+  return {
+    detected: Boolean(isChallenge || isRateLimited || isConversationError),
+    isChallenge,
+    isRateLimited,
+    isConversationError,
+  }
+}
+
+async function detectChallengeOrRateLimit(page) {
+  const title = await page.title().catch(() => '')
+  const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')
+  const state = detectPageInterruptionStateFromText(title, bodyText)
+  if (state.detected) {
+    emit({
+      type: 'status',
+      stage: 'challenge_or_rate_limit_detected',
+      is_challenge: state.isChallenge,
+      is_rate_limited: state.isRateLimited,
+      is_conversation_error: state.isConversationError,
+      url: page.url(),
+    })
+  }
+  return state
+}
+
 async function waitForNoChallenge(page, timeoutMs = CONFIG.challengeTimeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const title = await page.title().catch(() => '')
     const bodyText = await page.locator('body').innerText().catch(() => '')
-    if (!/just a moment/i.test(title) && !/just a moment|checking your browser/i.test(bodyText)) return
+    const state = detectPageInterruptionStateFromText(title, bodyText)
+    if (!state.isChallenge) return
     await delay(200)
   }
   emit({ type: 'status', stage: 'challenge_still_visible_after_timeout', timeoutMs })
@@ -325,6 +371,18 @@ function buildConversationUrl(targetUrl, conversationId) {
   return `${base.origin}/c/${conversationId}`
 }
 
+function normalizeConversationUrl(url) {
+  return String(url || '').replace(/\/$/, '')
+}
+
+function isSameConversationTarget(currentUrl, remoteConversationId, remoteConversationUrl) {
+  const normalizedCurrent = normalizeConversationUrl(currentUrl)
+  const normalizedTarget = normalizeConversationUrl(remoteConversationUrl)
+  if (normalizedTarget && normalizedCurrent === normalizedTarget) return true
+  const currentConversationId = extractRemoteConversationId(currentUrl)
+  return Boolean(remoteConversationId && currentConversationId && currentConversationId === remoteConversationId)
+}
+
 function getComposerContextMode({ newConversation, remoteConversationId, remoteConversationUrl }) {
   if (newConversation) return 'fresh'
   if (remoteConversationUrl || remoteConversationId) return 'existing'
@@ -371,16 +429,39 @@ async function openFreshThread(page, targetUrl) {
 
 async function openExistingThread(page, targetUrl, remoteConversationId, remoteConversationUrl) {
   const url = remoteConversationUrl || buildConversationUrl(targetUrl, remoteConversationId)
+  const currentUrl = page.url()
+  const currentComposer = await findComposer(page).catch(() => null)
+
+  if (isSameConversationTarget(currentUrl, remoteConversationId, remoteConversationUrl) && currentComposer) {
+    emit({
+      type: 'status',
+      stage: 'existing_thread_already_ready',
+      current_url: currentUrl,
+      remote_conversation_id: remoteConversationId || null,
+    })
+    await waitForNoChallenge(page)
+    await waitForChatShell(page)
+    await waitForComposerInteractive(page)
+    return true
+  }
+
   emit({
     type: 'status',
     stage: 'opening_existing_thread',
     url,
+    current_url: currentUrl,
     remote_conversation_id: remoteConversationId || null,
   })
 
   await page.goto(url, { waitUntil: 'domcontentloaded' })
   await waitForNoChallenge(page)
   await waitForChatShell(page)
+
+  const bodyText = await page.locator('body').innerText().catch(() => '')
+  if (/unable to load conversation/i.test(bodyText)) {
+    throw new Error(`Unable to load conversation ${remoteConversationId || ''}`.trim())
+  }
+
   await waitForComposerInteractive(page)
 
   emit({
@@ -1660,6 +1741,35 @@ async function handleRequest(request) {
 
     await waitForNoChallenge(page)
     await waitForChatShell(page)
+
+    const interruptionState = await detectChallengeOrRateLimit(page)
+    if (interruptionState.detected) {
+      emit({
+        type: 'result',
+        success: false,
+        error: interruptionState.isChallenge
+          ? 'ChatGPT is showing a human verification challenge. Manual intervention required.'
+          : interruptionState.isRateLimited
+            ? 'ChatGPT rate limit active. Back off before retrying.'
+            : 'ChatGPT could not load the conversation.',
+        text: '',
+        remote_conversation_id: request?.remote_conversation_id || null,
+        remote_parent_message_id: null,
+        transport_details: {
+          last_stage: 'challenge_detected',
+          page_url: page.url(),
+          is_challenge: interruptionState.isChallenge,
+          is_rate_limited: interruptionState.isRateLimited,
+          is_conversation_error: interruptionState.isConversationError,
+        },
+        verification_hints: {
+          remote_conversation_exists: Boolean(request?.remote_conversation_id),
+          requires_manual_intervention: interruptionState.isChallenge,
+        },
+      })
+      return
+    }
+
     const ui = await detectLoggedInUi(page)
     emit({
       type: 'status',
@@ -1867,8 +1977,12 @@ export {
   waitForComposerInteractive,
   waitForNoChallenge,
   waitForChatShell,
+  detectPageInterruptionStateFromText,
+  detectChallengeOrRateLimit,
   detectLoggedInUi,
   buildConversationUrl,
+  normalizeConversationUrl,
+  isSameConversationTarget,
   getComposerContextMode,
   openFreshThread,
   openExistingThread,
@@ -1905,7 +2019,10 @@ export {
 export default {
   sendPrompt,
   buildConversationUrl,
+  normalizeConversationUrl,
+  isSameConversationTarget,
   getComposerContextMode,
+  detectPageInterruptionStateFromText,
   streamAssistantText,
   getAssistantSnapshot,
   detectLoggedInUi,

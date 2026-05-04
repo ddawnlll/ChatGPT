@@ -5,7 +5,10 @@ import {
   extractAllToolCallTexts,
   extractFinalResponseText,
   buildConversationUrl,
+  normalizeConversationUrl,
+  isSameConversationTarget,
   getComposerContextMode,
+  detectPageInterruptionStateFromText,
   extractToolCallText,
   extractWriteContentText,
   isWriteToolCall,
@@ -157,10 +160,27 @@ describe('playwright transport helper extraction', () => {
     expect(buildConversationUrl('https://chatgpt.com/g/g-xyz', 'abc')).toBe('https://chatgpt.com/c/abc')
   })
 
+  test('normalizeConversationUrl trims trailing slash', () => {
+    expect(normalizeConversationUrl('https://chatgpt.com/c/abc/')).toBe('https://chatgpt.com/c/abc')
+  })
+
+  test('isSameConversationTarget matches by exact url or conversation id', () => {
+    expect(isSameConversationTarget('https://chatgpt.com/c/abc', 'abc', null)).toBe(true)
+    expect(isSameConversationTarget('https://chatgpt.com/c/abc/', null, 'https://chatgpt.com/c/abc')).toBe(true)
+    expect(isSameConversationTarget('https://chatgpt.com/c/other', 'abc', null)).toBe(false)
+  })
+
   test('getComposerContextMode selects existing when remote conversation is present', () => {
     expect(getComposerContextMode({ newConversation: false, remoteConversationId: 'abc', remoteConversationUrl: null })).toBe('existing')
     expect(getComposerContextMode({ newConversation: false, remoteConversationId: null, remoteConversationUrl: 'https://chatgpt.com/c/abc' })).toBe('existing')
     expect(getComposerContextMode({ newConversation: true, remoteConversationId: 'abc', remoteConversationUrl: null })).toBe('fresh')
     expect(getComposerContextMode({ newConversation: false, remoteConversationId: null, remoteConversationUrl: null })).toBe('current_or_fallback')
+  })
+
+  test('detectPageInterruptionStateFromText detects challenge, rate limit, and conversation errors', () => {
+    expect(detectPageInterruptionStateFromText('Just a moment...', 'Checking your browser')).toMatchObject({ detected: true, isChallenge: true })
+    expect(detectPageInterruptionStateFromText('429', 'Too many requests')).toMatchObject({ detected: true, isRateLimited: true })
+    expect(detectPageInterruptionStateFromText('', 'Unable to load conversation abc')).toMatchObject({ detected: true, isConversationError: true })
+    expect(detectPageInterruptionStateFromText('ChatGPT', 'Ready when you are')).toMatchObject({ detected: false })
   })
 })
