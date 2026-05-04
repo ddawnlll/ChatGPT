@@ -843,22 +843,27 @@ async function extractPageFinalResponseText(page, baselineText = '') {
 }
 
 async function extractPageToolCallText(page, baselineText = '') {
-  const baselineMatches = extractAllToolCallTexts(baselineText)
+  const baselineMatches = extractAllToolCallTexts(baselineText).filter((text) => !isPromptExampleToolCall(text))
+
+  function choose(matches) {
+    const filtered = matches.filter((text) => !isPromptExampleToolCall(text))
+    if (filtered.length > baselineMatches.length) return filtered[filtered.length - 1] || ''
+    if (filtered.length && filtered.join('\n') !== baselineMatches.join('\n')) return filtered[filtered.length - 1] || ''
+    return ''
+  }
 
   try {
     const html = await page.locator('body').evaluate((node) => node.innerHTML).catch(() => '')
-    const htmlMatches = extractAllToolCallTexts(html)
-    if (htmlMatches.length > baselineMatches.length) return htmlMatches[htmlMatches.length - 1]
-    if (htmlMatches.length && htmlMatches.join('\n') !== baselineMatches.join('\n')) return htmlMatches[htmlMatches.length - 1]
+    const picked = choose(extractAllToolCallTexts(html))
+    if (picked) return picked
   } catch (err) {
     emitError('page_tool_call_html_extract_failed', err)
   }
 
   try {
     const text = await page.locator('body').innerText().catch(() => '')
-    const textMatches = extractAllToolCallTexts(text)
-    if (textMatches.length > baselineMatches.length) return textMatches[textMatches.length - 1]
-    if (textMatches.length && textMatches.join('\n') !== baselineMatches.join('\n')) return textMatches[textMatches.length - 1]
+    const picked = choose(extractAllToolCallTexts(text))
+    if (picked) return picked
   } catch (err) {
     emitError('page_tool_call_text_extract_failed', err)
   }
@@ -876,14 +881,16 @@ async function waitForAssistantResultFallback(page, baselineAssistant, baselineP
       const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
       const domText = latestAssistant?.locator ? String(await extractAssistantText(latestAssistant.locator) || '').trim() : ''
       const pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
-      const pageToolCallText = String(await extractPageToolCallText(page, baselinePageText) || '').trim()
+      const assistantToolCallText = extractToolCallText(domText) || ''
 
       let candidate = chooseBetterAssistantText(bestText, domText).trim()
       candidate = chooseBetterAssistantText(candidate, pageFinalResponseText).trim()
-      candidate = chooseBetterAssistantText(candidate, pageToolCallText).trim()
+      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText)) {
+        candidate = chooseBetterAssistantText(candidate, assistantToolCallText).trim()
+      }
 
       if (candidate && !isIgnorableAssistantText(candidate) && !hasIncompleteTaggedResponse(candidate)) {
-        if (candidate === pageToolCallText) bestSource = 'page_tool_call'
+        if (candidate === assistantToolCallText) bestSource = 'assistant_tool_call'
         else if (candidate === pageFinalResponseText) bestSource = 'page_final_response'
         else if (candidate === domText) bestSource = 'assistant_dom'
         else bestSource = 'combined'
@@ -954,6 +961,20 @@ function extractToolCallText(text) {
   return matches[matches.length - 1]
 }
 
+function isPromptExampleToolCall(text) {
+  const raw = String(text || '').toLowerCase()
+  return (
+    raw.includes('<name>tool_name</name>') ||
+    raw.includes('<arg_name>raw argument value</arg_name>') ||
+    raw.includes('"name":"tool_name"') ||
+    raw.includes('"arguments":{...}') ||
+    raw.includes('legacy compatibility format') ||
+    raw.includes('do not json-escape shell commands') ||
+    raw.includes('available tools:') ||
+    raw.includes('conversation transcript:')
+  )
+}
+
 function hasIncompleteTaggedResponse(text) {
   const raw = String(text || '').trim().toLowerCase()
   if (!raw) return false
@@ -969,7 +990,7 @@ function hasIncompleteTaggedResponse(text) {
 function normalizeAssistantText(text) {
   const raw = String(text || '').replace(/\r/g, '')
   const taggedToolCall = extractToolCallText(raw)
-  if (taggedToolCall !== null) return taggedToolCall
+  if (taggedToolCall !== null && !isPromptExampleToolCall(taggedToolCall)) return taggedToolCall
   const taggedFinal = extractFinalResponseText(raw)
   if (taggedFinal !== null) return taggedFinal
   if (hasIncompleteTaggedResponse(raw)) return ''
@@ -1038,8 +1059,10 @@ function chooseBetterAssistantText(primary, fallback) {
   const primaryNormalized = normalizeAssistantText(primary)
   const fallbackNormalized = normalizeAssistantText(fallback)
 
-  const primaryHasToolCallTag = extractToolCallText(primary) !== null
-  const fallbackHasToolCallTag = extractToolCallText(fallback) !== null
+  const primaryExtractedToolCall = extractToolCallText(primary)
+  const fallbackExtractedToolCall = extractToolCallText(fallback)
+  const primaryHasToolCallTag = primaryExtractedToolCall !== null && !isPromptExampleToolCall(primaryExtractedToolCall)
+  const fallbackHasToolCallTag = fallbackExtractedToolCall !== null && !isPromptExampleToolCall(fallbackExtractedToolCall)
   const primaryHasFinalTag = extractFinalResponseText(primary) !== null
   const fallbackHasFinalTag = extractFinalResponseText(fallback) !== null
 
@@ -1078,12 +1101,15 @@ async function ensureAssistantStreamBinding(page) {
     }
   })
 
-  // Cleanup if the page navigates away mid-stream
+  // Navigation can happen before the assistant reply is fully rendered.
   page.on('framenavigated', (frame) => {
     if (frame === page.mainFrame() && typeof activeAssistantStreamSink === 'function') {
-      emit({ type: 'status', stage: 'stream_binding_navigation_cleanup' })
-      activeAssistantStreamSink({ kind: 'done', reason: 'page_navigated', rawText: '' })
-      activeAssistantStreamSink = null
+      emit({ type: 'status', stage: 'stream_binding_navigation_seen', url: page.url() })
+      setTimeout(() => {
+        if (typeof activeAssistantStreamSink === 'function') {
+          activeAssistantStreamSink({ kind: 'rescan', reason: 'page_navigated' })
+        }
+      }, 500)
     }
   })
 
@@ -1198,6 +1224,24 @@ async function streamAssistantText(page, timeoutMs, baselineAssistant = null, op
           normalized_length: normalizedText.length,
           ignorable,
         })
+      }
+
+      if (event.kind === 'rescan') {
+        try {
+          const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
+          const rescannedRaw = latestAssistant?.locator ? String(await extractAssistantText(latestAssistant.locator) || '') : ''
+          const rescannedText = normalizeAssistantText(rescannedRaw)
+          if (rescannedText && !isIgnorableAssistantText(rescannedText) && !hasIncompleteTaggedResponse(rescannedText)) {
+            const { delta, replaced } = computeAppendDelta(lastNormalizedText, rescannedText)
+            if (replaced) emit({ type: 'replace', content: rescannedText })
+            else if (delta) emit({ type: 'chunk', content: delta })
+            lastNormalizedText = rescannedText
+            lastRawText = rescannedRaw || lastRawText
+          }
+          emit({ type: 'status', stage: 'assistant_rescan_after_navigation', rescanned_length: rescannedText.length, reason: event.reason || 'page_navigated' })
+        } catch (err) {
+          emitError('assistant_rescan_after_navigation_failed', err)
+        }
       }
 
       if (event.kind === 'done') {
@@ -1543,10 +1587,12 @@ async function handleRequest(request) {
         domFallbackText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
       }
       pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
-      const pageToolCallText = String(await extractPageToolCallText(page, baselinePageText) || '').trim()
+      const assistantToolCallText = extractToolCallText(domFallbackText) || ''
       finalText = chooseBetterAssistantText(finalText, domFallbackText).trim()
       finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
-      finalText = chooseBetterAssistantText(finalText, pageToolCallText).trim()
+      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText)) {
+        finalText = chooseBetterAssistantText(finalText, assistantToolCallText).trim()
+      }
       emit({
         type: 'status',
         stage: 'assistant_dom_reconciled_after_stream',
@@ -1555,12 +1601,12 @@ async function handleRequest(request) {
         stream_length: String(streamed?.text || '').trim().length,
         dom_length: domFallbackText.length,
         page_final_length: pageFinalResponseText.length,
-        page_tool_call_length: pageToolCallText.length,
+        assistant_tool_call_length: assistantToolCallText.length,
         chosen_length: finalText.length,
         dom_has_final_response_tag: extractFinalResponseText(domFallbackText) !== null,
         dom_has_tool_call_tag: extractToolCallText(domFallbackText) !== null,
         page_has_final_response_tag: Boolean(pageFinalResponseText),
-        page_has_tool_call_tag: Boolean(pageToolCallText),
+        assistant_tool_call_is_prompt_example: Boolean(assistantToolCallText && isPromptExampleToolCall(assistantToolCallText)),
       })
     } catch (err) {
       emitError('assistant_dom_reconcile_after_stream_failed', err)
@@ -1718,6 +1764,7 @@ export {
   extractAllToolCallTexts,
   extractFinalResponseText,
   extractToolCallText,
+  isPromptExampleToolCall,
   hasIncompleteTaggedResponse,
   normalizeAssistantText,
   computeAppendDelta,
@@ -1741,6 +1788,7 @@ export default {
   extractAllFinalResponseTexts,
   extractToolCallText,
   extractAllToolCallTexts,
+  isPromptExampleToolCall,
   hasIncompleteTaggedResponse,
   chooseBetterAssistantText,
   CONFIG,

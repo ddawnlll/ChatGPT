@@ -241,11 +241,24 @@ def print_human_summary(results: list[StageResult]) -> None:
             f"- [{level}] {result.name}: {result.status.upper()} "
             f"(passed={result.passed}, failed={result.failed}, skipped={result.skipped}, deselected={result.deselected}, warnings={result.warnings})"
         )
+
     critical_failed = [result.name for result in results if result.critical and result.status == "failed"]
+    optional_failed = [result.name for result in results if (not result.critical) and result.status == "failed"]
+
     if critical_failed:
         print(f"\nCritical failures: {', '.join(critical_failed)}")
     else:
         print("\nCritical stages: all okay")
+
+    if optional_failed:
+        print(f"Optional stage failures: {', '.join(optional_failed)}")
+    else:
+        print("Optional stages: all okay or skipped")
+
+    if critical_failed or optional_failed:
+        print("Overall result: FAILED")
+    else:
+        print("Overall result: PASSED")
 
 
 def main() -> int:

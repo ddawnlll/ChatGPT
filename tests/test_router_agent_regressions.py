@@ -56,6 +56,33 @@ def test_agent_final_response_does_not_leak_prompt_placeholder(monkeypatch):
     assert "your final answer here" not in payload["choices"][0]["message"]["content"]
 
 
+def test_agent_final_response_wins_over_placeholder_tool_name(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            """
+<tool_call>{"name":"tool_name","arguments":{}}</tool_call>
+<final_response>Hello.</final_response>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "say hello"}],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Hello."
+
+
 def test_agent_tool_call_response_shape(monkeypatch):
     def fake_complete_chat_turn(**kwargs):
         return (
@@ -128,6 +155,37 @@ find app -print | sed 's|[^/]*/|  |g; s|  \\([^ ]\\)|├── \\1|'
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "bash"
     assert "sed" in choice["message"]["tool_calls"][0]["function"]["arguments"]
+
+
+def test_agent_multiple_tool_calls_response_shape(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            """
+<tool_call><name>find</name><arguments><path>.</path><pattern>*.py</pattern></arguments></tool_call>
+<tool_call><name>grep</name><arguments><path>.</path><pattern>TODO</pattern></arguments></tool_call>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "find py files and search TODO"}],
+            "tools": [
+                {"type": "function", "function": {"name": "find", "description": "Find", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "grep", "description": "Grep", "parameters": {"type": "object", "properties": {}}}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    tool_calls = response.json()["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 2
+    assert [call["function"]["name"] for call in tool_calls] == ["find", "grep"]
 
 
 def test_agent_streaming_transport_exception_returns_structured_sse_error(monkeypatch):

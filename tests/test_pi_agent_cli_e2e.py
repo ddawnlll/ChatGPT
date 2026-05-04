@@ -188,6 +188,40 @@ def test_pi_cli_first_turn_malformed_tool_call_is_repaired_and_tool_executes(mon
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_first_turn_partial_tool_tag_is_repaired_and_tool_executes(monkeypatch, tmp_path):
+    requests: list[list[dict[str, Any]]] = []
+
+    def fake_complete_chat_turn(**kwargs):
+        messages = kwargs["messages"]
+        requests.append(messages)
+        if any(message.get("role") == "tool" for message in messages):
+            return ("<final_response>read done.</final_response>", "conv-pi-partial")
+        return ("<", "conv-pi-partial")
+
+    def fake_complete_chat(**kwargs):
+        return """
+<tool_call>
+<name>read</name>
+<arguments>
+<path>sample.txt</path>
+</arguments>
+</tool_call>
+"""
+
+    (tmp_path / "sample.txt").write_text("alpha\n", encoding="utf-8")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn, complete_chat_impl=fake_complete_chat) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Read sample.txt", tools="read")
+
+    assert result.returncode == 0, result.stderr
+    assert "read done." in result.stdout
+    assert len(requests) >= 2
+    assert any(message.get("role") == "tool" and "alpha" in str(message.get("content", "")) for message in requests[-1])
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
 @pytest.mark.parametrize(
     ("tool_name", "tool_args", "allowed_tools", "setup", "assertion"),
     [
@@ -263,3 +297,38 @@ def test_pi_cli_tool_loop_executes_real_pi_tools(monkeypatch, tmp_path, tool_nam
     assert len(requests) >= 2
     assert assertion(tmp_path, requests[-1]), result.stdout
     assert any(message.get("role") == "tool" for message in requests[-1])
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_multi_tool_calls_execute_in_one_turn(monkeypatch, tmp_path):
+    requests: list[list[dict[str, Any]]] = []
+    (tmp_path / "sample.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "ls-visible.txt").write_text("x\n", encoding="utf-8")
+
+    def fake_complete_chat_turn(**kwargs):
+        messages = kwargs["messages"]
+        requests.append(messages)
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
+        if len(tool_messages) >= 2:
+            return ("<final_response>batch done.</final_response>", "conv-pi-batch")
+        return (
+            """
+<tool_call><name>read</name><arguments><path>sample.txt</path></arguments></tool_call>
+<tool_call><name>ls</name><arguments><path>.</path></arguments></tool_call>
+""",
+            "conv-pi-batch",
+        )
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Read sample.txt and list the directory", tools="read,ls")
+
+    assert result.returncode == 0, result.stderr
+    assert "batch done." in result.stdout
+    assert len(requests) >= 2
+    tool_messages = [message for message in requests[-1] if message.get("role") == "tool"]
+    assert len(tool_messages) >= 2
+    rendered_tool_text = "\n".join(str(message.get("content", "")) for message in tool_messages)
+    assert "alpha" in rendered_tool_text
+    assert "ls-visible.txt" in rendered_tool_text

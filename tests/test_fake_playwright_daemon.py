@@ -90,3 +90,29 @@ def test_fake_playwright_daemon_missing_result_raises_clean_error(monkeypatch, p
 
     assert transport.request_diagnostics["last_stage"] == "request_failed"
     assert transport.request_diagnostics["playwright_error"] == "browser closed"
+
+
+def test_fake_playwright_daemon_partial_chunk_then_full_tool_call_result_uses_final_result(monkeypatch, playwright_transport, daemon_events):
+    transport = playwright_transport
+
+    monkeypatch.setattr(
+        transport,
+        "_run",
+        lambda message, image=None, new_conversation=True: daemon_events(
+            {"type": "status", "stage": "assistant_text_updated"},
+            {"type": "chunk", "content": "<"},
+            {
+                "type": "result",
+                "success": True,
+                "text": "<tool_call><name>bash</name><arguments><command>tree app 2>/dev/null || find app -print | sort</command><timeout>10</timeout></arguments></tool_call>",
+                "remote_conversation_id": "conv-tool",
+                "remote_parent_message_id": "msg-tool",
+                "transport_details": {},
+                "verification_hints": {},
+            },
+        ),
+    )
+
+    chunks = list(transport.stream_message("hello"))
+    assert chunks == ["<"]
+    assert transport.get_last_result().text.startswith("<tool_call>")

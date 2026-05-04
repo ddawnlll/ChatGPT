@@ -235,6 +235,7 @@ These cover:
 - mocked pi tool contract tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - real pi CLI integration tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - real pi CLI regression coverage for first-turn malformed tool-call recovery after a fresh proxy start
+- real pi CLI regression coverage for partial first-turn tool tags and multi-tool execution in a single assistant turn
 - fake Playwright daemon protocol tests
 - JS helper tests for `tools/playwright_chat_transport.mjs`
 

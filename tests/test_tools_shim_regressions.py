@@ -1,4 +1,4 @@
-from proxy.app.tools_shim import parse_assistant_action
+from proxy.app.tools_shim import build_pi_agent_prompt, parse_assistant_action
 
 
 def test_parse_final_response_prefers_last_non_placeholder():
@@ -46,6 +46,21 @@ Actual:
     assert action.tool_arguments == {"path": "server.py"}
 
 
+def test_parse_final_response_wins_over_placeholder_tool_example():
+    text = """
+Example:
+<tool_call>{"name":"tool_name","arguments":{}}</tool_call>
+
+Actual:
+<final_response>Hello.</final_response>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "final"
+    assert action.content == "Hello."
+
+
 def test_parse_plain_final_fallback():
     action = parse_assistant_action("Ready.")
 
@@ -58,6 +73,13 @@ def test_parse_incomplete_final_response_tag_is_rejected():
 
     assert action.kind == "invalid_tool"
     assert action.parse_error == "incomplete final_response tag"
+
+
+def test_parse_single_angle_bracket_is_rejected():
+    action = parse_assistant_action("<")
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error == "incomplete tagged response"
 
 
 def test_parse_xml_bash_tool_call_with_raw_command():
@@ -104,3 +126,32 @@ print(\"hello world\")
         "path": "app/test.py",
         "content": 'print("hello world")\n',
     }
+
+
+def test_parse_multiple_xml_tool_calls_returns_tools_kind():
+    text = """
+<tool_call><name>find</name><arguments><path>.</path><pattern>*.py</pattern></arguments></tool_call>
+<tool_call><name>grep</name><arguments><path>.</path><pattern>TODO</pattern></arguments></tool_call>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tools"
+    assert action.tool_calls is not None
+    assert [call.name for call in action.tool_calls] == ["find", "grep"]
+
+
+def test_build_pi_agent_prompt_compacts_large_history():
+    huge = "x" * 10000
+    decision = build_pi_agent_prompt(
+        [
+            {"role": "user", "content": "first"},
+            {"role": "tool", "content": huge},
+            {"role": "user", "content": "latest request"},
+        ],
+        None,
+    )
+
+    assert "latest request" in decision.prompt
+    assert "[truncated" in decision.prompt
+    assert len(decision.prompt) < 20000

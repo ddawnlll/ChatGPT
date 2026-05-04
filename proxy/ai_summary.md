@@ -117,11 +117,11 @@ proxy/
 
 ### tests/test_pi_agent_cli_e2e.py
 - protects: full pi-to-proxy integration path using the real `pi` CLI against `proxy/app/router.py`
-- purpose: verifies actual pi built-in tool execution loops for `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, direct final-response handling, and first-turn malformed-response recovery using a live uvicorn proxy instance with mocked upstream model behavior
+- purpose: verifies actual pi built-in tool execution loops for `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, direct final-response handling, first-turn malformed-response recovery, partial-tag recovery, and multi-tool execution using a live uvicorn proxy instance with mocked upstream model behavior
 
 ### tests/test_fake_playwright_daemon.py
 - protects: `transport_runtime.py`
-- purpose: validates Python-side Playwright transport handling of status/chunk/result/error event sequences without launching a real daemon
+- purpose: validates Python-side Playwright transport handling of status/chunk/result/error event sequences without launching a real daemon, including partial-first-chunk followed by full final tool-call result behavior
 
 ### tests/test_fake_playwright_daemon_process.py
 - protects: `tools/playwright_chat_transport.mjs`, `transport_runtime.py` protocol assumptions

@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+MAX_TOOL_RESULT_CHARS = 3000
+MAX_TRANSCRIPT_MESSAGES = 8
+MAX_TOTAL_TRANSCRIPT_CHARS = 12000
+
 PI_TOOL_NAMES = frozenset({"read", "write", "edit", "bash", "grep", "find", "ls"})
 
 
@@ -19,11 +23,18 @@ class ShimDecision:
 
 
 @dataclass(slots=True)
+class ParsedToolCall:
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
 class ParsedAssistantAction:
     kind: str
     content: str | None = None
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
+    tool_calls: list[ParsedToolCall] | None = None
     parse_error: str | None = None
 
 
@@ -89,9 +100,43 @@ def _tool_descriptions(tools: list[dict[str, Any]] | None) -> list[str]:
     return rows
 
 
+def _truncate_middle(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return text[:head] + f"\n\n...[truncated {len(text) - limit} chars]...\n\n" + text[-tail:]
+
+
+
+def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
+    relevant = messages[-MAX_TRANSCRIPT_MESSAGES:]
+    parts: list[str] = []
+    for message in relevant:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).strip() or "unknown"
+        content = _stringify_content(message.get("content"))
+        if role == "assistant" and message.get("tool_calls"):
+            rendered = json.dumps(message.get("tool_calls"), ensure_ascii=False)
+            parts.append("assistant_tool_calls: " + _truncate_middle(rendered, 2000))
+            continue
+        if role == "tool" and content.strip():
+            parts.append("tool_result: " + _truncate_middle(content.strip(), MAX_TOOL_RESULT_CHARS))
+            continue
+        if content.strip():
+            parts.append(f"{role}: {_truncate_middle(content.strip(), 2000)}")
+
+    joined = "\n\n".join(parts)
+    if len(joined) <= MAX_TOTAL_TRANSCRIPT_CHARS:
+        return parts
+    return [_truncate_middle(joined, MAX_TOTAL_TRANSCRIPT_CHARS)]
+
+
+
 def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ShimDecision:
     system_parts: list[str] = []
-    transcript_parts: list[str] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -99,15 +144,8 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         content = _stringify_content(message.get("content"))
         if role in {"system", "developer"} and content.strip():
             system_parts.append(content.strip())
-        if role == "assistant" and message.get("tool_calls"):
-            transcript_parts.append(f"assistant_tool_calls: {json.dumps(message.get('tool_calls'), ensure_ascii=False)}")
-            continue
-        if role == "tool" and content.strip():
-            transcript_parts.append(f"tool_result: {content.strip()}")
-            continue
-        if content.strip():
-            transcript_parts.append(f"{role}: {content.strip()}")
 
+    transcript_parts = _compact_transcript_parts(messages)
     tool_block = "\n".join(_tool_descriptions(tools)) or "- No tools"
     system_block = "\n\n".join(system_parts).strip()
     transcript = "\n\n".join(transcript_parts).strip()
@@ -116,20 +154,24 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "You are operating as a coding agent for pi.\n"
         "You must behave like a tool-using coding assistant, not a normal chat bot.\n"
         "When tools are available, prefer using them instead of writing long prose.\n"
-        "Use at most one tool call at a time.\n"
+        "You may emit multiple independent tool calls in one response when they can safely run in parallel.\n"
+        "Use multiple <tool_call>...</tool_call> blocks for safe batching.\n"
+        "Only batch independent read-only or inspection commands, such as ls, find, grep, read, and safe bash commands.\n"
+        "Do not batch dependent operations. If a later command depends on an earlier result, emit only the first needed tool call.\n"
+        "Do not batch multiple write/edit operations unless they are clearly independent and explicitly requested.\n"
         "If a task requires inspecting files, call read.\n"
         "If a task requires modifying an existing file, call edit.\n"
         "If a task requires creating or replacing a whole file, call write.\n"
         "If a task requires running commands or tests, call bash.\n"
         "If the task is complete and no tool is needed, return a final response.\n\n"
         "Return output in exactly one of these formats:\n"
-        "1) Preferred tool call format:\n"
-        "<tool_call>\n"
-        "<name>tool_name</name>\n"
-        "<arguments>\n"
-        "<arg_name>raw argument value</arg_name>\n"
-        "</arguments>\n"
-        "</tool_call>\n\n"
+        "1) Preferred tool call format (examples escaped so they are not mistaken for your answer):\n"
+        "&lt;tool_call&gt;\n"
+        "&lt;name&gt;read&lt;/name&gt;\n"
+        "&lt;arguments&gt;\n"
+        "&lt;path&gt;app/main.py&lt;/path&gt;\n"
+        "&lt;/arguments&gt;\n"
+        "&lt;/tool_call&gt;\n\n"
         "For bash, put the exact shell command inside <command>...</command>. Do not JSON-escape shell commands.\n"
         "For write, put the exact file content inside <content>...</content>. Do not markdown-fence file content.\n"
         "For simple arguments like path or timeout, use separate XML tags inside <arguments>.\n\n"
@@ -138,7 +180,8 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "3) Final response:\n"
         "Use final_response XML tags around the final answer, for example:\n"
         "&lt;final_response&gt;Ready.&lt;/final_response&gt;\n\n"
-        "Output the tags as literal text. Do not put them in markdown fences. Do not HTML-escape them.\n"
+        "When answering, output actual unescaped tags as literal text. Do not put them in markdown fences. Do not HTML-escape them.\n"
+        "The examples above are escaped only so they are not mistaken for your answer.\n"
         "Do not include prose outside the tags.\n"
         "Preserve indentation exactly as it should appear in the file.\n"
         "If writing Python, every class/function body must be correctly indented and syntactically valid Python.\n"
@@ -294,6 +337,8 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
     name = name_match.group(1).strip()
     if not name:
         return ParsedAssistantAction(kind="invalid_tool", parse_error="xml tool_call missing name")
+    if name == "tool_name":
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder tool name")
 
     arguments: dict[str, Any] = {}
     arguments_match = _XML_ARGUMENTS_RE.search(payload)
@@ -322,6 +367,8 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
         name = data.get("name")
         arguments = data.get("arguments")
         if isinstance(name, str) and isinstance(arguments, dict):
+            if name.strip() == "tool_name":
+                return ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder tool name")
             if name == "write":
                 path = arguments.get("path")
                 if isinstance(arguments.get("filename"), str) and not isinstance(path, str):
@@ -348,22 +395,21 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
 def _extract_tool_call(raw: str) -> ParsedAssistantAction | None:
     matches = [match.group(1).strip() for match in _TOOL_TAG_RE.finditer(raw or "")]
     first_invalid: ParsedAssistantAction | None = None
+    calls: list[ParsedToolCall] = []
 
-    for payload in reversed(matches):
+    for payload in matches:
         xml_parsed = _parse_xml_tool_payload(payload, raw)
-        if xml_parsed is not None:
-            if xml_parsed.kind == "tool":
-                return xml_parsed
-            if first_invalid is None:
-                first_invalid = xml_parsed
+        parsed = xml_parsed if xml_parsed is not None else _parse_tool_payload(payload, raw)
+        if parsed.kind == "tool" and parsed.tool_name and isinstance(parsed.tool_arguments, dict):
+            calls.append(ParsedToolCall(name=parsed.tool_name, arguments=parsed.tool_arguments))
             continue
-
-        parsed = _parse_tool_payload(payload, raw)
-        if parsed.kind == "tool":
-            return parsed
         if first_invalid is None:
             first_invalid = parsed
 
+    if len(calls) == 1:
+        return ParsedAssistantAction(kind="tool", tool_name=calls[0].name, tool_arguments=calls[0].arguments, tool_calls=calls)
+    if len(calls) > 1:
+        return ParsedAssistantAction(kind="tools", tool_calls=calls)
     return first_invalid
 
 
@@ -381,12 +427,17 @@ def _extract_final_response(raw: str) -> str | None:
 
 
 def _detect_incomplete_tagged_response(raw: str) -> str | None:
-    lowered = (raw or "").lower()
-    if "<tool_call" in lowered and not _TOOL_TAG_RE.search(raw):
-        return "incomplete tool_call tag"
-    if "<final" in lowered and not _FINAL_TAG_RE.search(raw):
+    stripped = str(raw or "").strip()
+    lowered = stripped.lower()
+    if stripped in {"<", "</", "<tool", "<tool_", "<tool_c", "<tool_ca", "<tool_cal", "<tool_call", "<name", "<arguments", "<command", "<content"}:
+        return "incomplete tagged response"
+    if stripped in {"<final", "<final_", "<final_r", "<final_re", "<final_res", "<final_resp", "<final_respo", "<final_respon", "<final_response"}:
         return "incomplete final_response tag"
-    if "<write_content" in lowered and not _WRITE_CONTENT_RE.search(raw):
+    if "<tool_call" in lowered and not _TOOL_TAG_RE.search(stripped):
+        return "incomplete tool_call tag"
+    if "<final" in lowered and not _FINAL_TAG_RE.search(stripped):
+        return "incomplete final_response tag"
+    if "<write_content" in lowered and not _WRITE_CONTENT_RE.search(stripped):
         return "incomplete write_content tag"
     return None
 
@@ -395,10 +446,14 @@ def _detect_incomplete_tagged_response(raw: str) -> str | None:
 def parse_assistant_action(text: str) -> ParsedAssistantAction:
     raw = str(text or "").strip()
     tool_action = _extract_tool_call(raw)
-    if tool_action is not None:
-        return tool_action
-
     final_response = _extract_final_response(raw)
+
+    if tool_action is not None:
+        if tool_action.kind in {"tool", "tools"}:
+            return tool_action
+        if final_response is None:
+            return tool_action
+
     if final_response is not None:
         return ParsedAssistantAction(kind="final", content=final_response)
 
@@ -432,6 +487,7 @@ def should_retry_malformed_tool_call(action: ParsedAssistantAction) -> bool:
             "expecting",
             "delimiter",
             "json",
+            "incomplete tagged response",
             "incomplete tool_call tag",
             "incomplete write_content tag",
             "tool payload missing",

@@ -163,27 +163,42 @@ class RuntimeClient:
         transcript_aliases = [fingerprint_messages([*messages, {"role": "assistant", "content": assistant_text}])]
 
         action = parse_assistant_action(assistant_text)
-        if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
-            transcript_aliases.append(
-                fingerprint_messages(
-                    [
-                        *messages,
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "type": "function",
-                                    "function": {
-                                        "name": action.tool_name,
-                                        "arguments": dumps(action.tool_arguments, ensure_ascii=False, sort_keys=True),
-                                    },
-                                }
-                            ],
+        if action.kind in {"tool", "tools"}:
+            calls: list[dict[str, Any]] = []
+            if action.kind == "tools" and action.tool_calls:
+                calls = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": dumps(call.arguments, ensure_ascii=False, sort_keys=True),
                         },
-                    ]
+                    }
+                    for call in action.tool_calls
+                ]
+            elif action.tool_name and isinstance(action.tool_arguments, dict):
+                calls = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": action.tool_name,
+                            "arguments": dumps(action.tool_arguments, ensure_ascii=False, sort_keys=True),
+                        },
+                    }
+                ]
+            if calls:
+                transcript_aliases.append(
+                    fingerprint_messages(
+                        [
+                            *messages,
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": calls,
+                            },
+                        ]
+                    )
                 )
-            )
         elif action.kind == "final":
             transcript_aliases.append(fingerprint_messages([*messages, {"role": "assistant", "content": action.content or ""}]))
 

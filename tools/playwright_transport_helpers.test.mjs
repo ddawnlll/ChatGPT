@@ -5,6 +5,7 @@ import {
   extractAllToolCallTexts,
   extractFinalResponseText,
   extractToolCallText,
+  isPromptExampleToolCall,
   hasIncompleteTaggedResponse,
   normalizeAssistantText,
   chooseBetterAssistantText,
@@ -57,6 +58,19 @@ describe('playwright transport helper extraction', () => {
   test('chooseBetterAssistantText prefers complete tool call over partial capture', () => {
     const full = '<tool_call><name>bash</name><arguments><command>tree app 2>/dev/null || find app -print | sort</command><timeout>10</timeout></arguments></tool_call>'
     expect(chooseBetterAssistantText('<', full)).toBe(full)
+  })
+
+  test('isPromptExampleToolCall rejects prompt template examples', () => {
+    const example = [
+      '<tool_call>',
+      '<name>tool_name</name>',
+      '<arguments>',
+      '<arg_name>raw argument value</arg_name>',
+      '</arguments>',
+      '</tool_call>',
+    ].join('\n')
+    expect(isPromptExampleToolCall(example)).toBe(true)
+    expect(chooseBetterAssistantText('<final_response>hello!</final_response>', example)).toBe('hello!')
   })
 
   test('computeAppendDelta emits replacement when earlier text diverges strongly', () => {

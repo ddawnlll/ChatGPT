@@ -75,6 +75,15 @@ def tool_parse_error_message(parse_error: str | None) -> str:
     return f"Model emitted a malformed tool call{detail}"
 
 
+def action_tool_calls(action: Any) -> list[dict[str, Any]]:
+    if getattr(action, "kind", None) == "tools" and getattr(action, "tool_calls", None):
+        return [build_openai_tool_call(call.name, call.arguments) for call in action.tool_calls]
+    if getattr(action, "kind", None) == "tool" and getattr(action, "tool_name", None) and isinstance(getattr(action, "tool_arguments", None), dict):
+        return [build_openai_tool_call(action.tool_name, action.tool_arguments)]
+    return []
+
+
+
 def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None) -> tuple[str, Any]:
     text, effective_conversation_id = complete_chat_turn(
         model=model,
@@ -134,12 +143,13 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                     yield sse({"error": {"message": str(exc), "type": "server_error", "code": "transport_error"}})
                     yield done_sse()
                     return
-                if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
+                tool_calls = action_tool_calls(action)
+                if tool_calls:
                     chunk = StreamChunk(
                         id=req_id,
                         created=created,
                         model=request.model,
-                        choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", tool_calls=[build_openai_tool_call(action.tool_name, action.tool_arguments)]), finish_reason="tool_calls")],
+                        choices=[StreamChoice(index=0, delta=StreamDelta(role="assistant", tool_calls=tool_calls), finish_reason="tool_calls")],
                     )
                     yield sse(chunk.model_dump())
                     yield done_sse()
@@ -203,7 +213,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
         raise openai_error(str(exc), 400, "invalid_messages") from exc
 
     if agent_mode:
-        if action.kind == "tool" and action.tool_name and isinstance(action.tool_arguments, dict):
+        tool_calls = action_tool_calls(action)
+        if tool_calls:
             payload = ChatResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex}",
                 created=int(time.time()),
@@ -211,7 +222,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                 choices=[
                     ChatChoice(
                         index=0,
-                        message=ChatResponseMessage(role="assistant", content=None, tool_calls=[build_openai_tool_call(action.tool_name, action.tool_arguments)]),
+                        message=ChatResponseMessage(role="assistant", content=None, tool_calls=tool_calls),
                         finish_reason="tool_calls",
                     )
                 ],
