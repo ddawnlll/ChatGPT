@@ -129,7 +129,8 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"path/to/file\"}}</tool_call>\n"
         "<write_content>\nRAW FILE CONTENT HERE\n</write_content>\n\n"
         "3) Final response:\n"
-        "<final_response>your final answer here</final_response>\n\n"
+        "Use final_response XML tags around the final answer, for example:\n"
+        "&lt;final_response&gt;Ready.&lt;/final_response&gt;\n\n"
         "For write, prefer the safer write_content format instead of JSON-escaping the whole file body.\n"
         "Inside <write_content>, output raw file contents only. Do not add markdown fences like ``` or ```python.\n"
         "Preserve indentation exactly as it should appear in the file.\n"
@@ -147,6 +148,14 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
 _TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FINAL_TAG_RE = re.compile(r"<final_response>\s*(.*?)\s*</final_response>", re.DOTALL | re.IGNORECASE)
 _WRITE_CONTENT_RE = re.compile(r"<write_content>(.*?)</write_content>", re.DOTALL | re.IGNORECASE)
+_FINAL_RESPONSE_PLACEHOLDERS = {
+    "your final answer here",
+    "final answer here",
+    "your final response here",
+    "final response here",
+    "FINAL_TEXT",
+    "FINAL_ANSWER",
+}
 
 
 def _decode_loose_string(value: str) -> str:
@@ -278,15 +287,42 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
     return ParsedAssistantAction(kind="invalid_tool", parse_error="tool payload missing name/arguments")
 
 
+def _extract_tool_call(raw: str) -> ParsedAssistantAction | None:
+    matches = [match.group(1).strip() for match in _TOOL_TAG_RE.finditer(raw or "")]
+    first_invalid: ParsedAssistantAction | None = None
+
+    for payload in reversed(matches):
+        parsed = _parse_tool_payload(payload, raw)
+        if parsed.kind == "tool":
+            return parsed
+        if first_invalid is None:
+            first_invalid = parsed
+
+    return first_invalid
+
+
+
+def _extract_final_response(raw: str) -> str | None:
+    matches = [match.group(1).strip() for match in _FINAL_TAG_RE.finditer(raw or "")]
+
+    for value in reversed(matches):
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if normalized and normalized not in _FINAL_RESPONSE_PLACEHOLDERS:
+            return value
+
+    return None
+
+
+
 def parse_assistant_action(text: str) -> ParsedAssistantAction:
     raw = str(text or "").strip()
-    tool_match = _TOOL_TAG_RE.search(raw)
-    if tool_match:
-        return _parse_tool_payload(tool_match.group(1).strip(), raw)
+    tool_action = _extract_tool_call(raw)
+    if tool_action is not None:
+        return tool_action
 
-    final_match = _FINAL_TAG_RE.search(raw)
-    if final_match:
-        return ParsedAssistantAction(kind="final", content=final_match.group(1).strip())
+    final_response = _extract_final_response(raw)
+    if final_response is not None:
+        return ParsedAssistantAction(kind="final", content=final_response)
 
     if raw.startswith("{") and raw.endswith("}"):
         parsed = _parse_tool_payload(raw, raw)

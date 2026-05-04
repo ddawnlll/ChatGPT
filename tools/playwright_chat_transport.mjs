@@ -806,6 +806,68 @@ async function getAssistantSnapshot(page) {
   return { selector: null, count: 0, rawText: '' }
 }
 
+function extractAllFinalResponseTexts(text) {
+  return Array.from(String(text || '').matchAll(/<final_response>\s*([\s\S]*?)\s*<\/final_response>/gi))
+    .map((match) => String(match[1] || '').trim())
+    .filter(Boolean)
+}
+
+async function extractPageFinalResponseText(page, baselineText = '') {
+  const baselineMatches = extractAllFinalResponseTexts(baselineText)
+
+  try {
+    const html = await page.locator('body').evaluate((node) => node.innerHTML).catch(() => '')
+    const htmlMatches = extractAllFinalResponseTexts(html)
+    if (htmlMatches.length > baselineMatches.length) return htmlMatches[htmlMatches.length - 1]
+    if (htmlMatches.length && htmlMatches.join('\n') !== baselineMatches.join('\n')) return htmlMatches[htmlMatches.length - 1]
+  } catch (err) {
+    emitError('page_final_response_html_extract_failed', err)
+  }
+
+  try {
+    const text = await page.locator('body').innerText().catch(() => '')
+    const textMatches = extractAllFinalResponseTexts(text)
+    if (textMatches.length > baselineMatches.length) return textMatches[textMatches.length - 1]
+    if (textMatches.length && textMatches.join('\n') !== baselineMatches.join('\n')) return textMatches[textMatches.length - 1]
+  } catch (err) {
+    emitError('page_final_response_text_extract_failed', err)
+  }
+
+  return ''
+}
+
+async function waitForAssistantResultFallback(page, baselineAssistant, baselinePageText, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs
+  let bestText = ''
+  let bestSource = 'none'
+
+  while (Date.now() < deadline) {
+    try {
+      const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
+      const domText = latestAssistant?.locator ? String(await extractAssistantText(latestAssistant.locator) || '').trim() : ''
+      const pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
+
+      let candidate = chooseBetterAssistantText(bestText, domText).trim()
+      candidate = chooseBetterAssistantText(candidate, pageFinalResponseText).trim()
+
+      if (candidate && !isIgnorableAssistantText(candidate)) {
+        if (candidate === pageFinalResponseText) bestSource = 'page_final_response'
+        else if (candidate === domText) bestSource = 'assistant_dom'
+        else bestSource = 'combined'
+        return { text: candidate, source: bestSource }
+      }
+
+      bestText = candidate
+    } catch (err) {
+      emitError('wait_for_assistant_result_fallback_poll_failed', err)
+    }
+
+    await delay(250)
+  }
+
+  return { text: bestText.trim(), source: bestSource }
+}
+
 async function findLatestAssistantLocator(page, baseline = null) {
   if (baseline?.selector) {
     try {
@@ -846,8 +908,32 @@ async function findLatestAssistantLocator(page, baseline = null) {
 // ---------------------------------------------------------------------------
 // Text normalization and delta computation
 // ---------------------------------------------------------------------------
+function extractFinalResponseText(text) {
+  const raw = String(text || '')
+  const matches = Array.from(raw.matchAll(/<final_response>\s*([\s\S]*?)\s*<\/final_response>/gi))
+  if (!matches.length) return null
+  return String(matches[matches.length - 1][1] || '').trim()
+}
+
 function normalizeAssistantText(text) {
-  return String(text || '').replace(/\r/g, '').replace(/^Thinking\s*/i, '')
+  const raw = String(text || '').replace(/\r/g, '')
+  const taggedFinal = extractFinalResponseText(raw)
+  if (taggedFinal !== null) return taggedFinal
+
+  const cleanedLines = raw
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => {
+      const trimmed = line.trim()
+      if (!trimmed) return false
+      if (/^(thinking|analyzing|reasoning)\.?$/i.test(trimmed)) return false
+      if (/^hello!?\s+what.?s on your mind today\??$/i.test(trimmed)) return false
+      if (/^ready when you are\.?$/i.test(trimmed)) return false
+      if (/^how can i help(?:,.*)?\??$/i.test(trimmed)) return false
+      return true
+    })
+
+  return cleanedLines.join('\n').replace(/^Thinking\s*/i, '').trim()
 }
 
 function longestCommonPrefixLength(a, b) {
@@ -892,6 +978,26 @@ function isIgnorableAssistantText(text) {
     /^ready when you are\.?$/i.test(normalized) ||
     /^how can i help(?:,.*)?\??$/i.test(normalized)
   )
+}
+
+function chooseBetterAssistantText(primary, fallback) {
+  const primaryNormalized = normalizeAssistantText(primary)
+  const fallbackNormalized = normalizeAssistantText(fallback)
+
+  const primaryHasFinalTag = extractFinalResponseText(primary) !== null
+  const fallbackHasFinalTag = extractFinalResponseText(fallback) !== null
+
+  if (fallbackHasFinalTag && !primaryHasFinalTag) return fallbackNormalized
+  if (primaryHasFinalTag && !fallbackHasFinalTag) return primaryNormalized
+
+  const primaryIgnorable = isIgnorableAssistantText(primaryNormalized)
+  const fallbackIgnorable = isIgnorableAssistantText(fallbackNormalized)
+
+  if (primaryIgnorable && !fallbackIgnorable) return fallbackNormalized
+  if (fallbackIgnorable && !primaryIgnorable) return primaryNormalized
+
+  if (fallbackNormalized.length > primaryNormalized.length) return fallbackNormalized
+  return primaryNormalized
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,26 +1459,46 @@ async function handleRequest(request) {
     })
 
     const baselineAssistant = await getAssistantSnapshot(page)
+    const baselinePageText = await page.locator('body').innerText().catch(() => '')
     await sendPrompt(page, String(request?.message || ''), targetUrl, Boolean(request?.new_conversation))
     const streamed = await streamAssistantText(page, captureTimeoutMs, baselineAssistant)
 
     let finalText = String(streamed?.text || '').trim()
-    if (!finalText) {
-      try {
-        const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
-        if (latestAssistant?.locator) {
-          finalText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
-          emit({
-            type: 'status',
-            stage: 'assistant_dom_fallback_after_empty_stream',
-            selector: latestAssistant.selector,
-            count: latestAssistant.count,
-            recovered_length: finalText.length,
-          })
-        }
-      } catch (err) {
-        emitError('assistant_dom_fallback_after_empty_stream_failed', err)
+    let domFallbackText = ''
+    let pageFinalResponseText = ''
+    try {
+      const latestAssistant = await findLatestAssistantLocator(page, baselineAssistant)
+      if (latestAssistant?.locator) {
+        domFallbackText = String(await extractAssistantText(latestAssistant.locator) || '').trim()
       }
+      pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
+      finalText = chooseBetterAssistantText(finalText, domFallbackText).trim()
+      finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
+      emit({
+        type: 'status',
+        stage: 'assistant_dom_reconciled_after_stream',
+        selector: latestAssistant?.selector || null,
+        count: latestAssistant?.count || 0,
+        stream_length: String(streamed?.text || '').trim().length,
+        dom_length: domFallbackText.length,
+        page_final_length: pageFinalResponseText.length,
+        chosen_length: finalText.length,
+        dom_has_final_response_tag: extractFinalResponseText(domFallbackText) !== null,
+        page_has_final_response_tag: Boolean(pageFinalResponseText),
+      })
+    } catch (err) {
+      emitError('assistant_dom_reconcile_after_stream_failed', err)
+    }
+
+    if (!finalText) {
+      const waited = await waitForAssistantResultFallback(page, baselineAssistant, baselinePageText, 8000)
+      finalText = String(waited.text || '').trim()
+      emit({
+        type: 'status',
+        stage: 'assistant_waited_fallback_after_empty_result',
+        source: waited.source,
+        chosen_length: finalText.length,
+      })
     }
 
     const remoteConversationId = extractRemoteConversationId(page.url()) || request?.remote_conversation_id || null
