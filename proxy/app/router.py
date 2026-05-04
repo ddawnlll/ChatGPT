@@ -13,6 +13,7 @@ from .config import settings
 from .models import ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, HealthResponse, ModelList, StreamChoice, StreamChunk, StreamDelta
 from .streaming import chat_completions_stream, done_sse, sse
 from .tools_shim import (
+    ParsedAssistantAction,
     build_openai_tool_call,
     build_pi_agent_prompt,
     build_tool_repair_prompt,
@@ -83,6 +84,14 @@ def action_tool_calls(action: Any) -> list[dict[str, Any]]:
     return []
 
 
+def is_placeholder_transport_artifact(text: str) -> bool:
+    raw = str(text or "").strip().lower()
+    return raw in {
+        "<tool_call>...</tool_call>",
+        "<final_response>...</final_response>",
+    }
+
+
 
 def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None) -> tuple[str, Any]:
     text, effective_conversation_id = complete_chat_turn(
@@ -92,6 +101,8 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
         prompt_override=prompt_override,
     )
     action = parse_assistant_action(text)
+    if is_placeholder_transport_artifact(text):
+        return text, ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder transport artifact")
     if should_retry_malformed_tool_call(action):
         repair_prompt = build_tool_repair_prompt(text, action.parse_error)
         repaired_text = complete_chat(
@@ -122,6 +133,16 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
     if agent_mode:
         decision = build_pi_agent_prompt(dumped_messages, request.tools)
         prompt_override = decision.prompt
+        if request.parallel_tool_calls is True:
+            prompt_override += (
+                "\n\nRequest option: parallel_tool_calls=true.\n"
+                "When safe, batch independent read-only inspection tool calls in one response.\n"
+            )
+        if request.tool_choice == "required":
+            prompt_override += (
+                "\n\nRequest option: tool_choice=required.\n"
+                "You must emit at least one tool_call. Do not emit final_response on this turn.\n"
+            )
 
     if request.stream:
         if agent_mode:

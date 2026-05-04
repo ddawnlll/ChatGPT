@@ -235,6 +235,38 @@ def test_agent_incomplete_final_response_tag_returns_error(monkeypatch):
     assert "incomplete final_response tag" in payload["error"]["message"]
 
 
+def test_agent_does_not_repair_placeholder_transport_artifact(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        return ("<tool_call>...</tool_call>", "conv-test")
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("repair", kwargs))
+        return "<final_response>should not happen</final_response>"
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert response.status_code == 502
+    assert not any(kind == "repair" for kind, _kwargs in calls)
+    payload = response.json()
+    assert payload["error"]["code"] == "malformed_tool_call"
+    assert "placeholder transport artifact" in payload["error"]["message"]
+
+
 def test_agent_retries_malformed_tool_call_and_returns_repaired_tool(monkeypatch):
     calls = []
 
@@ -275,3 +307,33 @@ def test_agent_retries_malformed_tool_call_and_returns_repaired_tool(monkeypatch
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "edit"
     assert any(kind == "repair" for kind, _kwargs in calls)
+
+
+def test_agent_prompt_includes_request_tool_hints(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured["prompt_override"] = kwargs.get("prompt_override")
+        return ('<tool_call>{"name":"read","arguments":{"path":"server.py"}}</tool_call>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "analyze the repo"}],
+            "tools": PI_TOOLS,
+            "parallel_tool_calls": True,
+            "tool_choice": "required",
+        },
+    )
+
+    assert response.status_code == 200
+    prompt_override = captured["prompt_override"]
+    assert "parallel_tool_calls=true" in prompt_override
+    assert "batch independent read-only inspection tool calls" in prompt_override
+    assert "tool_choice=required" in prompt_override
+    assert "must emit at least one tool_call" in prompt_override

@@ -68,6 +68,12 @@ def test_parse_plain_final_fallback():
     assert action.content == "Ready."
 
 
+def test_parse_placeholder_tool_call_is_invalid_not_final():
+    action = parse_assistant_action("<tool_call>...</tool_call>")
+
+    assert action.kind == "invalid_tool"
+
+
 def test_parse_incomplete_final_response_tag_is_rejected():
     action = parse_assistant_action("<final")
 
@@ -155,3 +161,22 @@ def test_build_pi_agent_prompt_compacts_large_history():
     assert "latest request" in decision.prompt
     assert "[truncated" in decision.prompt
     assert len(decision.prompt) < 20000
+
+
+def test_repo_analysis_prompt_forces_tool_inspection():
+    decision = build_pi_agent_prompt(
+        [{"role": "user", "content": "analyze the repo"}],
+        [
+            {"type": "function", "function": {"name": "bash", "description": "Run shell", "parameters": {}}},
+            {"type": "function", "function": {"name": "ls", "description": "List files", "parameters": {}}},
+        ],
+    )
+
+    prompt = decision.prompt.lower()
+
+    assert "you are not operating inside chatgpt" in prompt
+    assert "must call tools first" in prompt
+    assert 'do not answer "i cannot access the repo"' in prompt
+    assert "analyze the repo" in prompt
+    assert "ls" in prompt
+    assert "bash" in prompt

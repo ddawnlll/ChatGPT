@@ -884,8 +884,10 @@ async function waitForAssistantResultFallback(page, baselineAssistant, baselineP
       const assistantToolCallText = extractToolCallText(domText) || ''
 
       let candidate = chooseBetterAssistantText(bestText, domText).trim()
-      candidate = chooseBetterAssistantText(candidate, pageFinalResponseText).trim()
-      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText)) {
+      if (!candidate || hasIncompleteTaggedResponse(candidate)) {
+        candidate = chooseBetterAssistantText(candidate, pageFinalResponseText).trim()
+      }
+      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText) && !isPlaceholderToolCallText(assistantToolCallText)) {
         candidate = chooseBetterAssistantText(candidate, assistantToolCallText).trim()
       }
 
@@ -975,6 +977,17 @@ function isPromptExampleToolCall(text) {
   )
 }
 
+function isPlaceholderToolCallText(text) {
+  const raw = String(text || '').trim().toLowerCase()
+  return (
+    raw === '<tool_call>...</tool_call>' ||
+    raw.includes('<name>tool_name</name>') ||
+    raw.includes('<arg_name>raw argument value</arg_name>') ||
+    raw.includes('"name":"tool_name"') ||
+    raw.includes('"arguments":{...}')
+  )
+}
+
 function hasIncompleteTaggedResponse(text) {
   const raw = String(text || '').trim().toLowerCase()
   if (!raw) return false
@@ -990,7 +1003,7 @@ function hasIncompleteTaggedResponse(text) {
 function normalizeAssistantText(text) {
   const raw = String(text || '').replace(/\r/g, '')
   const taggedToolCall = extractToolCallText(raw)
-  if (taggedToolCall !== null && !isPromptExampleToolCall(taggedToolCall)) return taggedToolCall
+  if (taggedToolCall !== null && !isPromptExampleToolCall(taggedToolCall) && !isPlaceholderToolCallText(taggedToolCall)) return taggedToolCall
   const taggedFinal = extractFinalResponseText(raw)
   if (taggedFinal !== null) return taggedFinal
   if (hasIncompleteTaggedResponse(raw)) return ''
@@ -1056,13 +1069,20 @@ function isIgnorableAssistantText(text) {
 }
 
 function chooseBetterAssistantText(primary, fallback) {
+  if (isPlaceholderToolCallText(fallback)) {
+    return normalizeAssistantText(primary)
+  }
+  if (isPlaceholderToolCallText(primary)) {
+    return normalizeAssistantText(fallback)
+  }
+
   const primaryNormalized = normalizeAssistantText(primary)
   const fallbackNormalized = normalizeAssistantText(fallback)
 
   const primaryExtractedToolCall = extractToolCallText(primary)
   const fallbackExtractedToolCall = extractToolCallText(fallback)
-  const primaryHasToolCallTag = primaryExtractedToolCall !== null && !isPromptExampleToolCall(primaryExtractedToolCall)
-  const fallbackHasToolCallTag = fallbackExtractedToolCall !== null && !isPromptExampleToolCall(fallbackExtractedToolCall)
+  const primaryHasToolCallTag = primaryExtractedToolCall !== null && !isPromptExampleToolCall(primaryExtractedToolCall) && !isPlaceholderToolCallText(primaryExtractedToolCall)
+  const fallbackHasToolCallTag = fallbackExtractedToolCall !== null && !isPromptExampleToolCall(fallbackExtractedToolCall) && !isPlaceholderToolCallText(fallbackExtractedToolCall)
   const primaryHasFinalTag = extractFinalResponseText(primary) !== null
   const fallbackHasFinalTag = extractFinalResponseText(fallback) !== null
 
@@ -1589,8 +1609,10 @@ async function handleRequest(request) {
       pageFinalResponseText = String(await extractPageFinalResponseText(page, baselinePageText) || '').trim()
       const assistantToolCallText = extractToolCallText(domFallbackText) || ''
       finalText = chooseBetterAssistantText(finalText, domFallbackText).trim()
-      finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
-      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText)) {
+      if (!finalText || hasIncompleteTaggedResponse(finalText)) {
+        finalText = chooseBetterAssistantText(finalText, pageFinalResponseText).trim()
+      }
+      if (assistantToolCallText && !isPromptExampleToolCall(assistantToolCallText) && !isPlaceholderToolCallText(assistantToolCallText)) {
         finalText = chooseBetterAssistantText(finalText, assistantToolCallText).trim()
       }
       emit({
@@ -1765,6 +1787,7 @@ export {
   extractFinalResponseText,
   extractToolCallText,
   isPromptExampleToolCall,
+  isPlaceholderToolCallText,
   hasIncompleteTaggedResponse,
   normalizeAssistantText,
   computeAppendDelta,

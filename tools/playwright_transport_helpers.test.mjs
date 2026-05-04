@@ -6,6 +6,7 @@ import {
   extractFinalResponseText,
   extractToolCallText,
   isPromptExampleToolCall,
+  isPlaceholderToolCallText,
   hasIncompleteTaggedResponse,
   normalizeAssistantText,
   chooseBetterAssistantText,
@@ -71,6 +72,12 @@ describe('playwright transport helper extraction', () => {
     ].join('\n')
     expect(isPromptExampleToolCall(example)).toBe(true)
     expect(chooseBetterAssistantText('<final_response>hello!</final_response>', example)).toBe('hello!')
+  })
+
+  test('isPlaceholderToolCallText rejects collapsed placeholder tool-call artifacts', () => {
+    expect(isPlaceholderToolCallText('<tool_call>...</tool_call>')).toBe(true)
+    expect(chooseBetterAssistantText('<final_response>hello!</final_response>', '<tool_call>...</tool_call>')).toBe('hello!')
+    expect(chooseBetterAssistantText('<tool_call>...</tool_call>', '<final_response>hello!</final_response>')).toBe('hello!')
   })
 
   test('computeAppendDelta emits replacement when earlier text diverges strongly', () => {
