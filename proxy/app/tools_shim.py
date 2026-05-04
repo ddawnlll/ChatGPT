@@ -20,6 +20,26 @@ _INTERNAL_REPAIR_MARKERS = (
 )
 
 PI_TOOL_NAMES = frozenset({"read", "write", "edit", "bash", "grep", "find", "ls"})
+_IMPLEMENTATION_TASK_SIGNALS = (
+    "implementation agent",
+    "continue and complete",
+    "continuation task",
+    "not a greenfield",
+    "inspect the current repository",
+    "inspect current repository",
+    "before coding",
+    "required deliverables",
+    "files changed",
+    "tests run",
+    "run required test commands",
+    "run the required test commands",
+    "final response format",
+    "add tests",
+    "fix only what is incorrect",
+    "preserve valid existing work",
+    "complete or patch",
+    "execute order",
+)
 
 
 @dataclass(slots=True)
@@ -235,6 +255,36 @@ def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
 
 
 
+def is_implementation_task(messages: list[dict[str, Any]]) -> bool:
+    latest_user_text = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip().lower() != "user":
+            continue
+        latest_user_text = _stringify_content(message.get("content")).strip().lower()
+        if latest_user_text:
+            break
+    if not latest_user_text:
+        return False
+    return any(signal in latest_user_text for signal in _IMPLEMENTATION_TASK_SIGNALS)
+
+
+
+def count_tool_rounds(messages: list[dict[str, Any]]) -> int:
+    rounds = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip().lower() != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            rounds += 1
+    return rounds
+
+
+
 def _build_planning_prompt(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> str:
     system_parts: list[str] = []
     for message in messages:
@@ -280,7 +330,9 @@ def _build_planning_prompt(*, messages: list[dict[str, Any]], tools: list[dict[s
         "Repo-analysis defaults:\n"
         "- If the user says \"analyze the repo\", start with one or more inspection tool calls.\n"
         "- Good first steps include ls for top-level structure, find for important files, grep for entrypoints/TODOs/package names, read for README/config/main source files, and bash for safe inspection commands.\n"
-        "- For broad repo inspection, batch independent read-only tool calls when safe.\n\n"
+        "- For broad repo inspection, batch independent read-only tool calls when safe.\n"
+        "- If the user provides a long implementation-job prompt with required deliverables, keep working through tools until the requested changes and verification steps are complete or blocked.\n"
+        "- For implementation jobs, inspection tool results are intermediate progress, not completion.\n\n"
         "Return output in exactly one of these formats:\n"
         "1) Preferred tool call format (examples escaped so they are not mistaken for your answer):\n"
         "&lt;tool_call&gt;\n"
@@ -342,8 +394,10 @@ def _build_planning_prompt(*, messages: list[dict[str, Any]], tools: list[dict[s
         "Do not emit a final_response immediately after a tool_call for the same task. After tool execution, wait for the next turn.\n"
         "You may emit <after_tools> after tool calls as hidden post-tool metadata.\n"
         "Use <after_tools><on_success>...</on_success></after_tools> only when the final reply can be safely determined from whether the tool succeeds.\n"
+        "Do not use <after_tools><on_success> for intermediate inspection tools in implementation jobs.\n"
         "Use <after_tools><on_failure>...</on_failure></after_tools> for concise failure text, optionally with {error}.\n"
         "For read/grep/find/ls/analysis tasks, prefer <after_tools><final_prompt>...</final_prompt></after_tools> instead of claiming unseen facts.\n"
+        "For implementation jobs, after tool execution you should usually continue with more tool calls until changes and tests are complete.\n"
         "Do not include explanations outside those tags.\n\n"
         f"Available tools:\n{tool_block}\n\n"
         f"System instructions:\n{system_block or '(none)'}\n\n"
@@ -388,6 +442,36 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
 
 def build_final_after_tools_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, final_prompt_hint: str | None = None) -> ShimDecision:
     return ShimDecision(prompt=_build_final_only_prompt(messages=messages, tools=tools, final_prompt_hint=final_prompt_hint), tools=tools or [], agent_mode=True)
+
+
+
+def build_task_continuation_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, tool_round_count: int, max_tool_rounds: int) -> ShimDecision:
+    transcript_parts = _compact_transcript_parts(messages)
+    transcript = "\n\n".join(transcript_parts).strip()
+    latest_user_text = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip().lower() != "user":
+            continue
+        latest_user_text = _stringify_content(message.get("content")).strip()
+        if latest_user_text:
+            break
+    prompt = (
+        "You are continuing a multi-step implementation task through pi tools.\n"
+        "More tool calls are allowed on this turn.\n"
+        "Continue the implementation task using the recent tool results as evidence.\n"
+        "Only emit <final_response> when the requested deliverables are complete or you are blocked and explain the blocker.\n"
+        "Do not claim files were changed unless tool results prove it.\n"
+        "Do not claim tests were run or passed unless tool results show the command output.\n"
+        f"Current tool round count: {tool_round_count}\n"
+        f"Maximum tool round count: {max_tool_rounds}\n"
+        "If more inspection, edits, writes, or test commands are needed, emit the next tool_call now.\n"
+        "Do not stop after intermediate inspection output.\n\n"
+        f"Latest user task:\n{latest_user_text or '(empty)'}\n\n"
+        f"Recent compact context:\n{transcript or '(empty)'}"
+    )
+    return ShimDecision(prompt=prompt, tools=tools or [], agent_mode=True)
 
 
 _TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)

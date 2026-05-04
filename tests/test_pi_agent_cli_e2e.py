@@ -300,8 +300,11 @@ def test_pi_cli_tool_loop_executes_real_pi_tools(monkeypatch, tmp_path, tool_nam
         assert "Updated edit.txt." in result.stdout
         assert len(requests) == 1
     elif tool_name == "bash":
-        assert "Command completed successfully." in result.stdout
-        assert len(requests) == 1
+        assert f"{tool_name} done." in result.stdout
+        assert len(requests) >= 2
+        assert any(message.get("role") == "tool" for message in requests[-1])
+        assert assertion(tmp_path, requests[-1]), result.stdout
+        return
     else:
         assert f"{tool_name} done." in result.stdout
         assert len(requests) >= 2
@@ -387,6 +390,101 @@ def test_pi_cli_read_then_final_uses_one_post_tool_final_prompt(monkeypatch, tmp
     assert len(requests) == 2
     assert "Do not call tools on this turn." in requests[-1]["prompt_override"]
     assert "Return exactly one <final_response>...</final_response> block" in requests[-1]["prompt_override"]
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_implementation_task_continues_until_done(monkeypatch, tmp_path):
+    requests: list[dict[str, Any]] = []
+    step = {"value": 0}
+    app_dir = tmp_path / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "server4.py").write_text('HOST = "0.0.0.0"\nPORT = 8000\n', encoding="utf-8")
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs)
+        step["value"] += 1
+        current = step["value"]
+        if current == 1:
+            return ('<tool_call>{"name":"bash","arguments":{"command":"find . -maxdepth 3 -type f | sort"}}</tool_call>', "conv-impl")
+        if current == 2:
+            return ('<tool_call>{"name":"read","arguments":{"path":"app/server4.py"}}</tool_call>', "conv-impl")
+        if current == 3:
+            return ('<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":[{"oldText":"PORT = 8000","newText":"PORT = 8090"}]}}</tool_call>', "conv-impl")
+        if current == 4:
+            return ('<tool_call>{"name":"write","arguments":{"path":"tests/test_server4.py","content":"import unittest\\nfrom pathlib import Path\\n\\nclass Server4Test(unittest.TestCase):\\n    def test_port_updated(self):\\n        text = Path(\"app/server4.py\").read_text(encoding=\"utf-8\")\\n        self.assertIn(\"PORT = 8090\", text)\\n\\nif __name__ == \"__main__\":\\n    unittest.main()\\n"}}</tool_call>', "conv-impl")
+        if current == 5:
+            return ('<tool_call>{"name":"bash","arguments":{"command":"python -m unittest discover -s tests"}}</tool_call>', "conv-impl")
+        return ("<final_response>Completed implementation task. Files changed: app/server4.py, tests/test_server4.py. Tests run: python -m unittest discover -s tests (passed).</final_response>", "conv-impl")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(
+            agent_dir,
+            tmp_path,
+            "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, preserve valid existing work, update app/server4.py, add tests, and run the required test commands.",
+            tools="bash,read,edit,write",
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "Completed implementation task." in result.stdout
+    assert "Command completed successfully." not in result.stdout
+    assert 'PORT = 8090' in (tmp_path / 'app' / 'server4.py').read_text(encoding='utf-8')
+    assert (tmp_path / 'tests' / 'test_server4.py').exists()
+    assert len(requests) == 6
+    latest_user_prompts = [str(call.get("prompt_override", "")) for call in requests[1:5]]
+    assert any("Continue the implementation task" in prompt for prompt in latest_user_prompts)
+    assert any("More tool calls are allowed on this turn." in prompt for prompt in latest_user_prompts)
+    assert "Tests run: python -m unittest discover -s tests (passed)." in result.stdout
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_implementation_task_fixes_failed_tests_before_final(monkeypatch, tmp_path):
+    requests: list[dict[str, Any]] = []
+    step = {"value": 0}
+    app_dir = tmp_path / "app"
+    tests_dir = tmp_path / "tests"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "server4.py").write_text('HOST = "0.0.0.0"\nPORT = 8000\n', encoding="utf-8")
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs)
+        step["value"] += 1
+        current = step["value"]
+        if current == 1:
+            return ('<tool_call>{"name":"bash","arguments":{"command":"find . -maxdepth 3 -type f | sort"}}</tool_call>', "conv-impl-fix")
+        if current == 2:
+            return ('<tool_call>{"name":"read","arguments":{"path":"app/server4.py"}}</tool_call>', "conv-impl-fix")
+        if current == 3:
+            return ('<tool_call>{"name":"write","arguments":{"path":"tests/test_server4.py","content":"import unittest\\nfrom pathlib import Path\\n\\nclass Server4Test(unittest.TestCase):\\n    def test_port_updated(self):\\n        text = Path(\"app/server4.py\").read_text(encoding=\"utf-8\")\\n        self.assertIn(\"PORT = 8090\", text)\\n\\nif __name__ == \"__main__\":\\n    unittest.main()\\n"}}</tool_call>', "conv-impl-fix")
+        if current == 4:
+            return ('<tool_call>{"name":"bash","arguments":{"command":"python -m unittest discover -s tests"}}</tool_call>', "conv-impl-fix")
+        if current == 5:
+            return ('<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":[{"oldText":"PORT = 8000","newText":"PORT = 8090"}]}}</tool_call>', "conv-impl-fix")
+        if current == 6:
+            return ('<tool_call>{"name":"bash","arguments":{"command":"python -m unittest discover -s tests"}}</tool_call>', "conv-impl-fix")
+        return ("<final_response>Completed implementation task after fixing failed tests. Files changed: app/server4.py, tests/test_server4.py. Tests run: python -m unittest discover -s tests (passed).</final_response>", "conv-impl-fix")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(
+            agent_dir,
+            tmp_path,
+            "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, preserve valid existing work, add tests, run the required test commands, and fix failures before finalizing.",
+            tools="bash,read,edit,write",
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "Completed implementation task after fixing failed tests." in result.stdout
+    assert "Command completed successfully." not in result.stdout
+    assert 'PORT = 8090' in (tmp_path / 'app' / 'server4.py').read_text(encoding='utf-8')
+    assert (tmp_path / 'tests' / 'test_server4.py').exists()
+    assert len(requests) == 7
+    assert any("FAILED" in str(message.get("content", "")) for call in requests for message in call.get("messages", []) if isinstance(message, dict) and message.get("role") == "tool")
+    assert any("Continue the implementation task" in str(call.get("prompt_override", "")) for call in requests[1:6])
+    assert "Tests run: python -m unittest discover -s tests (passed)." in result.stdout
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")

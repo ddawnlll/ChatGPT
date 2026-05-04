@@ -95,6 +95,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).lower() in {"1", "true", "yes", "on"}
 
 
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
 @dataclass(slots=True)
 class Settings:
     host: str = field(default_factory=lambda: os.environ.get("CHATGPT_PROXY_HOST", "0.0.0.0"))
@@ -129,6 +134,9 @@ class Settings:
     agent_post_tool_final_only: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_POST_TOOL_FINAL_ONLY", True))
     agent_local_terminal_final_fastpath: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_LOCAL_TERMINAL_FINAL_FASTPATH", True))
     agent_after_tools_plan_enabled: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_AFTER_TOOLS_PLAN_ENABLED", True))
+    agent_task_mode_enabled: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_TASK_MODE_ENABLED", True))
+    agent_task_max_tool_rounds: int = field(default_factory=lambda: _env_int("CHATGPT_PROXY_AGENT_TASK_MAX_TOOL_ROUNDS", 12))
+    agent_task_disable_local_bash_fastpath: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_TASK_DISABLE_LOCAL_BASH_FASTPATH", True))
 
     def state_path(self) -> Path:
         path = Path(self.state_dir).expanduser()

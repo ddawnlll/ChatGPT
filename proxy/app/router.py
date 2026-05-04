@@ -18,7 +18,10 @@ from .tools_shim import (
     build_final_after_tools_prompt,
     build_openai_tool_call,
     build_pi_agent_prompt,
+    build_task_continuation_prompt,
     build_tool_repair_prompt,
+    count_tool_rounds,
+    is_implementation_task,
     is_pi_agent_request,
     parse_assistant_action,
     should_retry_malformed_tool_call,
@@ -154,6 +157,12 @@ def is_tool_access_refusal_text(text: str) -> bool:
             "don't have access to the pi",
             "cannot create",
             "can't create",
+            "workspace path",
+            "not accessible through the available execution tool",
+            "not accessible through available execution tool",
+            "could not inspect or modify",
+            "could not inspect",
+            "could not modify",
         )
     )
 
@@ -279,6 +288,24 @@ def render_after_tools_template(template: str, messages: list[dict[str, Any]]) -
 
 
 
+def is_simple_explicit_bash_request(messages: list[dict[str, Any]]) -> bool:
+    latest_user = extract_latest_user_text(messages).lower().strip()
+    if not latest_user:
+        return False
+    explicit_prefixes = (
+        "run this command:",
+        "run command:",
+        "execute this command:",
+        "execute command:",
+        "run:",
+        "execute:",
+        "bash:",
+        "shell:",
+    )
+    return latest_user.startswith(explicit_prefixes)
+
+
+
 def maybe_synthesize_local_final(messages: list[dict[str, Any]], pending_plan: dict[str, Any] | None = None) -> str | None:
     if pending_plan:
         if _looks_like_successful_tool_result(messages):
@@ -302,11 +329,8 @@ def maybe_synthesize_local_final(messages: list[dict[str, Any]], pending_plan: d
         path = arguments.get("path")
         if isinstance(path, str) and path.strip():
             return f"Updated {path.strip()}."
-    if tool_name == "bash":
-        latest_user = extract_latest_user_text(messages).lower()
-        bash_signals = ("run ", "execute ", "command", "bash ", "shell ")
-        if latest_user and any(signal in latest_user for signal in bash_signals):
-            return "Command completed successfully."
+    if tool_name == "bash" and is_simple_explicit_bash_request(messages):
+        return "Command completed successfully."
     return None
 
 
@@ -370,17 +394,35 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
     force_new_conversation = False
     pending_after_tools_plan: dict[str, Any] | None = None
     resolved_state = None
+    task_mode = False
+    tool_round_count = 0
+    max_tool_rounds = settings.agent_task_max_tool_rounds
     if agent_mode:
         force_new_conversation = settings.agent_force_new_conversation
+        task_mode = settings.agent_task_mode_enabled and is_implementation_task(dumped_messages)
         post_tool_turn = settings.agent_post_tool_final_only and has_tool_results(dumped_messages)
+        tool_round_count = count_tool_rounds(dumped_messages)
         allow_tool_calls = not post_tool_turn
         if post_tool_turn:
             _resolved_conversation_id, resolved_state = resolve_conversation_state(model=request.model, messages=dumped_messages, conversation_id=conversation_id)
             if settings.agent_after_tools_plan_enabled:
                 pending_after_tools_plan = get_pending_after_tools_plan(resolved_state, dumped_messages)
-            final_prompt_hint = pending_after_tools_plan.get("final_prompt") if isinstance(pending_after_tools_plan, dict) else None
-            decision = build_final_after_tools_prompt(dumped_messages, request.tools, final_prompt_hint=final_prompt_hint if isinstance(final_prompt_hint, str) else None)
-            prompt_override = decision.prompt
+            if task_mode and tool_round_count < max_tool_rounds:
+                allow_tool_calls = True
+                decision = build_task_continuation_prompt(dumped_messages, request.tools, tool_round_count, max_tool_rounds)
+                prompt_override = decision.prompt
+            else:
+                allow_tool_calls = False
+                final_prompt_hint = pending_after_tools_plan.get("final_prompt") if isinstance(pending_after_tools_plan, dict) else None
+                if task_mode and tool_round_count >= max_tool_rounds:
+                    limit_hint = (
+                        f"Configured tool-round limit reached ({tool_round_count}/{max_tool_rounds}). "
+                        "Return a status update describing what is done, what remains, and any blocker. "
+                        "Do not claim success unless the tool evidence proves completion."
+                    )
+                    final_prompt_hint = f"{final_prompt_hint}\n\n{limit_hint}" if isinstance(final_prompt_hint, str) and final_prompt_hint.strip() else limit_hint
+                decision = build_final_after_tools_prompt(dumped_messages, request.tools, final_prompt_hint=final_prompt_hint if isinstance(final_prompt_hint, str) else None)
+                prompt_override = decision.prompt
         else:
             decision = build_pi_agent_prompt(dumped_messages, request.tools)
             prompt_override = decision.prompt
@@ -405,13 +447,15 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                     "You must emit at least one tool_call. Do not emit final_response on this turn.\n"
                 )
 
+    allow_local_fastpath = settings.agent_local_terminal_final_fastpath and not (task_mode and settings.agent_task_disable_local_bash_fastpath)
+
     if request.stream:
         if agent_mode:
             async def agent_event_stream():
                 req_id = f"chatcmpl-{uuid.uuid4().hex}"
                 created = int(time.time())
                 try:
-                    if post_tool_turn and settings.agent_local_terminal_final_fastpath:
+                    if post_tool_turn and allow_local_fastpath:
                         synthesized = maybe_synthesize_local_final(dumped_messages, pending_after_tools_plan)
                         if synthesized is not None:
                             if settings.agent_after_tools_plan_enabled:
@@ -504,7 +548,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
 
     try:
         if agent_mode:
-            if post_tool_turn and settings.agent_local_terminal_final_fastpath:
+            if post_tool_turn and allow_local_fastpath:
                 synthesized = maybe_synthesize_local_final(dumped_messages, pending_after_tools_plan)
                 if synthesized is not None:
                     if settings.agent_after_tools_plan_enabled:

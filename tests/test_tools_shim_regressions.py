@@ -1,4 +1,4 @@
-from proxy.app.tools_shim import build_final_after_tools_prompt, build_pi_agent_prompt, build_tool_repair_prompt, parse_assistant_action, should_retry_malformed_tool_call
+from proxy.app.tools_shim import build_final_after_tools_prompt, build_pi_agent_prompt, build_task_continuation_prompt, build_tool_repair_prompt, count_tool_rounds, is_implementation_task, parse_assistant_action, should_retry_malformed_tool_call
 
 
 def test_parse_final_response_prefers_last_non_placeholder():
@@ -327,6 +327,52 @@ def test_parse_multiple_xml_tool_calls_returns_tools_kind():
     assert action.kind == "tools"
     assert action.tool_calls is not None
     assert [call.name for call in action.tool_calls] == ["find", "grep"]
+
+
+def test_task_classifier_recognizes_supported_implementation_template():
+    assert is_implementation_task([
+        {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, run the required test commands, preserve valid existing work, and report files changed and tests run."}
+    ]) is True
+
+
+
+def test_task_classifier_does_not_classify_simple_prompts():
+    assert is_implementation_task([{"role": "user", "content": "hello"}]) is False
+    assert is_implementation_task([{"role": "user", "content": "run pwd"}]) is False
+
+
+
+def test_task_continuation_prompt_allows_tools_and_includes_round_count():
+    decision = build_task_continuation_prompt(
+        [
+            {"role": "user", "content": "Continue and complete the implementation task. Add tests and run the required test commands."},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"find . -maxdepth 2 -type f | sort"}'}}]},
+            {"role": "tool", "tool_call_id": "call_bash", "content": "./app/server4.py"},
+        ],
+        [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        tool_round_count=1,
+        max_tool_rounds=12,
+    )
+
+    prompt = decision.prompt
+    assert "More tool calls are allowed on this turn." in prompt
+    assert "Continue the implementation task" in prompt
+    assert "Only emit <final_response> when the requested deliverables are complete or you are blocked" in prompt
+    assert "Current tool round count: 1" in prompt
+    assert "Maximum tool round count: 12" in prompt
+    assert "For write, always use this exact pattern" not in prompt
+    assert "Malformed previous response to repair:" not in prompt
+
+
+
+def test_count_tool_rounds_counts_assistant_tool_turns():
+    assert count_tool_rounds([
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "type": "function", "function": {"name": "bash", "arguments": '{}'}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "ok"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "2", "type": "function", "function": {"name": "read", "arguments": '{}'}}]},
+    ]) == 2
+
 
 
 def test_build_pi_agent_prompt_compacts_large_history():

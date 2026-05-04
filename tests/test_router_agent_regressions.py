@@ -668,6 +668,44 @@ print(\"smoke ok\")
 
 
 
+def test_agent_retries_workspace_path_access_refusal_with_tool_recovery(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        return (
+            "Blocked: the workspace path /home/erfolg/src/pi-test is not accessible through the available execution tool, so I could not inspect or modify app/server4.py.",
+            "conv-test",
+        )
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("recovery", kwargs))
+        return '<tool_call>{"name":"read","arguments":{"path":"app/server4.py"}}</tool_call>'
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "Inspect app/server4.py before making changes."}],
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    assert any(kind == "recovery" for kind, _kwargs in calls)
+    recovery_prompt = [kwargs["prompt_override"] for kind, kwargs in calls if kind == "recovery"][0]
+    assert "Recovery rule:" in recovery_prompt
+    assert "you DO have access through the provided pi tools".lower() in recovery_prompt.lower()
+
+
+
 def test_write_required_prompt_is_not_reapplied_after_tool_result(monkeypatch):
     def fail_complete_chat_turn(**kwargs):
         raise AssertionError("post-write turn should not reuse write-required planning prompt")
@@ -1060,6 +1098,218 @@ def test_final_only_prompt_disallows_tool_calls(monkeypatch):
 
     assert response.status_code == 502
     assert "tool calls are not allowed after tool results" in response.json()["error"]["message"]
+
+
+
+def test_task_mode_bash_inspection_result_does_not_local_final(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"read","arguments":{"path":"app/server4.py"}}</tool_call>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"find . -maxdepth 3 -type f | sort"}'}}]},
+                {"role": "tool", "tool_call_id": "call_bash", "content": "./app/server4.py\n./tests/test_server4.py"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}}, {"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "Continue the implementation task" in captured["prompt_override"]
+    assert "Do not call tools on this turn." not in captured["prompt_override"]
+
+
+
+def test_task_mode_post_tool_continuation_allows_another_tool_call(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return ('<tool_call><name>read</name><arguments><path>app/server4.py</path></arguments></tool_call>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"find . -maxdepth 3 -type f | sort"}'}}]},
+                {"role": "tool", "tool_call_id": "call_bash", "content": "./app/server4.py"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}}, {"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "read"
+
+
+
+def test_task_mode_read_result_does_not_force_final_only(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":[{"oldText":"PORT = 8000","newText":"PORT = 8090"}]}}</tool_call>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_read", "type": "function", "function": {"name": "read", "arguments": '{"path":"app/server4.py"}'}}]},
+                {"role": "tool", "tool_call_id": "call_read", "content": "HOST = \"0.0.0.0\"\nPORT = 8000\n"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}, {"type": "function", "function": {"name": "edit", "description": "Edit file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Do not call tools on this turn." not in captured["prompt_override"]
+    assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "edit"
+
+
+
+def test_simple_explicit_bash_command_still_local_finals(monkeypatch):
+    def fail_complete_chat_turn(**kwargs):
+        raise AssertionError("browser/model should not be called for simple explicit bash fastpath")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fail_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "run this command: true"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"true"}'}}]},
+                {"role": "tool", "tool_call_id": "call_bash", "content": ""},
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Command completed successfully."
+
+
+
+def test_task_mode_failed_test_command_continues_through_model(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":[{"oldText":"broken","newText":"fixed"}]}}</tool_call>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"python -m unittest discover -s tests"}'}}]},
+                {"role": "tool", "tool_call_id": "call_bash", "content": "FAILED (failures=1)"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}}, {"type": "function", "function": {"name": "edit", "description": "Edit file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Continue the implementation task" in captured["prompt_override"]
+    assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "edit"
+
+
+
+def test_task_mode_failed_test_result_allows_followup_fix_tool_call(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"write","arguments":{"path":"tests/test_server4.py","content":"import unittest\\n"}}</tool_call>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_bash", "type": "function", "function": {"name": "bash", "arguments": '{"command":"python -m unittest discover -s tests"}'}}]},
+                {"role": "tool", "tool_call_id": "call_bash", "content": "FAILED (failures=1)\nAssertionError: PORT = 8090 not found"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "bash", "description": "Run bash", "parameters": {}}},
+                {"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "FAILED (failures=1)" in captured["prompt_override"]
+    assert "More tool calls are allowed on this turn." in captured["prompt_override"]
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "write"
+
+
+
+def test_task_mode_max_tool_rounds_stops_safely(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<final_response>Status: reached the tool-round limit before completion.</final_response>', "conv-task")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    messages = [{"role": "user", "content": "You are the implementation agent. Continue and complete this continuation task, not a greenfield build. Inspect the current repository before coding, add tests, and run the required test commands."}]
+    for index in range(12):
+        messages.append({"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{index}", "type": "function", "function": {"name": "read", "arguments": '{"path":"file.py"}'}}]})
+        messages.append({"role": "tool", "tool_call_id": f"call_{index}", "content": f"tool result {index}"})
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": messages,
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Configured tool-round limit reached" in captured["prompt_override"]
+    assert "Do not call tools on this turn." in captured["prompt_override"]
+    assert response.json()["choices"][0]["message"]["content"].startswith("Status:")
 
 
 

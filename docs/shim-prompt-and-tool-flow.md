@@ -272,6 +272,25 @@ Important pieces:
 
 The proxy binds message-history fingerprints to an internal conversation state. That lets follow-up requests reuse the same browser transport and remote conversation identifiers.
 
+## Post-tool task continuation mode
+
+The shim/router now distinguishes between simple post-tool turns and multi-step implementation jobs.
+
+For implementation-agent style prompts, after a trailing tool-result block the proxy may build a task-continuation prompt that:
+
+- keeps tool calls enabled
+- includes compact transcript and recent tool results
+- includes current/max tool-round counts
+- instructs the model to continue until deliverables are complete or blocked
+- avoids claiming test execution without tool-result evidence
+
+This prevents premature local finals such as `Command completed successfully.` after intermediate inspection or test commands that are only one step in a larger implementation job.
+
+Non-task post-tool turns still keep the existing behavior:
+
+- safe local finals for simple write/edit and explicit simple bash requests
+- final-only prompt for analysis/read-style requests when appropriate
+
 ## Why one task can currently take two turns
 
 The current design is still classic tool-agent flow:
