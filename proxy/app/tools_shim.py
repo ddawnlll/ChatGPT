@@ -314,6 +314,18 @@ def _extract_final_response(raw: str) -> str | None:
 
 
 
+def _detect_incomplete_tagged_response(raw: str) -> str | None:
+    lowered = (raw or "").lower()
+    if "<tool_call" in lowered and not _TOOL_TAG_RE.search(raw):
+        return "incomplete tool_call tag"
+    if "<final" in lowered and not _FINAL_TAG_RE.search(raw):
+        return "incomplete final_response tag"
+    if "<write_content" in lowered and not _WRITE_CONTENT_RE.search(raw):
+        return "incomplete write_content tag"
+    return None
+
+
+
 def parse_assistant_action(text: str) -> ParsedAssistantAction:
     raw = str(text or "").strip()
     tool_action = _extract_tool_call(raw)
@@ -323,6 +335,10 @@ def parse_assistant_action(text: str) -> ParsedAssistantAction:
     final_response = _extract_final_response(raw)
     if final_response is not None:
         return ParsedAssistantAction(kind="final", content=final_response)
+
+    incomplete_error = _detect_incomplete_tagged_response(raw)
+    if incomplete_error:
+        return ParsedAssistantAction(kind="invalid_tool", parse_error=incomplete_error)
 
     if raw.startswith("{") and raw.endswith("}"):
         parsed = _parse_tool_payload(raw, raw)
@@ -340,7 +356,21 @@ def should_retry_malformed_tool_call(action: ParsedAssistantAction) -> bool:
     if action.kind != "invalid_tool":
         return False
     error = (action.parse_error or "").lower()
-    return "write" in error or "python write content failed syntax validation" in error or "syntax validation" in error
+    if not error:
+        return True
+    return any(
+        token in error
+        for token in (
+            "write",
+            "syntax validation",
+            "expecting",
+            "delimiter",
+            "json",
+            "incomplete tool_call tag",
+            "incomplete write_content tag",
+            "tool payload missing",
+        )
+    )
 
 
 def build_tool_repair_prompt(bad_response: str, parse_error: str | None) -> str:

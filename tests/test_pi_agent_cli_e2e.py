@@ -132,6 +132,21 @@ def test_pi_cli_final_response_flow(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_rejects_incomplete_final_response_tag(monkeypatch, tmp_path):
+    def fake_complete_chat_turn(**kwargs):
+        return ("<final", "conv-pi-bad-final")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Say hello.")
+
+    assert result.returncode != 0
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert "incomplete final_response tag" in combined or "malformed_tool_call" in combined
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
 @pytest.mark.parametrize(
     ("tool_name", "tool_args", "allowed_tools", "setup", "assertion"),
     [

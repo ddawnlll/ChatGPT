@@ -1,4 +1,4 @@
-.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi test-proxy test-pi-contract test-browser-e2e test-all-fast test-js
+.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi test-proxy test-pi-contract test-browser-e2e test-all-fast test-all test-js
 
 # Export critical macOS environment variables for all commands
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
@@ -19,6 +19,7 @@ help:
 	@echo "  make enter-pi      - Start the pi coding agent using the ChatGPT Proxy"
 	@echo "  make clean-profile - Remove Firefox profile to start fresh"
 	@echo "  make diag          - Run Playwright diagnostics"
+	@echo "  make test-all      - Run all tests (browser E2E skips unless RUN_BROWSER_E2E=1)"
 
 login:
 	@bun tools/login.mjs
@@ -51,6 +52,9 @@ test-browser-e2e:
 
 test-all-fast: test-js
 	.venv/bin/pytest tests -q -m "not browser_e2e"
+
+test-all:
+	.venv/bin/python tools/test_all.py
 
 kill-browser:
 	@echo "Killing browser processes..."

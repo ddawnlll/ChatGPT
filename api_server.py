@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,14 @@ from uvicorn import run
 from transport_runtime import ChatTransport, build_transport
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    load_chats_from_db()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -529,12 +537,6 @@ def update_chat_title(chat: dict[str, Any], message: str) -> None:
     if chat["title"] == "New chat":
         trimmed = message.strip()
         chat["title"] = (trimmed[:60] + "…") if len(trimmed) > 60 else trimmed or "New chat"
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    init_db()
-    load_chats_from_db()
 
 
 @app.get("/health")

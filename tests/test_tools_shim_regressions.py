@@ -51,3 +51,10 @@ def test_parse_plain_final_fallback():
 
     assert action.kind == "final"
     assert action.content == "Ready."
+
+
+def test_parse_incomplete_final_response_tag_is_rejected():
+    action = parse_assistant_action("<final")
+
+    assert action.kind == "invalid_tool"
+    assert action.parse_error == "incomplete final_response tag"

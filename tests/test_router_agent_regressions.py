@@ -106,3 +106,68 @@ def test_agent_streaming_transport_exception_returns_structured_sse_error(monkey
     assert '"code":"transport_error"' in response.text
     assert "Playwright transport failed: boom" in response.text
     assert response.text.rstrip().endswith("data: [DONE]")
+
+
+def test_agent_incomplete_final_response_tag_returns_error(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return ("<final", "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["error"]["code"] == "malformed_tool_call"
+    assert "incomplete final_response tag" in payload["error"]["message"]
+
+
+def test_agent_retries_malformed_tool_call_and_returns_repaired_tool(monkeypatch):
+    calls = []
+
+    def fake_complete_chat_turn(**kwargs):
+        calls.append(("turn", kwargs))
+        return ('<tool_call>{"name":"edit","arguments":{"path":"app/test.py" "edits":[]}}</tool_call>', "conv-test")
+
+    def fake_complete_chat(**kwargs):
+        calls.append(("repair", kwargs))
+        return '<tool_call>{"name":"edit","arguments":{"path":"app/test.py","edits":[{"oldText":"print(1)","newText":"print(2)"}]}}</tool_call>'
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "add something more to file"}],
+            "tools": [
+                *PI_TOOLS,
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "description": "Edit file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "edit"
+    assert any(kind == "repair" for kind, _kwargs in calls)
