@@ -123,16 +123,23 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "If a task requires running commands or tests, call bash.\n"
         "If the task is complete and no tool is needed, return a final response.\n\n"
         "Return output in exactly one of these formats:\n"
-        "1) Standard tools:\n"
+        "1) Preferred tool call format:\n"
+        "<tool_call>\n"
+        "<name>tool_name</name>\n"
+        "<arguments>\n"
+        "<arg_name>raw argument value</arg_name>\n"
+        "</arguments>\n"
+        "</tool_call>\n\n"
+        "For bash, put the exact shell command inside <command>...</command>. Do not JSON-escape shell commands.\n"
+        "For write, put the exact file content inside <content>...</content>. Do not markdown-fence file content.\n"
+        "For simple arguments like path or timeout, use separate XML tags inside <arguments>.\n\n"
+        "2) Legacy compatibility format (allowed but less reliable for string-heavy arguments):\n"
         "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n\n"
-        "2) Safer write format for large file content or code with quotes/triple quotes:\n"
-        "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"path/to/file\"}}</tool_call>\n"
-        "<write_content>\nRAW FILE CONTENT HERE\n</write_content>\n\n"
         "3) Final response:\n"
         "Use final_response XML tags around the final answer, for example:\n"
         "&lt;final_response&gt;Ready.&lt;/final_response&gt;\n\n"
-        "For write, prefer the safer write_content format instead of JSON-escaping the whole file body.\n"
-        "Inside <write_content>, output raw file contents only. Do not add markdown fences like ``` or ```python.\n"
+        "Output the tags as literal text. Do not put them in markdown fences. Do not HTML-escape them.\n"
+        "Do not include prose outside the tags.\n"
         "Preserve indentation exactly as it should appear in the file.\n"
         "If writing Python, every class/function body must be correctly indented and syntactically valid Python.\n"
         "Do not rewrite code into markdown, bullet points, or prose.\n"
@@ -148,6 +155,9 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
 _TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FINAL_TAG_RE = re.compile(r"<final_response>\s*(.*?)\s*</final_response>", re.DOTALL | re.IGNORECASE)
 _WRITE_CONTENT_RE = re.compile(r"<write_content>(.*?)</write_content>", re.DOTALL | re.IGNORECASE)
+_XML_NAME_RE = re.compile(r"<name>\s*(.*?)\s*</name>", re.DOTALL | re.IGNORECASE)
+_XML_ARGUMENTS_RE = re.compile(r"<arguments>\s*(.*?)\s*</arguments>", re.DOTALL | re.IGNORECASE)
+_XML_ARG_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>\s*(.*?)\s*</\1>", re.DOTALL | re.IGNORECASE)
 _FINAL_RESPONSE_PLACEHOLDERS = {
     "your final answer here",
     "final answer here",
@@ -258,6 +268,54 @@ def _recover_write_payload(payload: str, full_text: str) -> ParsedAssistantActio
     )
 
 
+def _coerce_xml_arg_value(name: str, value: str) -> Any:
+    value = value.strip()
+    lower_name = name.strip().lower()
+    lower_value = value.lower()
+
+    if lower_name in {"timeout", "limit", "max_results"}:
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if lower_value == "true":
+        return True
+    if lower_value == "false":
+        return False
+    return value
+
+
+
+def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | None:
+    name_match = _XML_NAME_RE.search(payload)
+    if not name_match:
+        return None
+
+    name = name_match.group(1).strip()
+    if not name:
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="xml tool_call missing name")
+
+    arguments: dict[str, Any] = {}
+    arguments_match = _XML_ARGUMENTS_RE.search(payload)
+    if arguments_match:
+        arguments_body = arguments_match.group(1)
+        for match in _XML_ARG_RE.finditer(arguments_body):
+            key = match.group(1).strip()
+            value = match.group(2)
+            arguments[key] = _coerce_xml_arg_value(key, value)
+
+    if name == "write":
+        content_match = re.search(r"<content>\s*(.*?)\s*</content>", payload, re.DOTALL | re.IGNORECASE)
+        if content_match:
+            arguments["content"] = content_match.group(1)
+        invalid = _validate_write_arguments(arguments)
+        if invalid is not None:
+            return invalid
+
+    return ParsedAssistantAction(kind="tool", tool_name=name, tool_arguments=arguments)
+
+
+
 def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
     try:
         data = json.loads(payload)
@@ -292,6 +350,14 @@ def _extract_tool_call(raw: str) -> ParsedAssistantAction | None:
     first_invalid: ParsedAssistantAction | None = None
 
     for payload in reversed(matches):
+        xml_parsed = _parse_xml_tool_payload(payload, raw)
+        if xml_parsed is not None:
+            if xml_parsed.kind == "tool":
+                return xml_parsed
+            if first_invalid is None:
+                first_invalid = xml_parsed
+            continue
+
         parsed = _parse_tool_payload(payload, raw)
         if parsed.kind == "tool":
             return parsed

@@ -84,6 +84,52 @@ def test_agent_tool_call_response_shape(monkeypatch):
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "read"
 
 
+def test_agent_xml_bash_tool_call_response_shape(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            """
+<tool_call>
+<name>bash</name>
+<arguments>
+<timeout>10</timeout>
+<command>
+find app -print | sed 's|[^/]*/|  |g; s|  \\([^ ]\\)|├── \\1|'
+</command>
+</arguments>
+</tool_call>
+""",
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "list files in app in tree"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run bash command",
+                        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "bash"
+    assert "sed" in choice["message"]["tool_calls"][0]["function"]["arguments"]
+
+
 def test_agent_streaming_transport_exception_returns_structured_sse_error(monkeypatch):
     def fake_complete_chat_turn(**kwargs):
         raise RuntimeError("Playwright transport failed: boom")

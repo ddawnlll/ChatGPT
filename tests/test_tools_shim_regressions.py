@@ -58,3 +58,49 @@ def test_parse_incomplete_final_response_tag_is_rejected():
 
     assert action.kind == "invalid_tool"
     assert action.parse_error == "incomplete final_response tag"
+
+
+def test_parse_xml_bash_tool_call_with_raw_command():
+    text = r"""
+<tool_call>
+<name>bash</name>
+<arguments>
+<timeout>10</timeout>
+<command>
+find app -print | sed 's|[^/]*/|  |g; s|  \([^ ]\)|├── \1|'
+</command>
+</arguments>
+</tool_call>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "bash"
+    assert action.tool_arguments == {
+        "timeout": 10,
+        "command": "find app -print | sed 's|[^/]*/|  |g; s|  \\([^ ]\\)|├── \\1|'",
+    }
+
+
+def test_parse_xml_write_tool_call_with_raw_content():
+    text = """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/test.py</path>
+<content>
+print(\"hello world\")
+</content>
+</arguments>
+</tool_call>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "write"
+    assert action.tool_arguments == {
+        "path": "app/test.py",
+        "content": 'print("hello world")\n',
+    }
