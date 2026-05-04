@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from proxy.app import router as router_module
 from proxy.app.main import create_app
 from proxy.app.state import conversation_store
 
@@ -36,7 +37,7 @@ def test_agent_final_response_does_not_leak_prompt_placeholder(monkeypatch):
             "conv-test",
         )
 
-    monkeypatch.setattr("proxy.app.router.complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
 
     client = make_client()
     response = client.post(
@@ -62,7 +63,7 @@ def test_agent_tool_call_response_shape(monkeypatch):
             "conv-test",
         )
 
-    monkeypatch.setattr("proxy.app.router.complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
 
     client = make_client()
     response = client.post(
@@ -87,7 +88,7 @@ def test_agent_streaming_transport_exception_returns_structured_sse_error(monkey
     def fake_complete_chat_turn(**kwargs):
         raise RuntimeError("Playwright transport failed: boom")
 
-    monkeypatch.setattr("proxy.app.router.complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
 
     client = make_client()
     response = client.post(

@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from proxy.app import router as router_module
 from proxy.app.main import create_app
 from proxy.app.state import conversation_store
 
@@ -18,7 +19,7 @@ PI_TOOLS = [
 
 TOOL_CASES = [
     ("read", "inspect server.py", {"path": "server.py"}),
-    ("write", "create app/server.py", {"path": "app/server.py"}),
+    ("write", "create app/server.py", {"path": "app/server.py", "content": "print('ok')\n"}),
     ("edit", "patch app/server.py", {"path": "app/server.py"}),
     ("bash", "run tests", {"command": "pytest -q"}),
     ("grep", "search for TODO", {"pattern": "TODO", "path": "."}),
@@ -41,7 +42,7 @@ def test_pi_tool_request_returns_openai_tool_call(monkeypatch, tool_name, user_p
             "conv-test",
         )
 
-    monkeypatch.setattr("proxy.app.router.complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
 
     client = make_client()
     response = client.post(
@@ -68,7 +69,7 @@ def test_pi_tool_follow_up_tool_result_returns_final_response(monkeypatch):
             return ("<final_response>Done.</final_response>", "conv-test")
         return ('<tool_call>{"name":"read","arguments":{"path":"server.py"}}</tool_call>', "conv-test")
 
-    monkeypatch.setattr("proxy.app.router.complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
 
     client = make_client()
 

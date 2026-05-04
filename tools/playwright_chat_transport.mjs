@@ -1441,6 +1441,14 @@ async function handleRequest(request) {
 
   try {
     emit({ type: 'status', stage: 'request_received', new_conversation: Boolean(request?.new_conversation) })
+
+    if (Array.isArray(request?.test_events)) {
+      for (const event of request.test_events) {
+        emit(event)
+      }
+      return
+    }
+
     const runtime = await ensureRuntime(browserConfig, targetUrl)
     const { page } = runtime
 
@@ -1638,9 +1646,13 @@ export {
   extractAssistantText,
   getAssistantSnapshot,
   findLatestAssistantLocator,
+  extractAllFinalResponseTexts,
+  extractFinalResponseText,
   normalizeAssistantText,
   computeAppendDelta,
   isIgnorableAssistantText,
+  chooseBetterAssistantText,
+  waitForAssistantResultFallback,
   ensureAssistantStreamBinding,
   streamAssistantText,
   delay,
@@ -1653,5 +1665,9 @@ export default {
   streamAssistantText,
   getAssistantSnapshot,
   detectLoggedInUi,
+  normalizeAssistantText,
+  extractFinalResponseText,
+  extractAllFinalResponseTexts,
+  chooseBetterAssistantText,
   CONFIG,
 }

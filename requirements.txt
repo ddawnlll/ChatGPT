@@ -9,12 +9,14 @@ curl_cffi==0.15.0
 esprima==4.0.1
 fastapi==0.136.1
 h11==0.16.0
+httpx==0.28.1
 idna==3.13
 markdown-it-py==4.0.0
 mdurl==0.1.2
 pillow==12.2.0
 pycparser==3.0
 pydantic==2.13.3
+pytest==9.0.1
 pydantic_core==2.46.3
 Pygments==2.20.0
 rich==15.0.0

@@ -205,3 +205,55 @@ Once the proxy works, pi should be able to use it with a custom provider config 
 - `proxy/docs/implementation/reuse-from-perplexity-proxy.md`
 
 These docs define the plan, reuse inventory, and implementation boundaries.
+
+---
+
+## Testing
+
+The proxy now has tiered automated tests so CI does not depend on live ChatGPT for every run.
+
+### Fast CI-safe tests
+
+Run all fast tests:
+
+```bash
+make test-all-fast
+```
+
+Or run specific tiers:
+
+```bash
+make test-proxy
+make test-pi-contract
+make test-js
+```
+
+These cover:
+
+- parser regressions in `proxy/app/tools_shim.py`
+- router and SSE regressions for pi-agent-compatible requests
+- mocked pi tool contract tests for `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- fake Playwright daemon protocol tests
+- JS helper tests for `tools/playwright_chat_transport.mjs`
+
+### Optional real-browser smoke tests
+
+Real browser tests are marked with the `browser_e2e` pytest marker and are skipped by default.
+
+Run them manually with:
+
+```bash
+RUN_BROWSER_E2E=1 make test-browser-e2e
+```
+
+These tests validate the live Playwright/browser path end-to-end and are intended for nightly or manual verification, not normal fast CI.
+
+### CI workflows
+
+- `.github/workflows/ci.yml`
+  - installs Python and Bun dependencies
+  - runs `make test-js`
+  - runs `make test-all-fast`
+- `.github/workflows/browser-nightly.yml`
+  - manual/scheduled browser smoke workflow
+  - guarded by `CHATGPT_PROXY_BROWSER_E2E_ENABLED=1`

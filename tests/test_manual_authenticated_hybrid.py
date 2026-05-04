@@ -32,7 +32,7 @@ def test_refresh_hybrid_session_material_runs_extractor(monkeypatch, tmp_path, c
     class DummyCompleted:
         returncode = 0
 
-    monkeypatch.setattr(hybrid, "run", lambda command, check=False: commands.append(command) or DummyCompleted())
+    monkeypatch.setattr(hybrid, "run", lambda command, check=False, **kwargs: commands.append(command) or DummyCompleted())
     result = hybrid.refresh_hybrid_session_material(
         {
             "websocket_discovery_path": str(discovery_file),

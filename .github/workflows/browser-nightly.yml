@@ -1,0 +1,43 @@
+name: browser-nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  browser-e2e:
+    if: ${{ secrets.CHATGPT_PROXY_BROWSER_E2E_ENABLED == '1' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Bun dependencies
+        run: bun install
+
+      - name: Run browser smoke tests
+        env:
+          RUN_BROWSER_E2E: '1'
+          CHATGPT_PROXY_BROWSER_E2E_ENABLED: ${{ secrets.CHATGPT_PROXY_BROWSER_E2E_ENABLED }}
+          CHATGPT_PROXY_BROWSER_EXECUTABLE_PATH: ${{ secrets.CHATGPT_PROXY_BROWSER_EXECUTABLE_PATH }}
+          CHATGPT_PROXY_BROWSER_USER_DATA_DIR: ${{ secrets.CHATGPT_PROXY_BROWSER_USER_DATA_DIR }}
+          CHATGPT_PROXY_BROWSER_PROFILE_DIRECTORY: ${{ secrets.CHATGPT_PROXY_BROWSER_PROFILE_DIRECTORY }}
+          CHATGPT_PROXY_BROWSER_HEADLESS: 'true'
+        run: |
+          . .venv/bin/activate
+          make test-browser-e2e
