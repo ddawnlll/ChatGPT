@@ -1,4 +1,4 @@
-.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi
+.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi test-proxy test-pi-contract test-browser-e2e test-all-fast
 
 # Export critical macOS environment variables for all commands
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
@@ -25,6 +25,27 @@ login:
 
 diag:
 	@bun tools/diag.js
+
+test-proxy:
+	.venv/bin/pytest \
+		tests/test_tools_shim_regressions.py \
+		tests/test_router_agent_regressions.py \
+		tests/test_streaming_contract.py \
+		-q
+
+test-pi-contract:
+	.venv/bin/pytest \
+		tests/test_pi_tool_contract_e2e.py \
+		tests/test_fake_playwright_daemon.py \
+		-q
+
+test-browser-e2e:
+	RUN_BROWSER_E2E=1 .venv/bin/pytest \
+		tests/test_real_browser_smoke.py \
+		-q
+
+test-all-fast:
+	.venv/bin/pytest tests -q -m "not browser_e2e"
 
 kill-browser:
 	@echo "Killing browser processes..."
