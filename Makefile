@@ -34,6 +34,7 @@ test-proxy:
 	.venv/bin/pytest \
 		tests/test_tools_shim_regressions.py \
 		tests/test_router_agent_regressions.py \
+		tests/test_client_state.py \
 		tests/test_streaming_contract.py \
 		-q
 

@@ -217,11 +217,14 @@ class RuntimeClient:
                 if force_new_conversation:
                     transport_data["conversation_id"] = None
                     transport_data["parent_message_id"] = None
+                    transport_data["conversation_url"] = None
                 else:
                     if state.data.get("remote_conversation_id"):
                         transport_data["conversation_id"] = state.data.get("remote_conversation_id")
                     if state.data.get("remote_parent_message_id"):
                         transport_data["parent_message_id"] = state.data.get("remote_parent_message_id")
+                    if state.data.get("remote_conversation_url"):
+                        transport_data["conversation_url"] = state.data.get("remote_conversation_url")
             return transport, force_new_conversation, state, resolved_conversation_id
 
         transport = build_transport(build_session_material(self.model_id))
@@ -232,20 +235,30 @@ class RuntimeClient:
             if force_new_conversation:
                 transport_data["conversation_id"] = None
                 transport_data["parent_message_id"] = None
+                transport_data["conversation_url"] = None
             else:
                 if state.data.get("remote_conversation_id"):
                     transport_data["conversation_id"] = state.data.get("remote_conversation_id")
                 if state.data.get("remote_parent_message_id"):
                     transport_data["parent_message_id"] = state.data.get("remote_parent_message_id")
+                if state.data.get("remote_conversation_url"):
+                    transport_data["conversation_url"] = state.data.get("remote_conversation_url")
         state.transport = transport
         conversation_store.put(state)
         return transport, force_new_conversation or state.data.get("remote_conversation_id") is None, state, effective_conversation_id
 
-    def _update_state_after_response(self, state: ConversationState | None, messages: list[dict[str, Any]], assistant_text: str, remote_conversation_id: str | None, remote_parent_message_id: str | None) -> None:
+    def _update_state_after_response(self, state: ConversationState | None, messages: list[dict[str, Any]], assistant_text: str, remote_conversation_id: str | None, remote_parent_message_id: str | None, transport_details: dict[str, Any] | None = None) -> None:
         if state is None:
             return
         state.data["remote_conversation_id"] = remote_conversation_id
         state.data["remote_parent_message_id"] = remote_parent_message_id
+        page_url = None
+        if isinstance(transport_details, dict):
+            candidate = transport_details.get("page_url")
+            if isinstance(candidate, str) and candidate.strip():
+                page_url = candidate.strip()
+        if page_url:
+            state.data["remote_conversation_url"] = page_url
         history_alias = fingerprint_messages(messages)
         transcript_aliases = [fingerprint_messages([*messages, {"role": "assistant", "content": assistant_text}])]
 
@@ -305,7 +318,7 @@ class RuntimeClient:
             raise ValueError("No user message content was found")
         transport, new_conversation, state, effective_conversation_id = self._get_transport(conversation_id, messages, force_new_conversation=force_new_conversation)
         result = transport.send_message(prompt, None, new_conversation=new_conversation)
-        self._update_state_after_response(state, messages, result.text, result.remote_conversation_id, result.remote_parent_message_id)
+        self._update_state_after_response(state, messages, result.text, result.remote_conversation_id, result.remote_parent_message_id, result.transport_details)
         return result.text, effective_conversation_id
 
     def complete_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> str:
@@ -330,7 +343,7 @@ class RuntimeClient:
             chunks.append(text)
             yield text
         result = transport.get_last_result()
-        self._update_state_after_response(state, messages, result.text or "".join(chunks), result.remote_conversation_id, result.remote_parent_message_id)
+        self._update_state_after_response(state, messages, result.text or "".join(chunks), result.remote_conversation_id, result.remote_parent_message_id, result.transport_details)
 
 
 def complete_chat(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> str:

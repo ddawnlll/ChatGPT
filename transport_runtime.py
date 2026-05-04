@@ -102,7 +102,7 @@ class PlaywrightTransport:
 
     def __init__(self, session_material: dict[str, Any]):
         self.session_material = dict(session_material)
-        self.data: dict[str, Any] = {"conversation_id": None, "parent_message_id": None}
+        self.data: dict[str, Any] = {"conversation_id": None, "parent_message_id": None, "conversation_url": None}
         self.response: str = ""
         self._last_result = TransportResult("", None, None, {"transport_mode": "playwright"}, {})
         self.request_diagnostics: dict[str, Any] = {
@@ -121,6 +121,7 @@ class PlaywrightTransport:
             "image": image,
             "new_conversation": new_conversation,
             "remote_conversation_id": self.data.get("conversation_id"),
+            "remote_conversation_url": self.data.get("conversation_url"),
             "url": self.session_material.get("browser_chat_url") or "https://chatgpt.com/",
             "capture_timeout_ms": self.session_material.get("browser_capture_timeout_ms", 120000),
             "transport": {
@@ -146,11 +147,15 @@ class PlaywrightTransport:
         self.data["parent_message_id"] = payload.get("remote_parent_message_id")
         transport_details = dict(payload.get("transport_details") or {})
         verification_hints = dict(payload.get("verification_hints") or {})
+        page_url = transport_details.get("page_url")
+        if isinstance(page_url, str) and page_url.strip():
+            self.data["conversation_url"] = page_url.strip()
         self.request_diagnostics = {
             **self.request_diagnostics,
             **transport_details,
             "remote_conversation_id": self.data.get("conversation_id"),
             "remote_parent_message_id": self.data.get("parent_message_id"),
+            "remote_conversation_url": self.data.get("conversation_url"),
         }
         self._last_result = TransportResult(
             text=self.response,

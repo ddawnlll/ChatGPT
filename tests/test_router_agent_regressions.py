@@ -979,7 +979,7 @@ def test_post_read_tool_result_uses_compact_final_only_prompt(monkeypatch):
 
     assert response.status_code == 200
     prompt_override = captured["prompt_override"]
-    assert captured["force_new_conversation"] is True
+    assert captured["force_new_conversation"] is False
     assert "Do not call tools on this turn." in prompt_override
     assert "Return exactly one <final_response>...</final_response> block" in prompt_override
     assert "Available tools:" not in prompt_override
@@ -1091,7 +1091,7 @@ def test_old_write_tool_result_in_history_does_not_trigger_local_final_for_new_u
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Hello!"
-    assert captured["force_new_conversation"] is True
+    assert captured["force_new_conversation"] is False
     assert "Do not call tools on this turn." not in captured["prompt_override"]
 
 
@@ -1124,12 +1124,12 @@ def test_new_edit_request_after_previous_write_success_reenters_planning_mode(mo
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
-    assert captured["force_new_conversation"] is True
+    assert captured["force_new_conversation"] is False
     assert "Do not call tools on this turn." not in captured["prompt_override"]
 
 
 
-def test_agent_planning_calls_use_force_new_conversation(monkeypatch):
+def test_agent_planning_calls_default_to_restoring_remote_thread(monkeypatch):
     captured = {}
 
     def fake_complete_chat_turn(**kwargs):
@@ -1150,7 +1150,44 @@ def test_agent_planning_calls_use_force_new_conversation(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert captured["force_new_conversation"] is True
+    assert captured["force_new_conversation"] is False
+
+
+
+def test_router_uses_request_user_as_stable_conversation_identity(monkeypatch):
+    seen = []
+
+    def fake_complete_chat_turn(**kwargs):
+        seen.append(kwargs["conversation_id"])
+        return ('<tool_call>{"name":"read","arguments":{"path":"server.py"}}</tool_call>', kwargs["conversation_id"])
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "pi-session-a",
+            "messages": [{"role": "user", "content": "read server.py"}],
+            "tools": PI_TOOLS,
+        },
+    )
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "pi-session-b",
+            "messages": [{"role": "user", "content": "read server.py"}],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert seen == ["pi-session-a", "pi-session-b"]
 
 
 

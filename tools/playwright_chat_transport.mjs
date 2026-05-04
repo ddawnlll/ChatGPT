@@ -320,6 +320,17 @@ async function clickNewChatButton(page, timeoutMs = 8_000) {
   return null
 }
 
+function buildConversationUrl(targetUrl, conversationId) {
+  const base = new URL(targetUrl || 'https://chatgpt.com/')
+  return `${base.origin}/c/${conversationId}`
+}
+
+function getComposerContextMode({ newConversation, remoteConversationId, remoteConversationUrl }) {
+  if (newConversation) return 'fresh'
+  if (remoteConversationUrl || remoteConversationId) return 'existing'
+  return 'current_or_fallback'
+}
+
 async function openFreshThread(page, targetUrl) {
   const currentUrl = page.url()
   const normalizedTarget = targetUrl.replace(/\/$/, '')
@@ -358,13 +369,54 @@ async function openFreshThread(page, targetUrl) {
   return true
 }
 
-async function ensureComposerContext(page, targetUrl, newConversation) {
-  if (newConversation) {
+async function openExistingThread(page, targetUrl, remoteConversationId, remoteConversationUrl) {
+  const url = remoteConversationUrl || buildConversationUrl(targetUrl, remoteConversationId)
+  emit({
+    type: 'status',
+    stage: 'opening_existing_thread',
+    url,
+    remote_conversation_id: remoteConversationId || null,
+  })
+
+  await page.goto(url, { waitUntil: 'domcontentloaded' })
+  await waitForNoChallenge(page)
+  await waitForChatShell(page)
+  await waitForComposerInteractive(page)
+
+  emit({
+    type: 'status',
+    stage: 'existing_thread_ready',
+    current_url: page.url(),
+  })
+  return true
+}
+
+async function ensureComposerContext(page, targetUrl, newConversation, remoteConversationId = null, remoteConversationUrl = null) {
+  const mode = getComposerContextMode({ newConversation, remoteConversationId, remoteConversationUrl })
+  emit({ type: 'status', stage: 'composer_context_mode', mode, new_conversation: Boolean(newConversation), has_remote_conversation_id: Boolean(remoteConversationId), has_remote_conversation_url: Boolean(remoteConversationUrl) })
+
+  if (mode === 'fresh') {
     await openFreshThread(page, targetUrl)
+  } else if (mode === 'existing') {
+    try {
+      await openExistingThread(page, targetUrl, remoteConversationId, remoteConversationUrl)
+    } catch (err) {
+      emitError('existing_thread_open_failed', err, {
+        remote_conversation_id: remoteConversationId || null,
+        remote_conversation_url: remoteConversationUrl || null,
+      })
+      emit({
+        type: 'status',
+        stage: 'existing_thread_open_failed_fallback_to_fresh',
+        remote_conversation_id: remoteConversationId || null,
+        remote_conversation_url: remoteConversationUrl || null,
+      })
+      await openFreshThread(page, targetUrl)
+    }
   }
 
   const initialComposer = await findComposer(page).catch(() => null)
-  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), new_conversation: Boolean(newConversation) })
+  emit({ type: 'status', stage: 'composer_probe', found: Boolean(initialComposer), new_conversation: Boolean(newConversation), mode })
   if (initialComposer) return waitForComposerInteractive(page, 5_000)
 
   if (!newConversation) {
@@ -372,7 +424,7 @@ async function ensureComposerContext(page, targetUrl, newConversation) {
     if (readyComposer) return readyComposer
   }
 
-  emit({ type: 'status', stage: 'navigating_home_fallback', target_url: targetUrl })
+  emit({ type: 'status', stage: 'navigating_home_fallback', target_url: targetUrl, mode })
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch((err) => emitError('navigation_fallback_failed', err, { targetUrl }))
   await waitForNoChallenge(page)
   await waitForChatShell(page)
@@ -663,8 +715,8 @@ async function triggerPromptSend(page, composer) {
 // ---------------------------------------------------------------------------
 // sendPrompt — orchestrates compose + inject + send + confirmation
 // ---------------------------------------------------------------------------
-async function sendPrompt(page, message, targetUrl, newConversation) {
-  const composer = await ensureComposerContext(page, targetUrl, newConversation)
+async function sendPrompt(page, message, targetUrl, newConversation, remoteConversationId = null, remoteConversationUrl = null, preparedComposer = null) {
+  const composer = preparedComposer || await ensureComposerContext(page, targetUrl, newConversation, remoteConversationId, remoteConversationUrl)
   emit({ type: 'status', stage: 'composer_ready', selector: composer.selector, index: composer.index })
 
   let promptSent = false
@@ -1620,9 +1672,25 @@ async function handleRequest(request) {
       logged_in_likely: ui.loggedInLikely,
     })
 
+    await ensureComposerContext(
+      page,
+      targetUrl,
+      Boolean(request?.new_conversation),
+      request?.remote_conversation_id || null,
+      request?.remote_conversation_url || null,
+    )
     const baselineAssistant = await getAssistantSnapshot(page)
     const baselinePageText = await page.locator('body').innerText().catch(() => '')
-    await sendPrompt(page, String(request?.message || ''), targetUrl, Boolean(request?.new_conversation))
+    const preparedComposer = await waitForComposerInteractive(page, 5_000)
+    await sendPrompt(
+      page,
+      String(request?.message || ''),
+      targetUrl,
+      Boolean(request?.new_conversation),
+      request?.remote_conversation_id || null,
+      request?.remote_conversation_url || null,
+      preparedComposer,
+    )
     const streamed = await streamAssistantText(page, captureTimeoutMs, baselineAssistant)
 
     let finalText = String(streamed?.text || '').trim()
@@ -1800,7 +1868,10 @@ export {
   waitForNoChallenge,
   waitForChatShell,
   detectLoggedInUi,
+  buildConversationUrl,
+  getComposerContextMode,
   openFreshThread,
+  openExistingThread,
   ensureComposerContext,
   injectText,
   activateComposer,
@@ -1833,6 +1904,8 @@ export {
 
 export default {
   sendPrompt,
+  buildConversationUrl,
+  getComposerContextMode,
   streamAssistantText,
   getAssistantSnapshot,
   detectLoggedInUi,

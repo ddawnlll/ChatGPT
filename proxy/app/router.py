@@ -360,6 +360,7 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
         raise openai_error(f"Unknown model: {request.model}", 400, "model_not_found")
 
     conversation_id = request.user.strip() if isinstance(request.user, str) and request.user.strip() else None
+    logger.debug("chat_completions conversation identity: has_request_user=%s conversation_id=%s", bool(conversation_id), conversation_id or "<history-alias>")
     dumped_messages = [message.model_dump() for message in request.messages]
     agent_mode = is_pi_agent_request(request.tools)
     prompt_override = None

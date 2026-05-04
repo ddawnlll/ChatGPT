@@ -4,6 +4,8 @@ import {
   extractAllFinalResponseTexts,
   extractAllToolCallTexts,
   extractFinalResponseText,
+  buildConversationUrl,
+  getComposerContextMode,
   extractToolCallText,
   extractWriteContentText,
   isWriteToolCall,
@@ -145,5 +147,20 @@ describe('playwright transport helper extraction', () => {
   test('isIgnorableAssistantText treats thinking as ignorable and final answer as non-ignorable', () => {
     expect(isIgnorableAssistantText('Thinking')).toBe(true)
     expect(isIgnorableAssistantText('<final_response>Ready.</final_response>')).toBe(false)
+  })
+
+  test('buildConversationUrl uses site origin for plain chat url', () => {
+    expect(buildConversationUrl('https://chatgpt.com/', 'abc')).toBe('https://chatgpt.com/c/abc')
+  })
+
+  test('buildConversationUrl strips gpt route and uses site origin', () => {
+    expect(buildConversationUrl('https://chatgpt.com/g/g-xyz', 'abc')).toBe('https://chatgpt.com/c/abc')
+  })
+
+  test('getComposerContextMode selects existing when remote conversation is present', () => {
+    expect(getComposerContextMode({ newConversation: false, remoteConversationId: 'abc', remoteConversationUrl: null })).toBe('existing')
+    expect(getComposerContextMode({ newConversation: false, remoteConversationId: null, remoteConversationUrl: 'https://chatgpt.com/c/abc' })).toBe('existing')
+    expect(getComposerContextMode({ newConversation: true, remoteConversationId: 'abc', remoteConversationUrl: null })).toBe('fresh')
+    expect(getComposerContextMode({ newConversation: false, remoteConversationId: null, remoteConversationUrl: null })).toBe('current_or_fallback')
   })
 })

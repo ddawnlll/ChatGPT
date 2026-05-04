@@ -515,6 +515,8 @@ def _validate_edit_arguments(arguments: dict[str, Any]) -> ParsedAssistantAction
         return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call missing path")
 
     edits = arguments.get("edits")
+    if edits is None:
+        return None
     if isinstance(edits, str):
         parsed_edits = _parse_xml_edits(edits)
         if parsed_edits is not None:

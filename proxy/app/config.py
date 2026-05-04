@@ -125,7 +125,7 @@ class Settings:
     browser_auto_start_debug_browser: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_BROWSER_AUTO_START_DEBUG_BROWSER", False))
     browser_debugging_port: int = field(default_factory=lambda: int(os.environ.get("CHATGPT_PROXY_BROWSER_DEBUGGING_PORT", "9222")))
     state_dir: str = field(default_factory=lambda: os.environ.get("CHATGPT_PROXY_STATE_DIR", str(Path("data/proxy").resolve())))
-    agent_force_new_conversation: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_FORCE_NEW_CONVERSATION", True))
+    agent_force_new_conversation: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_FORCE_NEW_CONVERSATION", False))
     agent_post_tool_final_only: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_POST_TOOL_FINAL_ONLY", True))
     agent_local_terminal_final_fastpath: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_LOCAL_TERMINAL_FINAL_FASTPATH", True))
     agent_after_tools_plan_enabled: bool = field(default_factory=lambda: _env_bool("CHATGPT_PROXY_AGENT_AFTER_TOOLS_PLAN_ENABLED", True))

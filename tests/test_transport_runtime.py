@@ -54,6 +54,27 @@ def test_build_transport_returns_playwright_transport_for_playwright_mode():
     assert transport.get_session_status()["transport_mode"] == "playwright"
 
 
+def test_playwright_transport_request_payload_includes_remote_thread_identity():
+    transport = PlaywrightTransport(
+        {
+            "transport_mode": "playwright",
+            "browser_user_data_dir": "/tmp/profile",
+            "browser_profile_directory": "Default",
+            "browser_executable_path": "/usr/bin/chrome",
+            "browser_chat_url": "https://chatgpt.com/",
+        }
+    )
+    transport.data["conversation_id"] = "conv-old"
+    transport.data["conversation_url"] = "https://chatgpt.com/c/conv-old"
+
+    payload = transport._request_payload("hello", new_conversation=False)
+
+    assert payload["remote_conversation_id"] == "conv-old"
+    assert payload["remote_conversation_url"] == "https://chatgpt.com/c/conv-old"
+    assert payload["new_conversation"] is False
+
+
+
 def test_playwright_transport_send_message_consumes_jsonl_events(monkeypatch):
     transport = PlaywrightTransport(
         {
@@ -76,7 +97,7 @@ def test_playwright_transport_send_message_consumes_jsonl_events(monkeypatch):
                     "text": "playwright answer",
                     "remote_conversation_id": "conv-pw",
                     "remote_parent_message_id": "msg-pw",
-                    "transport_details": {"last_stage": "done", "ui_logged_in_likely": True},
+                    "transport_details": {"last_stage": "done", "ui_logged_in_likely": True, "page_url": "https://chatgpt.com/c/conv-pw"},
                     "verification_hints": {"remote_conversation_exists": True},
                 },
             ]
@@ -91,6 +112,8 @@ def test_playwright_transport_send_message_consumes_jsonl_events(monkeypatch):
     assert result.transport_details["effective_transport_mode"] == "playwright"
     assert transport.response == "playwright answer"
     assert transport.data["conversation_id"] == "conv-pw"
+    assert transport.data["conversation_url"] == "https://chatgpt.com/c/conv-pw"
+    assert result.transport_details["remote_conversation_url"] == "https://chatgpt.com/c/conv-pw"
 
 
 def test_playwright_transport_stream_message_yields_chunks_and_stores_result(monkeypatch):
