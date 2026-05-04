@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
 MAX_TOOL_RESULT_CHARS = 3000
 MAX_TRANSCRIPT_MESSAGES = 8
 MAX_TOTAL_TRANSCRIPT_CHARS = 12000
@@ -35,12 +36,20 @@ class ParsedToolCall:
 
 
 @dataclass(slots=True)
+class ParsedAfterTools:
+    on_success: str | None = None
+    on_failure: str | None = None
+    final_prompt: str | None = None
+
+
+@dataclass(slots=True)
 class ParsedAssistantAction:
     kind: str
     content: str | None = None
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
     tool_calls: list[ParsedToolCall] | None = None
+    after_tools: ParsedAfterTools | None = None
     parse_error: str | None = None
 
 
@@ -127,6 +136,77 @@ def _is_internal_repair_prompt(role: str, content: str) -> bool:
 
 
 
+def _safe_tool_arg_int(arguments: dict[str, Any], key: str) -> int | None:
+    value = arguments.get(key)
+    return value if isinstance(value, int) else None
+
+
+
+def _safe_tool_arg_str(arguments: dict[str, Any], key: str) -> str | None:
+    value = arguments.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+
+def _summarize_single_tool_call(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if not isinstance(function, dict):
+        return "- unknown_tool_call"
+
+    name = str(function.get("name") or tool_call.get("name") or "unknown").strip() or "unknown"
+    raw_arguments = function.get("arguments")
+    arguments: dict[str, Any] = {}
+    if isinstance(raw_arguments, str):
+        try:
+            parsed = json.loads(raw_arguments)
+            if isinstance(parsed, dict):
+                arguments = parsed
+        except Exception:
+            arguments = {}
+    elif isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+
+    if name == "write":
+        path = _safe_tool_arg_str(arguments, "path") or _safe_tool_arg_str(arguments, "filename") or "?"
+        content = arguments.get("content")
+        content_len = len(content) if isinstance(content, str) else 0
+        return f"- write {path} content=[omitted {content_len} chars]"
+    if name == "edit":
+        path = _safe_tool_arg_str(arguments, "path") or "?"
+        edits = arguments.get("edits")
+        edit_count = len(edits) if isinstance(edits, list) else "?"
+        return f"- edit {path} edits={edit_count}"
+    if name == "read":
+        return f"- read {_safe_tool_arg_str(arguments, 'path') or '?'}"
+    if name == "ls":
+        return f"- ls {_safe_tool_arg_str(arguments, 'path') or '?'}"
+    if name == "find":
+        path = _safe_tool_arg_str(arguments, "path") or "?"
+        pattern = _safe_tool_arg_str(arguments, "pattern")
+        return f'- find {path}{f" pattern=\"{pattern}\"" if pattern else ""}'
+    if name == "grep":
+        path = _safe_tool_arg_str(arguments, "path") or "?"
+        pattern = _safe_tool_arg_str(arguments, "pattern")
+        return f'- grep {path}{f" pattern=\"{pattern}\"" if pattern else ""}'
+    if name == "bash":
+        command = _safe_tool_arg_str(arguments, "command")
+        timeout = _safe_tool_arg_int(arguments, "timeout")
+        command_preview = _truncate_middle(command, 120) if command else "?"
+        return f'- bash "{command_preview}"{f" timeout={timeout}" if timeout is not None else ""}'
+    return f"- {name}"
+
+
+
+def _summarize_assistant_tool_calls(tool_calls: Any) -> str:
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return "assistant_tool_calls: - none"
+    summaries = [_summarize_single_tool_call(tool_call) for tool_call in tool_calls if isinstance(tool_call, dict)]
+    if not summaries:
+        summaries = ["- unknown_tool_call"]
+    return "assistant_tool_calls:\n" + "\n".join(summaries)
+
+
+
 def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
     relevant = messages[-MAX_TRANSCRIPT_MESSAGES:]
     parts: list[str] = []
@@ -134,12 +214,13 @@ def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).strip() or "unknown"
+        if role in {"system", "developer"}:
+            continue
         content = _stringify_content(message.get("content"))
         if _is_internal_repair_prompt(role, content):
             continue
         if role == "assistant" and message.get("tool_calls"):
-            rendered = json.dumps(message.get("tool_calls"), ensure_ascii=False)
-            parts.append("assistant_tool_calls: " + _truncate_middle(rendered, 2000))
+            parts.append(_summarize_assistant_tool_calls(message.get("tool_calls")))
             continue
         if role == "tool" and content.strip():
             parts.append("tool_result: " + _truncate_middle(content.strip(), MAX_TOOL_RESULT_CHARS))
@@ -154,7 +235,7 @@ def _compact_transcript_parts(messages: list[dict[str, Any]]) -> list[str]:
 
 
 
-def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ShimDecision:
+def _build_planning_prompt(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> str:
     system_parts: list[str] = []
     for message in messages:
         if not isinstance(message, dict):
@@ -209,6 +290,18 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "&lt;/arguments&gt;\n"
         "&lt;/tool_call&gt;\n\n"
         "For bash, put the exact shell command inside <command>...</command>. Do not JSON-escape shell commands.\n"
+        "For edit, use an edits array. Do not put XML inside a JSON string. Preferred XML pattern:\n"
+        "&lt;tool_call&gt;\n"
+        "&lt;name&gt;edit&lt;/name&gt;\n"
+        "&lt;arguments&gt;\n"
+        "&lt;path&gt;app/main.py&lt;/path&gt;\n"
+        "&lt;edits&gt;\n"
+        "&lt;edit&gt;&lt;oldText&gt;OLD TEXT&lt;/oldText&gt;&lt;newText&gt;NEW TEXT&lt;/newText&gt;&lt;/edit&gt;\n"
+        "&lt;/edits&gt;\n"
+        "&lt;/arguments&gt;\n"
+        "&lt;/tool_call&gt;\n"
+        "Legacy JSON example for edit:\n"
+        "&lt;tool_call&gt;{\"name\":\"edit\",\"arguments\":{\"path\":\"app/main.py\",\"edits\":[{\"oldText\":\"OLD TEXT\",\"newText\":\"NEW TEXT\"}]}}&lt;/tool_call&gt;\n"
         "For write, always use this exact pattern:\n"
         "&lt;tool_call&gt;\n"
         "&lt;name&gt;write&lt;/name&gt;\n"
@@ -247,20 +340,69 @@ def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, 
         "- Before emitting, mentally verify ast.parse would pass.\n"
         "Do not rewrite code into markdown, bullet points, or prose.\n"
         "Do not emit a final_response immediately after a tool_call for the same task. After tool execution, wait for the next turn.\n"
+        "You may emit <after_tools> after tool calls as hidden post-tool metadata.\n"
+        "Use <after_tools><on_success>...</on_success></after_tools> only when the final reply can be safely determined from whether the tool succeeds.\n"
+        "Use <after_tools><on_failure>...</on_failure></after_tools> for concise failure text, optionally with {error}.\n"
+        "For read/grep/find/ls/analysis tasks, prefer <after_tools><final_prompt>...</final_prompt></after_tools> instead of claiming unseen facts.\n"
         "Do not include explanations outside those tags.\n\n"
         f"Available tools:\n{tool_block}\n\n"
         f"System instructions:\n{system_block or '(none)'}\n\n"
         f"Conversation transcript:\n{transcript or '(empty)'}"
     )
-    return ShimDecision(prompt=prompt, tools=tools or [], agent_mode=True)
+    return prompt
+
+
+
+def _build_final_only_prompt(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, final_prompt_hint: str | None = None) -> str:
+    transcript_parts = _compact_transcript_parts(messages)
+    transcript = "\n\n".join(transcript_parts).strip()
+    latest_user_text = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip() != "user":
+            continue
+        latest_user_text = _stringify_content(message.get("content")).strip()
+        if latest_user_text:
+            break
+
+    hint_block = f"\n\nAdditional finalization instruction:\n{final_prompt_hint.strip()}" if isinstance(final_prompt_hint, str) and final_prompt_hint.strip() else ""
+    return (
+        "You are responding after pi tool execution.\n"
+        "Do not call tools on this turn.\n"
+        "Do not emit <tool_call>.\n"
+        "Return exactly one <final_response>...</final_response> block and nothing else.\n"
+        "Use the recent tool-call summaries and tool results below to answer the user's request.\n"
+        "Do not include tool schemas, write protocol instructions, or repair text.\n\n"
+        f"Latest user request:\n{latest_user_text or '(empty)'}\n\n"
+        f"Recent compact context:\n{transcript or '(empty)'}"
+        f"{hint_block}"
+    )
+
+
+
+def build_pi_agent_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ShimDecision:
+    return ShimDecision(prompt=_build_planning_prompt(messages=messages, tools=tools), tools=tools or [], agent_mode=True)
+
+
+
+def build_final_after_tools_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, final_prompt_hint: str | None = None) -> ShimDecision:
+    return ShimDecision(prompt=_build_final_only_prompt(messages=messages, tools=tools, final_prompt_hint=final_prompt_hint), tools=tools or [], agent_mode=True)
 
 
 _TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _FINAL_TAG_RE = re.compile(r"<final_response>\s*(.*?)\s*</final_response>", re.DOTALL | re.IGNORECASE)
 _WRITE_CONTENT_RE = re.compile(r"<write_content>(.*?)</write_content>", re.DOTALL | re.IGNORECASE)
+_AFTER_TOOLS_RE = re.compile(r"<after_tools>\s*(.*?)\s*</after_tools>", re.DOTALL | re.IGNORECASE)
+_AFTER_TOOLS_ON_SUCCESS_RE = re.compile(r"<on_success>\s*(.*?)\s*</on_success>", re.DOTALL | re.IGNORECASE)
+_AFTER_TOOLS_ON_FAILURE_RE = re.compile(r"<on_failure>\s*(.*?)\s*</on_failure>", re.DOTALL | re.IGNORECASE)
+_AFTER_TOOLS_FINAL_PROMPT_RE = re.compile(r"<final_prompt>\s*(.*?)\s*</final_prompt>", re.DOTALL | re.IGNORECASE)
 _XML_NAME_RE = re.compile(r"<name>\s*(.*?)\s*</name>", re.DOTALL | re.IGNORECASE)
 _XML_ARGUMENTS_RE = re.compile(r"<arguments>\s*(.*?)\s*</arguments>", re.DOTALL | re.IGNORECASE)
 _XML_ARG_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>\s*(.*?)\s*</\1>", re.DOTALL | re.IGNORECASE)
+_EDIT_BLOCK_RE = re.compile(r"<edit>\s*(.*?)\s*</edit>", re.DOTALL | re.IGNORECASE)
+_EDIT_OLD_TEXT_RE = re.compile(r"<oldText>\s*(.*?)\s*</oldText>", re.DOTALL | re.IGNORECASE)
+_EDIT_NEW_TEXT_RE = re.compile(r"<newText>\s*(.*?)\s*</newText>", re.DOTALL | re.IGNORECASE)
 _FINAL_RESPONSE_PLACEHOLDERS = {
     "your final answer here",
     "final answer here",
@@ -366,6 +508,37 @@ def _validate_write_arguments(arguments: dict[str, Any], *, require_fence: bool)
     return None
 
 
+
+def _validate_edit_arguments(arguments: dict[str, Any]) -> ParsedAssistantAction | None:
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call missing path")
+
+    edits = arguments.get("edits")
+    if isinstance(edits, str):
+        parsed_edits = _parse_xml_edits(edits)
+        if parsed_edits is not None:
+            edits = parsed_edits
+            arguments["edits"] = edits
+
+    if not isinstance(edits, list):
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call edits must be an array")
+    if not edits:
+        return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call edits must not be empty")
+
+    normalized: list[dict[str, str]] = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call edits entries must be objects")
+        old_text = edit.get("oldText")
+        new_text = edit.get("newText")
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            return ParsedAssistantAction(kind="invalid_tool", parse_error="edit tool call each edit must include string oldText and newText")
+        normalized.append({"oldText": old_text, "newText": new_text})
+    arguments["edits"] = normalized
+    return None
+
+
 def _recover_write_payload(payload: str, full_text: str) -> ParsedAssistantAction | None:
     name_match = re.search(r'"name"\s*:\s*"([^"]+)"', payload)
     if not name_match or name_match.group(1) != "write":
@@ -418,11 +591,44 @@ def _recover_write_payload(payload: str, full_text: str) -> ParsedAssistantActio
     )
 
 
+def _normalize_xml_text_value(value: str) -> str:
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if text.startswith("\n"):
+        text = text[1:]
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text
+
+
+
+def _parse_xml_edits(value: str) -> list[dict[str, str]] | None:
+    matches = [match.group(1) for match in _EDIT_BLOCK_RE.finditer(value or "")]
+    if not matches:
+        return None
+    edits: list[dict[str, str]] = []
+    for body in matches:
+        old_match = _EDIT_OLD_TEXT_RE.search(body)
+        new_match = _EDIT_NEW_TEXT_RE.search(body)
+        if not old_match or not new_match:
+            return None
+        edits.append(
+            {
+                "oldText": _normalize_xml_text_value(old_match.group(1)),
+                "newText": _normalize_xml_text_value(new_match.group(1)),
+            }
+        )
+    return edits
+
+
+
 def _coerce_xml_arg_value(name: str, value: str) -> Any:
     value = value.strip()
     lower_name = name.strip().lower()
     lower_value = value.lower()
 
+    if lower_name == "edits":
+        parsed_edits = _parse_xml_edits(value)
+        return parsed_edits if parsed_edits is not None else value
     if lower_name in {"timeout", "limit", "max_results"}:
         try:
             return int(value)
@@ -479,6 +685,10 @@ def _parse_xml_tool_payload(payload: str, raw: str) -> ParsedAssistantAction | N
         invalid = _validate_write_arguments(arguments, require_fence=require_fence)
         if invalid is not None:
             return invalid
+    if name == "edit":
+        invalid = _validate_edit_arguments(arguments)
+        if invalid is not None:
+            return invalid
 
     return ParsedAssistantAction(kind="tool", tool_name=name, tool_arguments=arguments)
 
@@ -506,6 +716,10 @@ def _parse_tool_payload(payload: str, raw: str) -> ParsedAssistantAction:
                     arguments = {**arguments, "content": content}
                     require_fence = True
                 invalid = _validate_write_arguments(arguments, require_fence=require_fence)
+                if invalid is not None:
+                    return invalid
+            if name == "edit":
+                invalid = _validate_edit_arguments(arguments)
                 if invalid is not None:
                     return invalid
             return ParsedAssistantAction(kind="tool", tool_name=name, tool_arguments=arguments)
@@ -536,6 +750,25 @@ def _extract_tool_call(raw: str) -> ParsedAssistantAction | None:
     if len(calls) > 1:
         return ParsedAssistantAction(kind="tools", tool_calls=calls)
     return first_invalid
+
+
+
+def _extract_after_tools(raw: str) -> ParsedAfterTools | None:
+    matches = [match.group(1).strip() for match in _AFTER_TOOLS_RE.finditer(raw or "")]
+    if not matches:
+        return None
+    body = matches[-1]
+    on_success = _AFTER_TOOLS_ON_SUCCESS_RE.search(body)
+    on_failure = _AFTER_TOOLS_ON_FAILURE_RE.search(body)
+    final_prompt = _AFTER_TOOLS_FINAL_PROMPT_RE.search(body)
+    parsed = ParsedAfterTools(
+        on_success=on_success.group(1).strip() if on_success and on_success.group(1).strip() else None,
+        on_failure=on_failure.group(1).strip() if on_failure and on_failure.group(1).strip() else None,
+        final_prompt=final_prompt.group(1).strip() if final_prompt and final_prompt.group(1).strip() else None,
+    )
+    if parsed.on_success or parsed.on_failure or parsed.final_prompt:
+        return parsed
+    return None
 
 
 
@@ -572,9 +805,16 @@ def parse_assistant_action(text: str) -> ParsedAssistantAction:
     raw = str(text or "").strip()
     tool_action = _extract_tool_call(raw)
     final_response = _extract_final_response(raw)
+    after_tools = _extract_after_tools(raw)
 
     if tool_action is not None:
-        if tool_action.kind in {"tool", "tools"}:
+        if tool_action.kind == "tool":
+            if after_tools is not None:
+                return ParsedAssistantAction(kind="tool_plan", tool_name=tool_action.tool_name, tool_arguments=tool_action.tool_arguments, tool_calls=tool_action.tool_calls, after_tools=after_tools)
+            return tool_action
+        if tool_action.kind == "tools":
+            if after_tools is not None:
+                return ParsedAssistantAction(kind="tools_plan", tool_calls=tool_action.tool_calls, after_tools=after_tools)
             return tool_action
         if final_response is None:
             return tool_action

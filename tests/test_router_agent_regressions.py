@@ -2,9 +2,10 @@ import json
 
 from fastapi.testclient import TestClient
 
+from proxy.app import client as client_module
 from proxy.app import router as router_module
 from proxy.app.main import create_app
-from proxy.app.state import conversation_store
+from proxy.app.state import ConversationState, conversation_store
 
 PI_TOOLS = [
     {
@@ -27,6 +28,24 @@ PI_TOOLS = [
 def make_client() -> TestClient:
     conversation_store.clear()
     return TestClient(create_app())
+
+
+class DummyTransport:
+    def __init__(self, text="<final_response>Ready.</final_response>"):
+        self.data = {"conversation_id": None, "parent_message_id": None}
+        self.calls = []
+        self.text = text
+
+    def send_message(self, message, image=None, *, new_conversation=True):
+        self.calls.append({"message": message, "new_conversation": new_conversation})
+        from transport_runtime import TransportResult
+        return TransportResult(
+            text=self.text,
+            remote_conversation_id="remote-next",
+            remote_parent_message_id="msg-next",
+            transport_details={},
+            verification_hints={},
+        )
 
 
 def test_agent_final_response_does_not_leak_prompt_placeholder(monkeypatch):
@@ -369,6 +388,44 @@ print(\"hello\")
 
 
 
+def test_agent_edit_with_xml_edits_string_returns_valid_array(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return (
+            '<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":"<edit><oldText>PORT = 8000</oldText><newText>PORT = 8090</newText></edit>"}}</tool_call>',
+            "conv-test",
+        )
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "edit app/server4.py changing port to 8090"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "description": "Edit file",
+                        "parameters": {},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    args = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(args) == {
+        "path": "app/server4.py",
+        "edits": [{"oldText": "PORT = 8000", "newText": "PORT = 8090"}],
+    }
+
+
+
 def test_agent_write_with_write_content_invalid_python_returns_syntax_error_without_repair(monkeypatch):
     calls = []
 
@@ -612,13 +669,10 @@ print(\"smoke ok\")
 
 
 def test_write_required_prompt_is_not_reapplied_after_tool_result(monkeypatch):
-    captured = {}
+    def fail_complete_chat_turn(**kwargs):
+        raise AssertionError("post-write turn should not reuse write-required planning prompt")
 
-    def fake_complete_chat_turn(**kwargs):
-        captured["prompt_override"] = kwargs.get("prompt_override")
-        return ("<final_response>write done.</final_response>", "conv-test")
-
-    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+    monkeypatch.setattr(router_module, "complete_chat_turn", fail_complete_chat_turn)
 
     client = make_client()
     response = client.post(
@@ -654,6 +708,519 @@ def test_write_required_prompt_is_not_reapplied_after_tool_result(monkeypatch):
     )
 
     assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Created app/smoke_server.py."
+
+
+
+def test_router_stores_after_tools_plan_but_returns_only_tool_calls(monkeypatch):
+    transport = DummyTransport(
+        text="""
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+```python
+print(1)
+```
+</write_content>
+<after_tools>
+<on_success>Created app/server.py.</on_success>
+<on_failure>Could not create app/server.py: {error}</on_failure>
+</after_tools>
+"""
+    )
+    monkeypatch.setattr(client_module, "build_transport", lambda session_material: transport)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-plan",
+            "messages": [{"role": "user", "content": "Create app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    assert payload["choices"][0]["message"]["content"] is None
+    state = conversation_store.get("conv-plan")
+    assert state is not None
+    pending = state.data.get("pending_after_tools")
+    assert isinstance(pending, dict)
+    assert pending
+
+
+
+def test_post_write_tool_result_uses_on_success_without_browser_call(monkeypatch):
+    transport = DummyTransport(
+        text="""
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+```python
+print(1)
+```
+</write_content>
+<after_tools>
+<on_success>Created app/server.py.</on_success>
+<on_failure>Could not create app/server.py: {error}</on_failure>
+</after_tools>
+"""
+    )
+    monkeypatch.setattr(client_module, "build_transport", lambda session_material: transport)
+
+    client = make_client()
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-plan",
+            "messages": [{"role": "user", "content": "Create app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+    tool_call = first.json()["choices"][0]["message"]["tool_calls"][0]
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-plan",
+            "messages": [
+                {"role": "user", "content": "Create app/server.py"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": tool_call["id"], "content": "Successfully wrote 12 bytes"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+
+    assert second.status_code == 200
+    assert second.json()["choices"][0]["message"]["content"] == "Created app/server.py."
+    assert len(transport.calls) == 1
+
+
+
+def test_post_write_tool_result_returns_local_final_without_browser_call(monkeypatch):
+    def fail_complete_chat_turn(**kwargs):
+        raise AssertionError("browser call should not happen for write fast-path")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fail_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Create app/server.py"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_write",
+                            "type": "function",
+                            "function": {"name": "write", "arguments": '{"path":"app/server.py","content":"print(1)\\n"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_write", "content": "Successfully wrote 12 bytes"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Created app/server.py."
+
+
+
+def test_post_edit_tool_result_returns_local_final_without_browser_call(monkeypatch):
+    def fail_complete_chat_turn(**kwargs):
+        raise AssertionError("browser call should not happen for edit fast-path")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fail_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Update app/server.py"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_edit",
+                            "type": "function",
+                            "function": {"name": "edit", "arguments": '{"path":"app/server.py","edits":[{"oldText":"a","newText":"b"}]}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_edit", "content": "Edited file successfully"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "edit", "description": "Edit file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Updated app/server.py."
+
+
+
+def test_post_write_tool_failure_uses_on_failure_without_browser_call(monkeypatch):
+    transport = DummyTransport(
+        text="""
+<tool_call>
+<name>write</name>
+<arguments>
+<path>app/server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+```python
+print(1)
+```
+</write_content>
+<after_tools>
+<on_success>Created app/server.py.</on_success>
+<on_failure>Could not create app/server.py: {error}</on_failure>
+</after_tools>
+"""
+    )
+    monkeypatch.setattr(client_module, "build_transport", lambda session_material: transport)
+
+    client = make_client()
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-fail",
+            "messages": [{"role": "user", "content": "Create app/server.py"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+    tool_call = first.json()["choices"][0]["message"]["tool_calls"][0]
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-fail",
+            "messages": [
+                {"role": "user", "content": "Create app/server.py"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": tool_call["id"], "content": "Permission denied writing app/server.py"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "Write file", "parameters": {}}}],
+        },
+    )
+
+    assert second.status_code == 200
+    assert "Could not create app/server.py" in second.json()["choices"][0]["message"]["content"]
+    assert "Permission denied" in second.json()["choices"][0]["message"]["content"]
+    assert len(transport.calls) == 1
+
+
+
+def test_post_read_tool_result_uses_compact_final_only_prompt(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ("<final_response>README summary.</final_response>", "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Summarize README.md"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":"README.md"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_read", "content": "README contents here"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
     prompt_override = captured["prompt_override"]
-    assert "Request classification: write_required." not in prompt_override
-    assert "Emit exactly one write tool_call on this turn." not in prompt_override
+    assert captured["force_new_conversation"] is True
+    assert "Do not call tools on this turn." in prompt_override
+    assert "Return exactly one <final_response>...</final_response> block" in prompt_override
+    assert "Available tools:" not in prompt_override
+    assert "For write, always use this exact pattern" not in prompt_override
+
+
+
+def test_post_tool_final_prompt_hint_is_forwarded(monkeypatch):
+    conversation_store.clear()
+    planning_transport = DummyTransport(
+        text="""
+<tool_call><name>read</name><arguments><path>README.md</path></arguments></tool_call>
+<after_tools><final_prompt>Summarize the README in one sentence.</final_prompt></after_tools>
+"""
+    )
+    monkeypatch.setattr(client_module, "build_transport", lambda session_material: planning_transport)
+
+    planner = client_module.RuntimeClient("chatgpt-playwright")
+    plan_text, _ = planner.complete_chat_turn(
+        messages=[{"role": "user", "content": "Summarize README.md"}],
+        conversation_id="conv-plan",
+        prompt_override="plan prompt",
+        force_new_conversation=True,
+    )
+    plan_action = router_module.parse_assistant_action(plan_text)
+    tool_call = router_module.action_tool_calls(plan_action)[0]
+
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ("<final_response>README summary.</final_response>", "conv-plan")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = TestClient(create_app())
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-plan",
+            "messages": [
+                {"role": "user", "content": "Summarize README.md"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": tool_call["id"], "content": "README contents here"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert second.status_code == 200
+    assert "Additional finalization instruction:" in captured["prompt_override"]
+    assert "Summarize the README in one sentence." in captured["prompt_override"]
+
+
+
+def test_final_only_prompt_disallows_tool_calls(monkeypatch):
+    def fake_complete_chat_turn(**kwargs):
+        return ('<tool_call>{"name":"read","arguments":{"path":"README.md"}}</tool_call>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Summarize README.md"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_read", "type": "function", "function": {"name": "read", "arguments": '{"path":"README.md"}'}}]},
+                {"role": "tool", "tool_call_id": "call_read", "content": "README contents here"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 502
+    assert "tool calls are not allowed after tool results" in response.json()["error"]["message"]
+
+
+
+def test_old_write_tool_result_in_history_does_not_trigger_local_final_for_new_user_turn(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<final_response>Hello!</final_response>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "Create server2.py"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_write", "type": "function", "function": {"name": "write", "arguments": '{"path":"server2.py","content":"print(1)\\n"}'}}]},
+                {"role": "tool", "tool_call_id": "call_write", "content": "Successfully wrote 10 bytes"},
+                {"role": "assistant", "content": "Created server2.py."},
+                {"role": "user", "content": "hello!"},
+            ],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Hello!"
+    assert captured["force_new_conversation"] is True
+    assert "Do not call tools on this turn." not in captured["prompt_override"]
+
+
+
+def test_new_edit_request_after_previous_write_success_reenters_planning_mode(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"edit","arguments":{"path":"app/server3.py","edits":[{"oldText":"a","newText":"b"}]}}</tool_call>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "write app/server3.py"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_write", "type": "function", "function": {"name": "write", "arguments": '{"path":"app/server3.py","content":"print(1)\\n"}'}}]},
+                {"role": "tool", "tool_call_id": "call_write", "content": "Successfully wrote 10 bytes"},
+                {"role": "assistant", "content": "Created app/server3.py."},
+                {"role": "user", "content": "edit @app/server3.py file for adding more stuff"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "edit", "description": "Edit file", "parameters": {}}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert captured["force_new_conversation"] is True
+    assert "Do not call tools on this turn." not in captured["prompt_override"]
+
+
+
+def test_agent_planning_calls_use_force_new_conversation(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat_turn(**kwargs):
+        captured.update(kwargs)
+        return ('<tool_call>{"name":"read","arguments":{"path":"server.py"}}</tool_call>', "conv-test")
+
+    monkeypatch.setattr(router_module, "complete_chat_turn", fake_complete_chat_turn)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "messages": [{"role": "user", "content": "read server.py"}],
+            "tools": PI_TOOLS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["force_new_conversation"] is True
+
+
+
+def test_non_agent_calls_preserve_existing_conversation_behavior(monkeypatch):
+    captured = {}
+
+    def fake_complete_chat(**kwargs):
+        captured.update(kwargs)
+        return "Ready."
+
+    monkeypatch.setattr(router_module, "complete_chat", fake_complete_chat)
+
+    client = make_client()
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt-playwright",
+            "stream": False,
+            "user": "conv-plain",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["force_new_conversation"] is False
+    assert captured["conversation_id"] == "conv-plain"
+
+
+
+def test_runtime_client_force_new_conversation_uses_new_conversation_even_with_remote_state(monkeypatch):
+    conversation_store.clear()
+    state = ConversationState(conversation_id="conv-state", data={"remote_conversation_id": "remote-old", "remote_parent_message_id": "msg-old"})
+    state.transport = DummyTransport()
+    conversation_store.put(state)
+    runtime = client_module.RuntimeClient("chatgpt-playwright")
+    text, effective = runtime.complete_chat_turn(messages=[{"role": "user", "content": "hi"}], conversation_id="conv-state", force_new_conversation=True)
+
+    assert text == "<final_response>Ready.</final_response>"
+    assert effective == "conv-state"
+    assert state.transport.calls[-1]["new_conversation"] is True
+    assert state.transport.data["conversation_id"] is None
+    assert state.transport.data["parent_message_id"] is None
+
+
+
+def test_runtime_client_force_new_conversation_still_updates_aliases(monkeypatch):
+    conversation_store.clear()
+    transport = DummyTransport()
+    monkeypatch.setattr(client_module, "build_transport", lambda session_material: transport)
+
+    runtime = client_module.RuntimeClient("chatgpt-playwright")
+    messages = [{"role": "user", "content": "hello"}]
+    _text, effective = runtime.complete_chat_turn(messages=messages, force_new_conversation=True)
+
+    assert effective is not None
+    stored = conversation_store.get(effective)
+    assert stored is not None
+    assert stored.data["remote_conversation_id"] == "remote-next"
+    assert conversation_store.count() == 1
+
+
+
+def test_runtime_client_default_force_new_conversation_false_preserves_existing_behavior(monkeypatch):
+    conversation_store.clear()
+    state = ConversationState(conversation_id="conv-state", data={"remote_conversation_id": "remote-old", "remote_parent_message_id": "msg-old"})
+    state.transport = DummyTransport()
+    conversation_store.put(state)
+    runtime = client_module.RuntimeClient("chatgpt-playwright")
+    runtime.complete_chat_turn(messages=[{"role": "user", "content": "hi"}], conversation_id="conv-state", force_new_conversation=False)
+
+    assert state.transport.calls[-1]["new_conversation"] is False
+    assert state.transport.data["conversation_id"] == "remote-old"
+    assert state.transport.data["parent_message_id"] == "msg-old"

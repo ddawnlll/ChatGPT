@@ -247,9 +247,11 @@ Run them manually with:
 
 ```bash
 RUN_BROWSER_E2E=1 make test-browser-e2e
+# or
+make test-regression-live
 ```
 
-These tests validate the live Playwright/browser path end-to-end and are intended for nightly or manual verification, not normal fast CI.
+These tests validate the live Playwright/browser path end-to-end and are intended for nightly or manual verification, not normal fast CI. `test-regression-live` runs the fast regression suite first, then the live browser smokes, including a non-interactive `pi` CLI smoke against the real proxy/browser path.
 
 ### CI workflows
 

@@ -293,10 +293,23 @@ def test_pi_cli_tool_loop_executes_real_pi_tools(monkeypatch, tmp_path, tool_nam
         result = run_pi(agent_dir, tmp_path, f"Use the {tool_name} tool.", tools=allowed_tools)
 
     assert result.returncode == 0, result.stderr
-    assert f"{tool_name} done." in result.stdout
-    assert len(requests) >= 2
-    assert assertion(tmp_path, requests[-1]), result.stdout
-    assert any(message.get("role") == "tool" for message in requests[-1])
+    if tool_name == "write":
+        assert "Created created.txt." in result.stdout
+        assert len(requests) == 1
+    elif tool_name == "edit":
+        assert "Updated edit.txt." in result.stdout
+        assert len(requests) == 1
+    elif tool_name == "bash":
+        assert "Command completed successfully." in result.stdout
+        assert len(requests) == 1
+    else:
+        assert f"{tool_name} done." in result.stdout
+        assert len(requests) >= 2
+        assert any(message.get("role") == "tool" for message in requests[-1])
+        assert assertion(tmp_path, requests[-1]), result.stdout
+        return
+
+    assert assertion(tmp_path, requests[0]), result.stdout
 
 
 @pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
@@ -332,3 +345,89 @@ def test_pi_cli_multi_tool_calls_execute_in_one_turn(monkeypatch, tmp_path):
     rendered_tool_text = "\n".join(str(message.get("content", "")) for message in tool_messages)
     assert "alpha" in rendered_tool_text
     assert "ls-visible.txt" in rendered_tool_text
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_simple_write_fastpath_avoids_second_browser_prompt(monkeypatch, tmp_path):
+    requests: list[list[dict[str, Any]]] = []
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs["messages"])
+        return ('<tool_call>{"name":"write","arguments":{"path":"created.txt","content":"hello from pi\\n"}}</tool_call>', "conv-write-fast")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Create created.txt", tools="write")
+
+    assert result.returncode == 0, result.stderr
+    assert "Created created.txt." in result.stdout
+    assert len(requests) == 1
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_read_then_final_uses_one_post_tool_final_prompt(monkeypatch, tmp_path):
+    requests: list[dict[str, Any]] = []
+    (tmp_path / "sample.txt").write_text("alpha\n", encoding="utf-8")
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs)
+        messages = kwargs["messages"]
+        if any(message.get("role") == "tool" for message in messages):
+            return ("<final_response>sample says alpha.</final_response>", "conv-read-final")
+        return ('<tool_call>{"name":"read","arguments":{"path":"sample.txt"}}</tool_call>', "conv-read-final")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result = run_pi(agent_dir, tmp_path, "Read sample.txt and summarize it", tools="read")
+
+    assert result.returncode == 0, result.stderr
+    assert "sample says alpha." in result.stdout
+    assert len(requests) == 2
+    assert "Do not call tools on this turn." in requests[-1]["prompt_override"]
+    assert "Return exactly one <final_response>...</final_response> block" in requests[-1]["prompt_override"]
+
+
+@pytest.mark.skipif(not shutil.which(PI_BINARY), reason="pi binary is required for CLI E2E tests")
+def test_pi_cli_regression_multiturn_session_does_not_reuse_stale_write_fastpath(monkeypatch, tmp_path):
+    requests: list[dict[str, Any]] = []
+    phase = {"step": 0}
+
+    def fake_complete_chat_turn(**kwargs):
+        requests.append(kwargs)
+        messages = kwargs["messages"]
+        has_tool = any(message.get("role") == "tool" for message in messages)
+        phase["step"] += 1
+        step = phase["step"]
+
+        if step == 1:
+            return ("<final_response>Hello!</final_response>", "conv-regression")
+        if step == 2:
+            return ('<tool_call>{"name":"write","arguments":{"path":"app/server.py","content":"print(1)\\n"}}</tool_call>', "conv-regression")
+        if step == 3:
+            return ('<tool_call>{"name":"edit","arguments":{"path":"app/server.py","edits":[{"oldText":"print(1)","newText":"print(2)"}]}}</tool_call>', "conv-regression")
+        if step == 4 and not has_tool:
+            return ('<tool_call>{"name":"read","arguments":{"path":"app/server.py"}}</tool_call>', "conv-regression")
+        if step == 5 and has_tool:
+            return ("<final_response>Analysis done.</final_response>", "conv-regression")
+        if step == 6:
+            return ('<tool_call>{"name":"write","arguments":{"path":"docs/server.md","content":"# Server\\n"}}</tool_call>', "conv-regression")
+        return ("<final_response>fallback</final_response>", "conv-regression")
+
+    with running_proxy_server(monkeypatch, fake_complete_chat_turn) as base_url:
+        agent_dir = tmp_path / "pi-agent"
+        write_pi_models_json(agent_dir, base_url)
+        result1 = run_pi(agent_dir, tmp_path, "hello")
+        result2 = run_pi(agent_dir, tmp_path, "write app/server.py", tools="write")
+        result3 = run_pi(agent_dir, tmp_path, "edit @app/server.py file for adding more stuff", tools="edit")
+        result4 = run_pi(agent_dir, tmp_path, "read and analyze app/server.py", tools="read")
+        result5 = run_pi(agent_dir, tmp_path, "create docs/server.md", tools="write")
+
+    assert result1.returncode == 0 and "Hello!" in result1.stdout
+    assert result2.returncode == 0 and "Created app/server.py." in result2.stdout
+    assert result3.returncode == 0 and "Updated app/server.py." in result3.stdout
+    assert result4.returncode == 0 and "Analysis done." in result4.stdout
+    assert result5.returncode == 0 and "Created docs/server.md." in result5.stdout
+    assert len(requests) == 6
+    assert any("Do not call tools on this turn." in str(call.get("prompt_override", "")) for call in requests)

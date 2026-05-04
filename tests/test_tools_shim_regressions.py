@@ -1,4 +1,4 @@
-from proxy.app.tools_shim import build_pi_agent_prompt, build_tool_repair_prompt, parse_assistant_action, should_retry_malformed_tool_call
+from proxy.app.tools_shim import build_final_after_tools_prompt, build_pi_agent_prompt, build_tool_repair_prompt, parse_assistant_action, should_retry_malformed_tool_call
 
 
 def test_parse_final_response_prefers_last_non_placeholder():
@@ -170,6 +170,49 @@ if __name__ == "__main__":
     assert 'self.wfile.write(b"Hello from server.py\\n")' in action.tool_arguments["content"]
 
 
+
+def test_parse_json_edit_tool_call_with_xml_edits_string_is_normalized():
+    text = """
+<tool_call>{"name":"edit","arguments":{"path":"app/server4.py","edits":"<edit><oldText>PORT = 8000</oldText><newText>PORT = 8090</newText></edit>"}}</tool_call>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "edit"
+    assert action.tool_arguments == {
+        "path": "app/server4.py",
+        "edits": [{"oldText": "PORT = 8000", "newText": "PORT = 8090"}],
+    }
+
+
+
+def test_parse_xml_edit_tool_call_with_nested_edit_blocks():
+    text = """
+<tool_call>
+<name>edit</name>
+<arguments>
+<path>app/server4.py</path>
+<edits>
+<edit>
+<oldText>PORT = 8000</oldText>
+<newText>PORT = 8090</newText>
+</edit>
+</edits>
+</arguments>
+</tool_call>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool"
+    assert action.tool_name == "edit"
+    assert action.tool_arguments == {
+        "path": "app/server4.py",
+        "edits": [{"oldText": "PORT = 8000", "newText": "PORT = 8090"}],
+    }
+
+
 def test_parse_xml_write_rejects_multiple_fenced_blocks():
     text = """
 <tool_call>
@@ -226,6 +269,53 @@ self.send_response(200)
 
 
 
+def test_parse_tool_plan_with_on_success():
+    text = """
+<tool_call>
+<name>write</name>
+<arguments>
+<path>server.py</path>
+</arguments>
+</tool_call>
+<write_content>
+```python
+print("hello")
+```
+</write_content>
+<after_tools>
+<on_success>Created server.py.</on_success>
+<on_failure>Could not create server.py: {error}</on_failure>
+</after_tools>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tool_plan"
+    assert action.after_tools is not None
+    assert action.after_tools.on_success == "Created server.py."
+    assert action.after_tools.on_failure == "Could not create server.py: {error}"
+
+
+
+def test_parse_multi_tool_plan_with_final_prompt():
+    text = """
+<tool_call><name>find</name><arguments><path>.</path><pattern>*.py</pattern></arguments></tool_call>
+<tool_call><name>grep</name><arguments><path>.</path><pattern>TODO</pattern></arguments></tool_call>
+<after_tools>
+<final_prompt>Use the tool results to summarize the project in 5 bullets.</final_prompt>
+</after_tools>
+"""
+
+    action = parse_assistant_action(text)
+
+    assert action.kind == "tools_plan"
+    assert action.tool_calls is not None
+    assert [call.name for call in action.tool_calls] == ["find", "grep"]
+    assert action.after_tools is not None
+    assert action.after_tools.final_prompt == "Use the tool results to summarize the project in 5 bullets."
+
+
+
 def test_parse_multiple_xml_tool_calls_returns_tools_kind():
     text = """
 <tool_call><name>find</name><arguments><path>.</path><pattern>*.py</pattern></arguments></tool_call>
@@ -253,6 +343,109 @@ def test_build_pi_agent_prompt_compacts_large_history():
     assert "latest request" in decision.prompt
     assert "[truncated" in decision.prompt
     assert len(decision.prompt) < 20000
+
+
+
+def test_compact_transcript_skips_system_and_developer_messages():
+    decision = build_pi_agent_prompt(
+        [
+            {"role": "system", "content": "system alpha"},
+            {"role": "developer", "content": "developer beta"},
+            {"role": "user", "content": "latest request"},
+        ],
+        None,
+    )
+
+    prompt = decision.prompt
+    assert "System instructions:\nsystem alpha\n\ndeveloper beta" in prompt
+    transcript = prompt.split("Conversation transcript:\n", 1)[1]
+    assert "system: system alpha" not in transcript
+    assert "developer: developer beta" not in transcript
+
+
+
+def test_compact_transcript_summarizes_assistant_tool_calls_and_omits_write_content():
+    decision = build_pi_agent_prompt(
+        [
+            {"role": "user", "content": "make files"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_write",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path":"app/server.py","content":"print(\\"x\\")\\n"}',
+                        },
+                    },
+                    {
+                        "id": "call_edit",
+                        "type": "function",
+                        "function": {
+                            "name": "edit",
+                            "arguments": '{"path":"app/main.py","edits":[{"oldText":"a","newText":"b"},{"oldText":"c","newText":"d"}]}',
+                        },
+                    },
+                    {
+                        "id": "call_bash",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command":"pytest -q","timeout":30}',
+                        },
+                    },
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    },
+                ],
+            },
+        ],
+        None,
+    )
+
+    prompt = decision.prompt
+    assert "assistant_tool_calls:" in prompt
+    assert "- write app/server.py content=[omitted" in prompt
+    assert "print(\"x\")" not in prompt
+    assert "- edit app/main.py edits=2" in prompt
+    assert '- bash "pytest -q" timeout=30' in prompt
+    assert "- read README.md" in prompt
+
+
+
+def test_final_only_prompt_contains_no_tool_schema_or_write_protocol():
+    decision = build_final_after_tools_prompt(
+        [
+            {"role": "user", "content": "Summarize README.md"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"path":"README.md"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_read", "content": "README contents"},
+        ],
+        [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {}}}],
+    )
+
+    prompt = decision.prompt
+    assert "Do not call tools on this turn." in prompt
+    assert "Return exactly one <final_response>...</final_response> block" in prompt
+    assert "Available tools:" not in prompt
+    assert "For write, always use this exact pattern" not in prompt
+    assert "<write_content>" not in prompt
 
 
 def test_repo_analysis_prompt_forces_tool_inspection():

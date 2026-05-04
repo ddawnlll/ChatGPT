@@ -1,4 +1,4 @@
-.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi test-proxy test-pi-contract test-browser-e2e test-all-fast test-all test-all-live test-js
+.PHONY: help setup-browser start-proxy start-api shell setup-python setup-bun setup clean-profile kill-browser enter-pi test-proxy test-pi-contract test-browser-e2e test-all-fast test-all test-all-live test-js test-regression test-regression-live
 
 # Export critical macOS environment variables for all commands
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
@@ -21,6 +21,8 @@ help:
 	@echo "  make diag          - Run Playwright diagnostics"
 	@echo "  make test-all      - Run staged full test suite (browser E2E skips unless RUN_BROWSER_E2E=1)"
 	@echo "  make test-all-live - Run full suite including live browser E2E"
+	@echo "  make test-regression      - Run fast deterministic regression coverage"
+	@echo "  make test-regression-live - Run regression coverage plus live pi/browser smokes"
 
 login:
 	@bun tools/login.mjs
@@ -43,12 +45,28 @@ test-pi-contract:
 		tests/test_fake_playwright_daemon_process.py \
 		-q
 
+test-regression:
+	.venv/bin/pytest \
+		tests/test_tools_shim_regressions.py \
+		tests/test_router_agent_regressions.py \
+		tests/test_pi_agent_cli_e2e.py \
+		-q
+
+test-regression-live: test-regression
+	RUN_BROWSER_E2E=1 .venv/bin/pytest \
+		tests/test_real_browser_smoke.py \
+		tests/test_real_browser_write_smoke.py \
+		tests/test_real_pi_browser_smoke.py \
+		-q
+
 test-js:
 	bun run test:playwright-helpers
 
 test-browser-e2e:
 	RUN_BROWSER_E2E=1 .venv/bin/pytest \
 		tests/test_real_browser_smoke.py \
+		tests/test_real_browser_write_smoke.py \
+		tests/test_real_pi_browser_smoke.py \
 		-q
 
 test-all-fast: test-js

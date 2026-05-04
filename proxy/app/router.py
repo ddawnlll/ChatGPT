@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import time
 import uuid
+import json
 import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from .client import complete_chat, complete_chat_turn, list_models, stream_chat_completion
+from .client import clear_pending_after_tools_plan, complete_chat, complete_chat_turn, get_pending_after_tools_plan, list_models, resolve_conversation_state, stream_chat_completion
 from .config import settings
 from .models import ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, HealthResponse, ModelList, StreamChoice, StreamChunk, StreamDelta
 from .streaming import chat_completions_stream, done_sse, sse
 from .tools_shim import (
     ParsedAssistantAction,
+    build_final_after_tools_prompt,
     build_openai_tool_call,
     build_pi_agent_prompt,
     build_tool_repair_prompt,
@@ -77,9 +79,9 @@ def tool_parse_error_message(parse_error: str | None) -> str:
 
 
 def action_tool_calls(action: Any) -> list[dict[str, Any]]:
-    if getattr(action, "kind", None) == "tools" and getattr(action, "tool_calls", None):
+    if getattr(action, "kind", None) in {"tools", "tools_plan"} and getattr(action, "tool_calls", None):
         return [build_openai_tool_call(call.name, call.arguments) for call in action.tool_calls]
-    if getattr(action, "kind", None) == "tool" and getattr(action, "tool_name", None) and isinstance(getattr(action, "tool_arguments", None), dict):
+    if getattr(action, "kind", None) in {"tool", "tool_plan"} and getattr(action, "tool_name", None) and isinstance(getattr(action, "tool_arguments", None), dict):
         return [build_openai_tool_call(action.tool_name, action.tool_arguments)]
     return []
 
@@ -178,23 +180,150 @@ def build_tool_access_recovery_prompt(base_prompt: str, *, require_write: bool) 
 
 
 
-def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None, require_write: bool = False) -> tuple[str, Any]:
+def _find_trailing_post_tool_block(messages: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    if not messages:
+        return None
+    index = len(messages) - 1
+    trailing_tool_messages: list[dict[str, Any]] = []
+
+    while index >= 0:
+        message = messages[index]
+        role = str(message.get("role", "")).strip().lower() if isinstance(message, dict) else ""
+        if role in {"system", "developer"}:
+            index -= 1
+            continue
+        if role == "tool" and isinstance(message, dict):
+            trailing_tool_messages.append(message)
+            index -= 1
+            continue
+        break
+
+    if not trailing_tool_messages or index < 0:
+        return None
+
+    assistant_message = messages[index]
+    if not isinstance(assistant_message, dict):
+        return None
+    if str(assistant_message.get("role", "")).strip().lower() != "assistant":
+        return None
+    tool_calls = assistant_message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+
+    trailing_tool_messages.reverse()
+    return assistant_message, trailing_tool_messages
+
+
+
+def has_tool_results(messages: list[dict[str, Any]]) -> bool:
+    return _find_trailing_post_tool_block(messages) is not None
+
+
+
+def latest_assistant_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    block = _find_trailing_post_tool_block(messages)
+    if block is None:
+        return []
+    assistant_message, _tool_messages = block
+    tool_calls = assistant_message.get("tool_calls")
+    return tool_calls if isinstance(tool_calls, list) else []
+
+
+
+def _extract_single_terminal_tool_summary(messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]] | None:
+    tool_calls = latest_assistant_tool_calls(messages)
+    if len(tool_calls) != 1:
+        return None
+    tool_call = tool_calls[0]
+    function = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    arguments_raw = function.get("arguments")
+    if isinstance(arguments_raw, str):
+        try:
+            arguments = json.loads(arguments_raw)
+        except Exception:
+            return None
+    elif isinstance(arguments_raw, dict):
+        arguments = arguments_raw
+    else:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return name, arguments
+
+
+
+def _looks_like_successful_tool_result(messages: list[dict[str, Any]]) -> bool:
+    block = _find_trailing_post_tool_block(messages)
+    if block is None:
+        return False
+    _assistant_message, tool_messages = block
+    combined = "\n".join(str(message.get("content", "")) for message in tool_messages).lower()
+    failure_markers = ("error", "failed", "traceback", "exception", "no such file", "not found", "permission denied")
+    return not any(marker in combined for marker in failure_markers)
+
+
+
+def render_after_tools_template(template: str, messages: list[dict[str, Any]]) -> str:
+    block = _find_trailing_post_tool_block(messages)
+    if block is None:
+        error_text = ""
+    else:
+        _assistant_message, tool_messages = block
+        error_text = "\n".join(str(message.get("content", "")).strip() for message in tool_messages).strip()
+    return template.replace("{error}", error_text)
+
+
+
+def maybe_synthesize_local_final(messages: list[dict[str, Any]], pending_plan: dict[str, Any] | None = None) -> str | None:
+    if pending_plan:
+        if _looks_like_successful_tool_result(messages):
+            on_success = pending_plan.get("on_success")
+            if isinstance(on_success, str) and on_success.strip():
+                return render_after_tools_template(on_success.strip(), messages)
+        else:
+            on_failure = pending_plan.get("on_failure")
+            if isinstance(on_failure, str) and on_failure.strip():
+                return render_after_tools_template(on_failure.strip(), messages)
+
+    summary = _extract_single_terminal_tool_summary(messages)
+    if summary is None or not _looks_like_successful_tool_result(messages):
+        return None
+    tool_name, arguments = summary
+    if tool_name == "write":
+        path = arguments.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Created {path.strip()}."
+    if tool_name == "edit":
+        path = arguments.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Updated {path.strip()}."
+    if tool_name == "bash":
+        latest_user = extract_latest_user_text(messages).lower()
+        bash_signals = ("run ", "execute ", "command", "bash ", "shell ")
+        if latest_user and any(signal in latest_user for signal in bash_signals):
+            return "Command completed successfully."
+    return None
+
+
+
+def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], conversation_id: str | None, prompt_override: str | None, require_write: bool = False, allow_tool_calls: bool = True, force_new_conversation: bool = False) -> tuple[str, Any]:
     text, effective_conversation_id = complete_chat_turn(
         model=model,
         messages=dumped_messages,
         conversation_id=conversation_id,
         prompt_override=prompt_override,
+        force_new_conversation=force_new_conversation,
     )
-    logger.warning("assistant_raw_text_before_parse=%r", text)
     action = parse_assistant_action(text)
-    logger.warning(
-        "assistant_parsed_action kind=%s tool_name=%s parse_error=%r",
-        getattr(action, "kind", None),
-        getattr(action, "tool_name", None),
-        getattr(action, "parse_error", None),
-    )
     if is_placeholder_transport_artifact(text):
         return text, ParsedAssistantAction(kind="invalid_tool", parse_error="placeholder transport artifact")
+    if not allow_tool_calls and action_tool_calls(action):
+        return text, ParsedAssistantAction(kind="invalid_tool", parse_error="tool calls are not allowed after tool results")
     if action.kind == "final" and is_tool_access_refusal_text(text):
         recovery_prompt = build_tool_access_recovery_prompt(prompt_override or extract_latest_user_text(dumped_messages), require_write=require_write)
         recovered_text = complete_chat(
@@ -202,15 +331,9 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
             messages=dumped_messages,
             conversation_id=effective_conversation_id,
             prompt_override=recovery_prompt,
+            force_new_conversation=force_new_conversation,
         )
-        logger.warning("assistant_recovered_raw_text_before_parse=%r", recovered_text)
         recovered_action = parse_assistant_action(recovered_text)
-        logger.warning(
-            "assistant_recovered_parsed_action kind=%s tool_name=%s parse_error=%r",
-            getattr(recovered_action, "kind", None),
-            getattr(recovered_action, "tool_name", None),
-            getattr(recovered_action, "parse_error", None),
-        )
         return recovered_text, recovered_action
     if should_retry_malformed_tool_call(action):
         repair_prompt = build_tool_repair_prompt(text, action.parse_error)
@@ -219,15 +342,9 @@ def resolve_agent_action(*, model: str, dumped_messages: list[dict[str, Any]], c
             messages=dumped_messages,
             conversation_id=effective_conversation_id,
             prompt_override=repair_prompt,
+            force_new_conversation=force_new_conversation,
         )
-        logger.warning("assistant_repaired_raw_text_before_parse=%r", repaired_text)
         repaired_action = parse_assistant_action(repaired_text)
-        logger.warning(
-            "assistant_repaired_parsed_action kind=%s tool_name=%s parse_error=%r",
-            getattr(repaired_action, "kind", None),
-            getattr(repaired_action, "tool_name", None),
-            getattr(repaired_action, "parse_error", None),
-        )
         return repaired_text, repaired_action
     return text, action
 
@@ -247,29 +364,45 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
     agent_mode = is_pi_agent_request(request.tools)
     prompt_override = None
     require_write = False
+    post_tool_turn = False
+    allow_tool_calls = True
+    force_new_conversation = False
+    pending_after_tools_plan: dict[str, Any] | None = None
+    resolved_state = None
     if agent_mode:
-        decision = build_pi_agent_prompt(dumped_messages, request.tools)
-        prompt_override = decision.prompt
-        require_write = request_requires_write_tool(dumped_messages, request.tools)
-        if require_write:
-            prompt_override += (
-                "\n\nRequest classification: write_required.\n"
-                "The user's current task requires the write tool.\n"
-                "Emit exactly one write tool_call on this turn.\n"
-                "Do not answer with prose or claim you lack tool access.\n"
-                "Put the destination file path in <path> and wrap the exact file body in exactly one fenced code block inside <write_content>.\n"
-                "Do not emit <final_response> on this turn.\n"
-            )
-        if request.parallel_tool_calls is True:
-            prompt_override += (
-                "\n\nRequest option: parallel_tool_calls=true.\n"
-                "When safe, batch independent read-only inspection tool calls in one response.\n"
-            )
-        if request.tool_choice == "required":
-            prompt_override += (
-                "\n\nRequest option: tool_choice=required.\n"
-                "You must emit at least one tool_call. Do not emit final_response on this turn.\n"
-            )
+        force_new_conversation = settings.agent_force_new_conversation
+        post_tool_turn = settings.agent_post_tool_final_only and has_tool_results(dumped_messages)
+        allow_tool_calls = not post_tool_turn
+        if post_tool_turn:
+            _resolved_conversation_id, resolved_state = resolve_conversation_state(model=request.model, messages=dumped_messages, conversation_id=conversation_id)
+            if settings.agent_after_tools_plan_enabled:
+                pending_after_tools_plan = get_pending_after_tools_plan(resolved_state, dumped_messages)
+            final_prompt_hint = pending_after_tools_plan.get("final_prompt") if isinstance(pending_after_tools_plan, dict) else None
+            decision = build_final_after_tools_prompt(dumped_messages, request.tools, final_prompt_hint=final_prompt_hint if isinstance(final_prompt_hint, str) else None)
+            prompt_override = decision.prompt
+        else:
+            decision = build_pi_agent_prompt(dumped_messages, request.tools)
+            prompt_override = decision.prompt
+            require_write = request_requires_write_tool(dumped_messages, request.tools)
+            if require_write:
+                prompt_override += (
+                    "\n\nRequest classification: write_required.\n"
+                    "The user's current task requires the write tool.\n"
+                    "Emit exactly one write tool_call on this turn.\n"
+                    "Do not answer with prose or claim you lack tool access.\n"
+                    "Put the destination file path in <path> and wrap the exact file body in exactly one fenced code block inside <write_content>.\n"
+                    "Do not emit <final_response> on this turn.\n"
+                )
+            if request.parallel_tool_calls is True:
+                prompt_override += (
+                    "\n\nRequest option: parallel_tool_calls=true.\n"
+                    "When safe, batch independent read-only inspection tool calls in one response.\n"
+                )
+            if request.tool_choice == "required":
+                prompt_override += (
+                    "\n\nRequest option: tool_choice=required.\n"
+                    "You must emit at least one tool_call. Do not emit final_response on this turn.\n"
+                )
 
     if request.stream:
         if agent_mode:
@@ -277,13 +410,32 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                 req_id = f"chatcmpl-{uuid.uuid4().hex}"
                 created = int(time.time())
                 try:
-                    text, action = resolve_agent_action(
-                        model=request.model,
-                        dumped_messages=dumped_messages,
-                        conversation_id=conversation_id,
-                        prompt_override=prompt_override,
-                        require_write=require_write,
-                    )
+                    if post_tool_turn and settings.agent_local_terminal_final_fastpath:
+                        synthesized = maybe_synthesize_local_final(dumped_messages, pending_after_tools_plan)
+                        if synthesized is not None:
+                            if settings.agent_after_tools_plan_enabled:
+                                clear_pending_after_tools_plan(resolved_state, dumped_messages)
+                            text, action = synthesized, ParsedAssistantAction(kind="final", content=synthesized)
+                        else:
+                            text, action = resolve_agent_action(
+                                model=request.model,
+                                dumped_messages=dumped_messages,
+                                conversation_id=conversation_id,
+                                prompt_override=prompt_override,
+                                require_write=require_write,
+                                allow_tool_calls=allow_tool_calls,
+                                force_new_conversation=force_new_conversation,
+                            )
+                    else:
+                        text, action = resolve_agent_action(
+                            model=request.model,
+                            dumped_messages=dumped_messages,
+                            conversation_id=conversation_id,
+                            prompt_override=prompt_override,
+                            require_write=require_write,
+                            allow_tool_calls=allow_tool_calls,
+                            force_new_conversation=force_new_conversation,
+                        )
                 except ValueError as exc:
                     yield sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_messages"}})
                     yield done_sse()
@@ -292,6 +444,8 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
                     yield sse({"error": {"message": str(exc), "type": "server_error", "code": "transport_error"}})
                     yield done_sse()
                     return
+                if post_tool_turn and action.kind == "final" and settings.agent_after_tools_plan_enabled:
+                    clear_pending_after_tools_plan(resolved_state, dumped_messages)
                 tool_calls = action_tool_calls(action)
                 if tool_calls:
                     chunk = StreamChunk(
@@ -349,20 +503,41 @@ async def chat_completions(request: ChatRequest, raw_request: Request):
 
     try:
         if agent_mode:
-            text, action = resolve_agent_action(
-                model=request.model,
-                dumped_messages=dumped_messages,
-                conversation_id=conversation_id,
-                prompt_override=prompt_override,
-                require_write=require_write,
-            )
+            if post_tool_turn and settings.agent_local_terminal_final_fastpath:
+                synthesized = maybe_synthesize_local_final(dumped_messages, pending_after_tools_plan)
+                if synthesized is not None:
+                    if settings.agent_after_tools_plan_enabled:
+                        clear_pending_after_tools_plan(resolved_state, dumped_messages)
+                    text, action = synthesized, ParsedAssistantAction(kind="final", content=synthesized)
+                else:
+                    text, action = resolve_agent_action(
+                        model=request.model,
+                        dumped_messages=dumped_messages,
+                        conversation_id=conversation_id,
+                        prompt_override=prompt_override,
+                        require_write=require_write,
+                        allow_tool_calls=allow_tool_calls,
+                        force_new_conversation=force_new_conversation,
+                    )
+            else:
+                text, action = resolve_agent_action(
+                    model=request.model,
+                    dumped_messages=dumped_messages,
+                    conversation_id=conversation_id,
+                    prompt_override=prompt_override,
+                    require_write=require_write,
+                    allow_tool_calls=allow_tool_calls,
+                    force_new_conversation=force_new_conversation,
+                )
         else:
-            text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id, prompt_override=prompt_override)
+            text = complete_chat(model=request.model, messages=dumped_messages, conversation_id=conversation_id, prompt_override=prompt_override, force_new_conversation=force_new_conversation)
             action = None
     except ValueError as exc:
         raise openai_error(str(exc), 400, "invalid_messages") from exc
 
     if agent_mode:
+        if post_tool_turn and action.kind == "final" and settings.agent_after_tools_plan_enabled:
+            clear_pending_after_tools_plan(resolved_state, dumped_messages)
         tool_calls = action_tool_calls(action)
         if tool_calls:
             payload = ChatResponse(

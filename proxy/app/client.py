@@ -10,7 +10,7 @@ from transport_runtime import ChatTransport, build_transport
 
 from .config import settings
 from .state import ConversationState, conversation_store
-from .tools_shim import parse_assistant_action
+from .tools_shim import ParsedAfterTools, parse_assistant_action
 
 
 @dataclass(slots=True)
@@ -120,6 +120,78 @@ def fingerprint_messages(messages: list[dict[str, Any]]) -> str:
     return sha256(dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def fingerprint_latest_assistant_tool_call_turn(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    end = len(messages) - 1
+    tool_seen = False
+    while end >= 0:
+        message = messages[end]
+        role = str(message.get("role", "")).strip().lower() if isinstance(message, dict) else ""
+        if role in {"system", "developer"}:
+            end -= 1
+            continue
+        if role == "tool":
+            tool_seen = True
+            end -= 1
+            continue
+        break
+    if not tool_seen or end < 0:
+        return ""
+    candidate = messages[end]
+    if not isinstance(candidate, dict):
+        return ""
+    if str(candidate.get("role", "")).strip().lower() != "assistant":
+        return ""
+    tool_calls = candidate.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return ""
+    return fingerprint_messages(messages[: end + 1])
+
+
+
+def resolve_conversation_state(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None) -> tuple[str | None, ConversationState | None]:
+    return RuntimeClient(model)._resolve_state(conversation_id, messages)
+
+
+
+def _serialize_after_tools_plan(after_tools: ParsedAfterTools) -> dict[str, Any]:
+    return {
+        "on_success": after_tools.on_success,
+        "on_failure": after_tools.on_failure,
+        "final_prompt": after_tools.final_prompt,
+    }
+
+
+
+def get_pending_after_tools_plan(state: ConversationState | None, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    key = fingerprint_latest_assistant_tool_call_turn(messages)
+    if not key:
+        return None
+    plans = state.data.get("pending_after_tools")
+    if not isinstance(plans, dict):
+        return None
+    plan = plans.get(key)
+    return plan if isinstance(plan, dict) else None
+
+
+
+def clear_pending_after_tools_plan(state: ConversationState | None, messages: list[dict[str, Any]]) -> None:
+    if state is None:
+        return
+    key = fingerprint_latest_assistant_tool_call_turn(messages)
+    if not key:
+        return
+    plans = state.data.get("pending_after_tools")
+    if not isinstance(plans, dict) or key not in plans:
+        return
+    plans.pop(key, None)
+    state.data["pending_after_tools"] = plans
+    conversation_store.put(state)
+
+
 class RuntimeClient:
     def __init__(self, model_id: str):
         self.model_id = model_id
@@ -136,23 +208,38 @@ class RuntimeClient:
                 return state.conversation_id, state
         return None, None
 
-    def _get_transport(self, conversation_id: str | None, messages: list[dict[str, Any]]) -> tuple[ChatTransport, bool, ConversationState | None, str | None]:
+    def _get_transport(self, conversation_id: str | None, messages: list[dict[str, Any]], *, force_new_conversation: bool = False) -> tuple[ChatTransport, bool, ConversationState | None, str | None]:
         resolved_conversation_id, state = self._resolve_state(conversation_id, messages)
         if state and state.transport is not None:
-            return state.transport, False, state, resolved_conversation_id
+            transport = state.transport
+            transport_data = getattr(transport, "data", None)
+            if isinstance(transport_data, dict):
+                if force_new_conversation:
+                    transport_data["conversation_id"] = None
+                    transport_data["parent_message_id"] = None
+                else:
+                    if state.data.get("remote_conversation_id"):
+                        transport_data["conversation_id"] = state.data.get("remote_conversation_id")
+                    if state.data.get("remote_parent_message_id"):
+                        transport_data["parent_message_id"] = state.data.get("remote_parent_message_id")
+            return transport, force_new_conversation, state, resolved_conversation_id
 
         transport = build_transport(build_session_material(self.model_id))
         effective_conversation_id = resolved_conversation_id or conversation_id or f"proxy-{uuid4().hex}"
         state = state or ConversationState(conversation_id=effective_conversation_id)
         transport_data = getattr(transport, "data", None)
         if isinstance(transport_data, dict):
-            if state.data.get("remote_conversation_id"):
-                transport_data["conversation_id"] = state.data.get("remote_conversation_id")
-            if state.data.get("remote_parent_message_id"):
-                transport_data["parent_message_id"] = state.data.get("remote_parent_message_id")
+            if force_new_conversation:
+                transport_data["conversation_id"] = None
+                transport_data["parent_message_id"] = None
+            else:
+                if state.data.get("remote_conversation_id"):
+                    transport_data["conversation_id"] = state.data.get("remote_conversation_id")
+                if state.data.get("remote_parent_message_id"):
+                    transport_data["parent_message_id"] = state.data.get("remote_parent_message_id")
         state.transport = transport
         conversation_store.put(state)
-        return transport, state.data.get("remote_conversation_id") is None, state, effective_conversation_id
+        return transport, force_new_conversation or state.data.get("remote_conversation_id") is None, state, effective_conversation_id
 
     def _update_state_after_response(self, state: ConversationState | None, messages: list[dict[str, Any]], assistant_text: str, remote_conversation_id: str | None, remote_parent_message_id: str | None) -> None:
         if state is None:
@@ -163,7 +250,7 @@ class RuntimeClient:
         transcript_aliases = [fingerprint_messages([*messages, {"role": "assistant", "content": assistant_text}])]
 
         action = parse_assistant_action(assistant_text)
-        if action.kind in {"tool", "tools"}:
+        if action.kind in {"tool", "tools", "tool_plan", "tools_plan"}:
             calls: list[dict[str, Any]] = []
             if action.kind == "tools" and action.tool_calls:
                 calls = [
@@ -187,18 +274,23 @@ class RuntimeClient:
                     }
                 ]
             if calls:
-                transcript_aliases.append(
-                    fingerprint_messages(
-                        [
-                            *messages,
-                            {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": calls,
-                            },
-                        ]
-                    )
+                tool_call_alias = fingerprint_messages(
+                    [
+                        *messages,
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": calls,
+                        },
+                    ]
                 )
+                transcript_aliases.append(tool_call_alias)
+                if action.after_tools is not None:
+                    pending = state.data.get("pending_after_tools")
+                    if not isinstance(pending, dict):
+                        pending = {}
+                    pending[tool_call_alias] = _serialize_after_tools_plan(action.after_tools)
+                    state.data["pending_after_tools"] = pending
         elif action.kind == "final":
             transcript_aliases.append(fingerprint_messages([*messages, {"role": "assistant", "content": action.content or ""}]))
 
@@ -207,28 +299,29 @@ class RuntimeClient:
         for transcript_alias in transcript_aliases:
             conversation_store.bind_history_alias(transcript_alias, state.conversation_id)
 
-    def complete_chat_turn(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> tuple[str, str | None]:
+    def complete_chat_turn(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> tuple[str, str | None]:
         prompt = prompt_override or extract_latest_user_text(messages)
         if not prompt:
             raise ValueError("No user message content was found")
-        transport, new_conversation, state, effective_conversation_id = self._get_transport(conversation_id, messages)
+        transport, new_conversation, state, effective_conversation_id = self._get_transport(conversation_id, messages, force_new_conversation=force_new_conversation)
         result = transport.send_message(prompt, None, new_conversation=new_conversation)
         self._update_state_after_response(state, messages, result.text, result.remote_conversation_id, result.remote_parent_message_id)
         return result.text, effective_conversation_id
 
-    def complete_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> str:
+    def complete_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> str:
         text, _effective_conversation_id = self.complete_chat_turn(
             messages=messages,
             conversation_id=conversation_id,
             prompt_override=prompt_override,
+            force_new_conversation=force_new_conversation,
         )
         return text
 
-    async def stream_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> AsyncIterator[str]:
+    async def stream_chat(self, *, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> AsyncIterator[str]:
         prompt = prompt_override or extract_latest_user_text(messages)
         if not prompt:
             raise ValueError("No user message content was found")
-        transport, new_conversation, state, _effective_conversation_id = self._get_transport(conversation_id, messages)
+        transport, new_conversation, state, _effective_conversation_id = self._get_transport(conversation_id, messages, force_new_conversation=force_new_conversation)
         chunks: list[str] = []
         for chunk in transport.stream_message(prompt, None, new_conversation=new_conversation):
             text = str(chunk or "")
@@ -240,14 +333,14 @@ class RuntimeClient:
         self._update_state_after_response(state, messages, result.text or "".join(chunks), result.remote_conversation_id, result.remote_parent_message_id)
 
 
-def complete_chat(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> str:
-    return RuntimeClient(model).complete_chat(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override)
+def complete_chat(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> str:
+    return RuntimeClient(model).complete_chat(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override, force_new_conversation=force_new_conversation)
 
 
-def complete_chat_turn(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> tuple[str, str | None]:
-    return RuntimeClient(model).complete_chat_turn(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override)
+def complete_chat_turn(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> tuple[str, str | None]:
+    return RuntimeClient(model).complete_chat_turn(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override, force_new_conversation=force_new_conversation)
 
 
-async def stream_chat_completion(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None) -> AsyncIterator[str]:
-    async for chunk in RuntimeClient(model).stream_chat(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override):
+async def stream_chat_completion(*, model: str, messages: list[dict[str, Any]], conversation_id: str | None = None, prompt_override: str | None = None, force_new_conversation: bool = False) -> AsyncIterator[str]:
+    async for chunk in RuntimeClient(model).stream_chat(messages=messages, conversation_id=conversation_id, prompt_override=prompt_override, force_new_conversation=force_new_conversation):
         yield chunk
