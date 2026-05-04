@@ -147,7 +147,7 @@ def build_authenticated_client(session_data: dict, cookies: dict[str, str]) -> C
         if not websocket_url:
             print(
                 f"[auth-manual] websocket_url_missing_from_har path={har_path} "
-                "(HAR exports often omit websocket frames/URLs; run npm run discover:ws or set session.json:websocket_url manually)"
+                "(HAR exports often omit websocket frames/URLs; run bun run discover:ws or set session.json:websocket_url manually)"
             )
     return build_transport(
         {

@@ -9,7 +9,7 @@ from wrapper.paths import get_default_browser_executable_path, get_default_brows
 def refresh_hybrid_session_material(session_data: dict) -> dict:
     discovery_path = session_data.get("websocket_discovery_path", "session.discovered.json")
     command = [
-        "node",
+        "bun",
         "tools/extract_authenticated_session.mjs",
         "--output",
         discovery_path,

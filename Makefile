@@ -41,7 +41,7 @@ test-pi-contract:
 		-q
 
 test-js:
-	npm run test:playwright-helpers
+	bun run test:playwright-helpers
 
 test-browser-e2e:
 	RUN_BROWSER_E2E=1 .venv/bin/pytest \

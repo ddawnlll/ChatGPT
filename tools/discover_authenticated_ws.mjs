@@ -69,7 +69,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Usage: node tools/discover_authenticated_ws.mjs [options]
+  console.log(`Usage: bun tools/discover_authenticated_ws.mjs [options]
 
 Options:
   --message <text>             Probe message to send

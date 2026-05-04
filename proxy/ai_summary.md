@@ -97,6 +97,47 @@ proxy/
 - Prefers `playwright` transport over pure `requests`/`curl_cffi` because of complex bot-mitigation mechanisms introduced by OpenAI (Turnstile, Arkose, etc.).
 - Maintains complete state isolation inside `data/browser_profile` to prevent pollution of user data.
 
+## testing_map
+
+### tests/test_tools_shim_regressions.py
+- protects: `proxy/app/tools_shim.py`
+- purpose: guards parser regressions for `<final_response>` and `<tool_call>` extraction, especially prompt-placeholder leakage into pi-visible output
+
+### tests/test_router_agent_regressions.py
+- protects: `proxy/app/router.py`, `proxy/app/tools_shim.py`
+- purpose: verifies pi-agent-facing non-streaming and streaming behavior, including structured SSE transport errors instead of ASGI exception explosions
+
+### tests/test_streaming_contract.py
+- protects: `proxy/app/streaming.py`
+- purpose: verifies OpenAI SSE framing contract, stop chunk emission, and `[DONE]` termination
+
+### tests/test_pi_tool_contract_e2e.py
+- protects: `proxy/app/router.py`, `proxy/app/tools_shim.py`, `proxy/app/models.py`
+- purpose: exercises realistic pi-style tool requests for `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`, then checks OpenAI-compatible tool-call responses and follow-up final responses
+
+### tests/test_fake_playwright_daemon.py
+- protects: `transport_runtime.py`
+- purpose: validates Python-side Playwright transport handling of status/chunk/result/error event sequences without launching a real daemon
+
+### tests/test_fake_playwright_daemon_process.py
+- protects: `tools/playwright_chat_transport.mjs`, `transport_runtime.py` protocol assumptions
+- purpose: spawns the Bun daemon process and verifies structured JSONL event behavior, parse-error handling, and result payload shape
+
+### tools/playwright_transport_helpers.test.mjs
+- protects: `tools/playwright_chat_transport.mjs`
+- purpose: validates helper logic for final-response extraction, normalization, thinking filtering, and text reconciliation using Bun tests
+
+### tests/test_real_browser_smoke.py
+- protects: end-to-end browser-backed proxy path across `proxy/app/router.py`, `transport_runtime.py`, and `tools/playwright_chat_transport.mjs`
+- purpose: opt-in live browser smoke coverage for final responses, same-conversation follow-ups, and simple tool-call output
+
+## coding_rules
+- JavaScript execution is Bun-only.
+- Do not use `npm`, `node`, `npx`, `yarn`, or `pnpm` in new scripts, CI steps, docs, or test commands.
+- Use `bun run ...`, `bun test ...`, or direct `bun <file>.mjs` invocations instead.
+- Fast CI should remain live-service-independent; browser E2E stays opt-in.
+- See `docs/writing_rules.md` for the strict repository-wide rule set.
+
 ## caution
 - Port binding issues: It is explicitly bound to `0.0.0.0:8081` or `127.0.0.1:8081` to avoid common macOS conflicts (e.g. `spoofdpi` on port `8080`).
 - Browser limitations: The underlying Playwright Chromium instance depends strictly on correct command-line flags (`--no-sandbox`, `--disable-gpu`, `--single-process`, `--password-store=basic`) to bypass macOS Sequoia constraints and Gatekeeper termination.

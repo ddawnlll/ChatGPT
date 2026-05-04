@@ -67,7 +67,7 @@ function parseArgs(argv) {
     else if (arg === '--no-auto-start-debug-browser') options.autoStartDebugBrowser = false
     else if (arg === '--no-cdp') options.connectOverCdp = false
     else if (arg === '--help') {
-      console.log(`Usage: node tools/extract_authenticated_session.mjs [options]
+      console.log(`Usage: bun tools/extract_authenticated_session.mjs [options]
 
 Options:
   --output <path>
